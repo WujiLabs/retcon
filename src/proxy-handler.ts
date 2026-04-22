@@ -29,6 +29,7 @@ import { redactHeaders } from './redaction.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, SseStopReasonParser } from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
+import { computeVersionAsset } from './versions-v1.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
@@ -427,6 +428,11 @@ async function dispatch(
             )
           }
           else {
+            // Pre-compute the Version asset (dag-json of {request_body_cid,
+            // response_body_cid}) so the projector can stay synchronous.
+            // Hashing is async; the single-tx event-emit invariant requires
+            // all hashing to happen before we enter the transaction.
+            const asset = await computeVersionAsset(bodyBlob.cid, respBodyBlob.cid)
             emitTerminal(
               'proxy.response_completed',
               {
@@ -435,8 +441,9 @@ async function dispatch(
                 headers_cid: respHeaderBlob.cid,
                 body_cid: respBodyBlob.cid,
                 stop_reason: stopReason,
+                asset_cid: asset.cid,
               },
-              [respHeaderBlob.ref, respBodyBlob.ref],
+              [respHeaderBlob.ref, respBodyBlob.ref, { cid: asset.cid, bytes: asset.bytes }],
             )
           }
           resolve()

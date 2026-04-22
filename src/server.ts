@@ -17,12 +17,34 @@
 // pass-through in C4, MCP route in week-2 commits).
 
 import http from 'node:http'
-import type { EventProducer } from './events.js'
+import type { DB } from './db.js'
+import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { SessionQueue } from './session-queue.js'
+import { SessionsV1Projector } from './sessions-v1.js'
 import type { TobeStore } from './tobe.js'
+import { VersionsV1Projector } from './versions-v1.js'
+
+/**
+ * Build the standard set of projectors wired into a v1 producer.
+ *
+ * Declared dispatch order:
+ *   1. sessions_v1    — must run first so a session/task row exists before
+ *                       versions_v1 tries to reference it on FK.
+ *   2. versions_v1    — sets versions.parent_version_id on response_completed;
+ *                       branch_views_v1 reads that field later in the same tx.
+ *   3. branch_views_v1 (added in C7)
+ */
+export function defaultProjectors(): Projection[] {
+  return [new SessionsV1Projector(), new VersionsV1Projector()]
+}
+
+/** Convenience: build an EventProducer pre-wired with the v1 projectors. */
+export function createDefaultProducer(db: DB): EventProducer {
+  return createEventProducer(db, defaultProjectors())
+}
 
 export const DEFAULT_PORT = 4099
 

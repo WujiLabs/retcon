@@ -14,6 +14,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { migrate, openDb, type DB } from '../db.js'
 import { createEventConsumer, createEventProducer, type EventProducer } from '../events.js'
+import { defaultProjectors } from '../server.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
 import { startServer, type ServerHandle } from '../server.js'
@@ -217,6 +218,64 @@ describe('proxy pass-through + event emission', () => {
 
     // TOBE should have been committed (2xx upstream → file deleted).
     expect(fx.tobeStore.peek(sessionId)).toBeNull()
+  })
+
+  it('end-to-end: HTTP call populates sessions + versions projected views', async () => {
+    // Use the standard projector chain (sessions_v1 + versions_v1).
+    const db = openDb({ path: ':memory:' })
+    migrate(db)
+    const producer = createEventProducer(db, defaultProjectors())
+
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'hi' }],
+      }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: 'sess-e2e' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+
+    // Sessions view: orphan session was bootstrapped.
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get('sess-e2e') as
+      | { task_id: string, harness: string }
+      | undefined
+    expect(session).toBeTruthy()
+    expect(session!.harness).toBe('orphan')
+
+    // Versions view: one sealed Version with end_turn classification.
+    const version = db.prepare(
+      `SELECT id, task_id, classification, stop_reason, asset_cid, sealed_at
+         FROM versions WHERE task_id = ?`,
+    ).get(session!.task_id) as {
+      id: string
+      classification: string
+      stop_reason: string
+      asset_cid: string | null
+      sealed_at: number | null
+    } | undefined
+    expect(version).toBeTruthy()
+    expect(version!.classification).toBe('closed_forkable')
+    expect(version!.stop_reason).toBe('end_turn')
+    // CIDv1 base32 always starts with 'b'; the exact codec prefix varies.
+    expect(version!.asset_cid).toMatch(/^b[a-z0-9]+$/)
+    expect(version!.sealed_at).toBeGreaterThan(0)
+
+    // Asset blob was persisted alongside the event.
+    const assetBlob = db.prepare('SELECT 1 FROM blobs WHERE cid = ?').get(version!.asset_cid)
+    expect(assetBlob).toBeTruthy()
   })
 
   it('emits proxy.upstream_error when upstream is unreachable', async () => {
