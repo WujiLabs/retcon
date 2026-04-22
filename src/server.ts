@@ -17,7 +17,11 @@
 // pass-through in C4, MCP route in week-2 commits).
 
 import http from 'node:http'
+import type { EventProducer } from './events.js'
+import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
+import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { SessionQueue } from './session-queue.js'
+import type { TobeStore } from './tobe.js'
 
 export const DEFAULT_PORT = 4099
 
@@ -26,6 +30,12 @@ export interface ServerOptions {
   host?: string
   /** Full override of the upstream target. Defaults to the Anthropic API base. */
   upstream?: string
+  /** Required: where events get emitted. */
+  producer: EventProducer
+  /** Required: file-based TOBE state (per-session). */
+  tobeStore: TobeStore
+  /** Optional: override the default header redaction list. */
+  redactSet?: ReadonlySet<string>
 }
 
 export interface ServerHandle {
@@ -33,10 +43,17 @@ export interface ServerHandle {
   close(): Promise<void>
 }
 
-export function startServer(options: ServerOptions = {}): Promise<ServerHandle> {
+export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const port = options.port ?? DEFAULT_PORT
   const host = options.host ?? '127.0.0.1'
   const sessionQueue = new SessionQueue()
+  const proxyCtx: ProxyContext = {
+    producer: options.producer,
+    sessionQueue,
+    tobeStore: options.tobeStore,
+    redactSet: options.redactSet ?? DEFAULT_REDACTED_HEADERS,
+    upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
+  }
 
   const server = http.createServer((req, res) => {
     const path = req.url ?? ''
@@ -53,7 +70,7 @@ export function startServer(options: ServerOptions = {}): Promise<ServerHandle> 
     }
 
     if (path.startsWith('/v1/')) {
-      handleProxyStub(req, res, sessionQueue)
+      void handleProxyRequest(req, res, proxyCtx)
       return
     }
 
@@ -75,20 +92,6 @@ export function startServer(options: ServerOptions = {}): Promise<ServerHandle> 
       })
     })
   })
-}
-
-/**
- * STUB: transparent proxy for /v1/*. C4 replaces this with the real pass-through
- * (hop-by-hop header filtering, SSE streaming, compression handling, TOBE apply,
- * SSE parser tap). For now, responds 501 to make the shell observable.
- */
-function handleProxyStub(
-  _req: http.IncomingMessage,
-  res: http.ServerResponse,
-  _queue: SessionQueue,
-): void {
-  res.writeHead(501, { 'content-type': 'text/plain' })
-  res.end('proxy pass-through not yet implemented (C4)\n')
 }
 
 /**
