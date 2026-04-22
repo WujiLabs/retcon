@@ -56,10 +56,21 @@ describe('startServer routing', () => {
     expect(body.trim()).toBe('ok')
   })
 
-  it('stubs /mcp with 501', async () => {
+  it('/mcp GET returns 200 with text/event-stream (spec-compliant SSE open)', async () => {
     handle = await startServer({ port: 0, producer: fx!.producer, tobeStore: fx!.tobeStore })
-    const { status } = await get('/mcp')
-    expect(status).toBe(501)
+    // GET /mcp holds the SSE stream open; assert headers then abort so the
+    // afterEach close() doesn't wait on a never-terminating response.
+    const controller = new AbortController()
+    const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, { signal: controller.signal })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+    controller.abort()
+  })
+
+  it('/mcp 405s on unsupported methods', async () => {
+    handle = await startServer({ port: 0, producer: fx!.producer, tobeStore: fx!.tobeStore })
+    const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, { method: 'PUT' })
+    expect(res.status).toBe(405)
   })
 
   it('returns 404 for unknown paths', async () => {

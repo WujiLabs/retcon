@@ -17,9 +17,11 @@
 // pass-through in C4, MCP route in week-2 commits).
 
 import http from 'node:http'
+import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
+import { handleMcpRequest, type McpContext, type McpToolHandler } from './mcp-handler.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { SessionQueue } from './session-queue.js'
@@ -31,14 +33,15 @@ import { VersionsV1Projector } from './versions-v1.js'
  * Build the standard set of projectors wired into a v1 producer.
  *
  * Declared dispatch order:
- *   1. sessions_v1    — must run first so a session/task row exists before
- *                       versions_v1 tries to reference it on FK.
- *   2. versions_v1    — sets versions.parent_version_id on response_completed;
- *                       branch_views_v1 reads that field later in the same tx.
- *   3. branch_views_v1 (added in C7)
+ *   1. sessions_v1     — must run first so a session/task row exists before
+ *                        versions_v1 tries to reference it on FK.
+ *   2. versions_v1     — sets versions.parent_version_id on response_completed;
+ *                        branch_views_v1 reads that field later in the same tx.
+ *   3. branch_views_v1 — advances matching branch_view's head to the newly
+ *                        sealed Version.
  */
 export function defaultProjectors(): Projection[] {
-  return [new SessionsV1Projector(), new VersionsV1Projector()]
+  return [new SessionsV1Projector(), new VersionsV1Projector(), new BranchViewsV1Projector()]
 }
 
 /** Convenience: build an EventProducer pre-wired with the v1 projectors. */
@@ -65,6 +68,12 @@ export interface ServerOptions {
    * /v1/* handler's emitTerminal notifies). Defaults to a fresh instance.
    */
   forkAwaiter?: ForkAwaiter
+  /**
+   * Optional: map of MCP tool handlers to expose at /mcp. Keyed by tool name
+   * (e.g. "fork_list", "fork_back"). Empty map means no tools — initialize +
+   * tools/list still work, just with a zero-length tool list.
+   */
+  mcpTools?: Map<string, McpToolHandler>
 }
 
 export interface ServerHandle {
@@ -86,6 +95,10 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
     forkAwaiter,
   }
+  const mcpCtx: McpContext = {
+    producer: options.producer,
+    tools: options.mcpTools ?? new Map(),
+  }
 
   const server = http.createServer((req, res) => {
     const path = req.url ?? ''
@@ -97,7 +110,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     }
 
     if (path === '/mcp' || path.startsWith('/mcp?') || path.startsWith('/mcp/')) {
-      handleMcpStub(req, res)
+      void handleMcpRequest(req, res, mcpCtx)
       return
     }
 
@@ -127,11 +140,3 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   })
 }
 
-/**
- * STUB: MCP Streamable HTTP. Week-2 commits implement the real JSON-RPC
- * handler and SSE stream endpoint.
- */
-function handleMcpStub(_req: http.IncomingMessage, res: http.ServerResponse): void {
-  res.writeHead(501, { 'content-type': 'text/plain' })
-  res.end('MCP not yet implemented (week-2)\n')
-}
