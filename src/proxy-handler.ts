@@ -24,6 +24,7 @@ import { URL } from 'node:url'
 import zlib from 'node:zlib'
 import { blobRefFromBytes } from './body-blob.js'
 import type { EventProducer } from './events.js'
+import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, SseStopReasonParser } from './sse-parser.js'
@@ -79,6 +80,7 @@ export interface ProxyContext {
   readonly tobeStore: TobeStore
   readonly redactSet: ReadonlySet<string>
   readonly upstream: string
+  readonly forkAwaiter: ForkAwaiter
 }
 
 /**
@@ -175,10 +177,14 @@ async function dispatch(
   const rawBody = await readFullBody(req)
 
   // TOBE swap (optional; if no pending file exists, pass-through unchanged).
-  // Only consume on /v1/messages — other /v1/* paths (e.g. /v1/models listing)
+  // Only peek on /v1/messages — other /v1/* paths (e.g. /v1/models listing)
   // shouldn't waste a pending swap intended for the next user turn.
+  //
+  // peek (not consume) because we commit (delete) only after the upstream
+  // call completes with 2xx. On 5xx / abort / upstream_error the TOBE stays
+  // so Claude Code's retry loop re-applies it automatically.
   const isMessagesPath = (req.url ?? '').includes('/messages')
-  const pending = isMessagesPath ? ctx.tobeStore.consume(sessionId) : null
+  const pending = isMessagesPath ? ctx.tobeStore.peek(sessionId) : null
   let bodyToForward = rawBody
   let tobeAppliedFrom: {
     fork_point_version_id: string
@@ -253,12 +259,60 @@ async function dispatch(
     let terminalEmitted = false
     const emitTerminal = (
       topic: 'proxy.response_completed' | 'proxy.response_aborted' | 'proxy.upstream_error',
-      payload: object,
+      payload: Record<string, unknown>,
       refs?: Parameters<typeof ctx.producer.emit>[3],
     ): void => {
       if (terminalEmitted) return
       terminalEmitted = true
       ctx.producer.emit(topic, payload, sessionId, refs)
+      // TOBE lifecycle: only commit (delete the pending file) when the
+      // upstream call actually returned a non-5xx response. Every other
+      // outcome (5xx body, client abort, upstream_error) keeps the file
+      // so Claude Code's retry loop re-applies it. This is what makes
+      // the fork intent idempotent under transient failures.
+      if (pending) {
+        const isHttpSuccess
+          = topic === 'proxy.response_completed'
+            && typeof payload.status === 'number'
+            && payload.status < 500
+        if (isHttpSuccess) ctx.tobeStore.commit(sessionId)
+
+        // Notify any in-flight fork_back awaiter with a structured outcome.
+        // fork_back can either await this or query the event log after the
+        // fact; both paths go through ForkAwaiter / lastForkOutcome.
+        const outcome: ForkOutcome = (() => {
+          if (topic === 'proxy.response_completed') {
+            const s = typeof payload.status === 'number' ? payload.status : 0
+            return {
+              status: s >= 500 ? 'http_error' : 'completed',
+              version_id: requestEvent.id,
+              http_status: s,
+              stop_reason: (payload.stop_reason ?? null) as string | null,
+              fork_point_version_id: pending.fork_point_version_id,
+              source_view_id: pending.source_view_id,
+            }
+          }
+          if (topic === 'proxy.response_aborted') {
+            return {
+              status: 'aborted',
+              version_id: requestEvent.id,
+              error_message: typeof payload.reason === 'string' ? payload.reason : undefined,
+              fork_point_version_id: pending.fork_point_version_id,
+              source_view_id: pending.source_view_id,
+            }
+          }
+          return {
+            status: 'upstream_error',
+            version_id: requestEvent.id,
+            http_status: typeof payload.status === 'number' ? payload.status : undefined,
+            error_message:
+              typeof payload.error_message === 'string' ? payload.error_message : undefined,
+            fork_point_version_id: pending.fork_point_version_id,
+            source_view_id: pending.source_view_id,
+          }
+        })()
+        ctx.forkAwaiter.notify(sessionId, outcome)
+      }
     }
 
     const proto = target.protocol === 'http:' ? http : https

@@ -18,6 +18,7 @@
 
 import http from 'node:http'
 import type { EventProducer } from './events.js'
+import { ForkAwaiter } from './fork-awaiter.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { SessionQueue } from './session-queue.js'
@@ -36,10 +37,17 @@ export interface ServerOptions {
   tobeStore: TobeStore
   /** Optional: override the default header redaction list. */
   redactSet?: ReadonlySet<string>
+  /**
+   * Optional: pre-constructed ForkAwaiter. Provide one if you want to share
+   * it with the MCP handler (so fork_back can wait() on outcomes that the
+   * /v1/* handler's emitTerminal notifies). Defaults to a fresh instance.
+   */
+  forkAwaiter?: ForkAwaiter
 }
 
 export interface ServerHandle {
   readonly port: number
+  readonly forkAwaiter: ForkAwaiter
   close(): Promise<void>
 }
 
@@ -47,12 +55,14 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const port = options.port ?? DEFAULT_PORT
   const host = options.host ?? '127.0.0.1'
   const sessionQueue = new SessionQueue()
+  const forkAwaiter = options.forkAwaiter ?? new ForkAwaiter()
   const proxyCtx: ProxyContext = {
     producer: options.producer,
     sessionQueue,
     tobeStore: options.tobeStore,
     redactSet: options.redactSet ?? DEFAULT_REDACTED_HEADERS,
     upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
+    forkAwaiter,
   }
 
   const server = http.createServer((req, res) => {
@@ -85,6 +95,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
       const resolvedPort = typeof addr === 'object' && addr ? addr.port : port
       resolve({
         port: resolvedPort,
+        forkAwaiter,
         close: () =>
           new Promise<void>((done, fail) => {
             server.close(err => (err ? fail(err) : done()))

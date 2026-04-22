@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { beforeEach, describe, expect, it } from 'vitest'
-import { CURRENT_SCHEMA_VERSION, migrate, openDb, type DB } from '../db.js'
+import { closeDb, CURRENT_SCHEMA_VERSION, migrate, openDb, type DB } from '../db.js'
 
 describe('db migrations', () => {
   let db: DB
@@ -58,5 +58,22 @@ describe('db migrations', () => {
       Date.now(),
     )
     expect(() => migrate(db)).toThrow(/newer than this binary/)
+  })
+
+  it('sets wal_autocheckpoint pragma on openDb', () => {
+    migrate(db)
+    const val = db.pragma('wal_autocheckpoint', { simple: true }) as number
+    expect(val).toBe(1000)
+  })
+
+  it('closeDb runs a truncating checkpoint then closes', () => {
+    migrate(db)
+    db.prepare('INSERT INTO blobs (cid, bytes, size, created_at) VALUES (?, ?, ?, ?)').run(
+      'bafy-wal-test', Buffer.from('x'), 1, Date.now(),
+    )
+    closeDb(db)
+    expect(db.open).toBe(false)
+    // Idempotent.
+    expect(() => closeDb(db)).not.toThrow()
   })
 })

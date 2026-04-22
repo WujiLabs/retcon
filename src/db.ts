@@ -101,7 +101,26 @@ export function openDb(options: OpenDbOptions): DB {
   const db = new Database(options.path, { readonly: options.readonly ?? false })
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  // Keep the WAL file from growing unbounded under sustained writes. SQLite
+  // auto-truncates the WAL when it exceeds this many pages (default is 1000).
+  // We set it explicitly so the behavior doesn't depend on the sqlite version
+  // baked into better-sqlite3.
+  db.pragma('wal_autocheckpoint = 1000')
   return db
+}
+
+/**
+ * Graceful shutdown for a DB opened via openDb(). Runs a final truncating
+ * checkpoint so the WAL file doesn't survive the process exit, then closes
+ * the connection. Idempotent; safe to call on an already-closed DB.
+ */
+export function closeDb(db: DB): void {
+  if (!db.open) return
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)')
+  }
+  catch { /* best-effort on shutdown */ }
+  db.close()
 }
 
 /**

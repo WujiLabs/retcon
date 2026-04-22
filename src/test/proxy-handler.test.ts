@@ -215,8 +215,8 @@ describe('proxy pass-through + event emission', () => {
     expect(reqPayload.tobe_applied_from!.source_view_id).toBe('view-origin')
     expect(typeof reqPayload.tobe_applied_from!.original_body_cid).toBe('string')
 
-    // TOBE should have been consumed.
-    expect(fx.tobeStore.consume(sessionId)).toBeNull()
+    // TOBE should have been committed (2xx upstream → file deleted).
+    expect(fx.tobeStore.peek(sessionId)).toBeNull()
   })
 
   it('emits proxy.upstream_error when upstream is unreachable', async () => {
@@ -346,6 +346,110 @@ describe('proxy pass-through + event emission', () => {
     expect(res.headers.get('connection')).not.toBe('close')
   })
 
+  it('retains TOBE on upstream 5xx so the next retry re-applies it (A-R8)', async () => {
+    let call = 0
+    mock = await startMock((_req, res, _body) => {
+      call++
+      if (call === 1) {
+        res.writeHead(502, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'transient upstream failure' }))
+      }
+      else {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ stop_reason: 'end_turn' }))
+      }
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    const sessionId = 'sess-retry'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'retry-me' }],
+      fork_point_version_id: 'v-retry-fp',
+      source_view_id: 'view-retry',
+    })
+
+    // First call — upstream returns 5xx. TOBE must survive.
+    const r1 = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+    })
+    expect(r1.status).toBe(502)
+    expect(fx.tobeStore.peek(sessionId)).not.toBeNull()
+
+    // Second call — upstream returns 2xx. TOBE now commits (deleted).
+    const r2 = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+    })
+    expect(r2.status).toBe(200)
+    expect(fx.tobeStore.peek(sessionId)).toBeNull()
+  })
+
+  it('notifies ForkAwaiter on a completed TOBE request (A-R8 scaffolding)', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'end_turn' }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    const sessionId = 'sess-await'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'forked' }],
+      fork_point_version_id: 'v-await-fp',
+      source_view_id: 'view-await',
+    })
+    // Register the waiter BEFORE the HTTP call so the awaiter is primed.
+    const outcomeP = proxy.forkAwaiter.wait(sessionId, 5000)
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+    })
+    await res.text()
+    const outcome = await outcomeP
+    expect(outcome.status).toBe('completed')
+    expect(outcome.http_status).toBe(200)
+    expect(outcome.stop_reason).toBe('end_turn')
+    expect(outcome.fork_point_version_id).toBe('v-await-fp')
+    expect(outcome.source_view_id).toBe('view-await')
+  })
+
+  it('notifies ForkAwaiter with aborted/http_error on upstream failure', async () => {
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: 'http://127.0.0.1:1',  // unreachable
+    })
+    const sessionId = 'sess-await-err'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'forked' }],
+      fork_point_version_id: 'v-fp',
+      source_view_id: 'view-err',
+    })
+    const outcomeP = proxy.forkAwaiter.wait(sessionId, 5000)
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ messages: [] }),
+    })
+    const outcome = await outcomeP
+    expect(outcome.status).toBe('upstream_error')
+    expect(outcome.http_status).toBe(502)
+    // TOBE retained for retry — upstream failure.
+    expect(fx.tobeStore.peek(sessionId)).not.toBeNull()
+  })
+
   it('does NOT consume TOBE for non-messages /v1/* paths', async () => {
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -369,7 +473,7 @@ describe('proxy pass-through + event emission', () => {
       headers: { [SESSION_HEADER]: sessionId },
     })
     // TOBE should still be there for the next /v1/messages.
-    const stillPending = fx.tobeStore.consume(sessionId)
+    const stillPending = fx.tobeStore.peek(sessionId)
     expect(stillPending).not.toBeNull()
     expect(stillPending!.fork_point_version_id).toBe('v-keep')
   })

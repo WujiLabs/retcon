@@ -28,8 +28,15 @@ export interface TobeStore {
   readonly dir: string
   fileFor(sessionId: string): string
   write(sessionId: string, pending: TobePending): void
-  /** Read and delete the file in one shot. Returns null if none pending. */
-  consume(sessionId: string): TobePending | null
+  /**
+   * Read the pending file WITHOUT deleting it. Returns null if none pending
+   * or if the file is malformed (caller treats this as no TOBE).
+   * The proxy uses peek on dispatch; only commit() after a successful 2xx
+   * response so 5xx / abort outcomes keep the fork intent alive for retry.
+   */
+  peek(sessionId: string): TobePending | null
+  /** Delete the pending file. Idempotent. */
+  commit(sessionId: string): void
 }
 
 export function createTobeStore(dir: string): TobeStore {
@@ -55,7 +62,7 @@ export function createTobeStore(dir: string): TobeStore {
     fs.renameSync(tmp, target)
   }
 
-  function consume(sessionId: string): TobePending | null {
+  function peek(sessionId: string): TobePending | null {
     const p = fileFor(sessionId)
     let raw: string
     try {
@@ -66,16 +73,25 @@ export function createTobeStore(dir: string): TobeStore {
       if (e.code === 'ENOENT') return null
       throw err
     }
-    // Delete BEFORE parsing so a malformed file can't pin the session.
-    try { fs.unlinkSync(p) }
-    catch { /* already gone — race with a concurrent consume; fine */ }
     try {
       return JSON.parse(raw) as TobePending
     }
     catch {
+      // Malformed file — delete so it doesn't pin the session. Fork intent
+      // is lost, but the user can re-issue fork_back.
+      try { fs.unlinkSync(p) }
+      catch { /* ignore */ }
       return null
     }
   }
 
-  return { dir, fileFor, write, consume }
+  function commit(sessionId: string): void {
+    try { fs.unlinkSync(fileFor(sessionId)) }
+    catch (err) {
+      const e = err as NodeJS.ErrnoException
+      if (e.code !== 'ENOENT') throw err
+    }
+  }
+
+  return { dir, fileFor, write, peek, commit }
 }
