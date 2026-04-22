@@ -27,17 +27,37 @@ export interface SseParseResult {
 
 type Listener = (result: SseParseResult) => void
 
+/**
+ * Cap the pending-frame buffer to guard against a malformed stream (or a
+ * MITM) that never emits a frame boundary. The proxy binds to 127.0.0.1 so
+ * an attacker would need local privileges, but the cap keeps the failure
+ * mode obvious instead of a silent OOM.
+ */
+export const MAX_BUFFER_BYTES = 10 * 1024 * 1024
+
 export class SseStopReasonParser {
   private buffer = ''
   private stopReason: string | null = null
   private finished = false
+  private overflowed = false
   private readonly listeners: Listener[] = []
 
   /** Feed one chunk of SSE bytes. Safe to call any number of times. */
   feed(chunk: Uint8Array | Buffer | string): void {
-    if (this.finished) return
+    if (this.finished || this.overflowed) return
     const asStr = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
     this.buffer += asStr
+
+    if (this.buffer.length > MAX_BUFFER_BYTES) {
+      this.overflowed = true
+      this.buffer = ''
+      this.finished = true
+      // Surface the overflow once via the finish listeners so the caller
+      // records a dangling Version rather than waiting forever.
+      const result = { stopReason: this.stopReason, finished: true }
+      for (const l of this.listeners) l(result)
+      return
+    }
 
     // Split on frame boundaries. SSE frames end with a blank line (\n\n).
     // Some implementations use \r\n\r\n; handle both.
@@ -50,6 +70,11 @@ export class SseStopReasonParser {
       this.processFrame(frame)
       if (this.finished) break
     }
+  }
+
+  /** Test-only: did the parser trip its buffer cap? */
+  didOverflow(): boolean {
+    return this.overflowed
   }
 
   /** Call after the upstream response has ended. Flushes any partial tail. */

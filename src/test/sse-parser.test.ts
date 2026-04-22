@@ -88,6 +88,19 @@ describe('SseStopReasonParser', () => {
     p.feed(frame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } }))
     expect(p.snapshot().stopReason).toBeNull()
   })
+
+  it('trips the buffer cap on a never-terminating stream', () => {
+    const p = new SseStopReasonParser()
+    // 2MB of a single line with no frame boundary — should trigger overflow.
+    const junk = 'data: '.concat('x'.repeat(2 * 1024 * 1024))
+    // Feed in chunks under the cap per call, but cumulative > cap.
+    for (let i = 0; i < 6; i++) {
+      p.feed(junk)
+      if (p.didOverflow()) break
+    }
+    expect(p.didOverflow()).toBe(true)
+    expect(p.snapshot().finished).toBe(true)
+  })
 })
 
 describe('extractStopReasonFromJsonBody', () => {

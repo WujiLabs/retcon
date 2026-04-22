@@ -17,6 +17,7 @@
 // Header redaction runs before computing headers_cid — plaintext API keys
 // never land in blobs (G3).
 
+import crypto from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import { URL } from 'node:url'
@@ -31,7 +32,7 @@ import type { TobePending, TobeStore } from './tobe.js'
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
 
-// Hop-by-hop headers per RFC 7230 plus ones Node's fetch would have set itself.
+// Hop-by-hop headers per RFC 7230 plus ones Node's http client will set itself.
 const SKIP_REQUEST_HEADERS = new Set([
   'host',
   'connection',
@@ -39,10 +40,38 @@ const SKIP_REQUEST_HEADERS = new Set([
   'transfer-encoding',
   'keep-alive',
   'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'upgrade',
+  'expect',           // Expect: 100-continue would stall upstream
+])
+
+// Same list for the RESPONSE direction: Node re-chunks and re-frames the
+// response itself, so forwarding upstream's hop-by-hop + content-length
+// produces double framing or conflicting headers to the client.
+const SKIP_RESPONSE_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'transfer-encoding',
+  'keep-alive',
+  'proxy-connection',
   'te',
   'trailer',
   'upgrade',
 ])
+
+function filterResponseHeaders(
+  headers: http.IncomingHttpHeaders,
+): http.OutgoingHttpHeaders {
+  const out: http.OutgoingHttpHeaders = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue
+    if (SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue
+    out[key] = value
+  }
+  return out
+}
 
 export interface ProxyContext {
   readonly producer: EventProducer
@@ -54,14 +83,15 @@ export interface ProxyContext {
 
 /**
  * Resolve a session id for this request. Prefer the x-playtiss-session header
- * injected by the /fork skill; fall back to a per-connection id so every
- * request lands in SOME session (orphan mode).
+ * injected by the /fork skill; fall back to a per-request random id for orphan
+ * mode. A socket-tuple fallback would collide when the OS reuses ports — two
+ * unrelated orphan requests sharing `remoteAddress:remotePort` would cross-read
+ * each other's TOBE files and cross-project events.
  */
 export function resolveSessionId(req: http.IncomingMessage): string {
   const raw = req.headers[SESSION_HEADER]
   if (typeof raw === 'string' && raw.length > 0) return raw
-  const sock = req.socket
-  return `orphan-${sock.remoteAddress ?? 'unknown'}-${sock.remotePort ?? 0}`
+  return `orphan-${crypto.randomUUID()}`
 }
 
 function readFullBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -145,7 +175,10 @@ async function dispatch(
   const rawBody = await readFullBody(req)
 
   // TOBE swap (optional; if no pending file exists, pass-through unchanged).
-  const pending = ctx.tobeStore.consume(sessionId)
+  // Only consume on /v1/messages — other /v1/* paths (e.g. /v1/models listing)
+  // shouldn't waste a pending swap intended for the next user turn.
+  const isMessagesPath = (req.url ?? '').includes('/messages')
+  const pending = isMessagesPath ? ctx.tobeStore.consume(sessionId) : null
   let bodyToForward = rawBody
   let tobeAppliedFrom: {
     fork_point_version_id: string
@@ -190,8 +223,18 @@ async function dispatch(
       : [bodyBlob.ref, headerBlob.ref],
   )
 
-  // Build upstream request.
-  const target = new URL(req.url ?? '/', ctx.upstream)
+  // Build upstream request. req.url must be treated as path-only — if a client
+  // sent an absolute-form request-line (`POST http://evil.example/... HTTP/1.1`),
+  // Node's http parser hands that URL through. `new URL(absolute, base)` ignores
+  // the base, so we'd SSRF to any host the client names and leak Authorization
+  // headers. Reject absolute URLs and anything not starting with `/`.
+  const rawPath = req.url ?? '/'
+  if (!rawPath.startsWith('/')) {
+    res.writeHead(400, { 'content-type': 'text/plain' })
+    res.end('playtiss-proxy: absolute URLs not allowed; send path only\n')
+    return
+  }
+  const target = new URL(rawPath, ctx.upstream)
   const forwardHeaders: Record<string, string | string[]> = {}
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue
@@ -200,109 +243,176 @@ async function dispatch(
   }
   forwardHeaders['content-length'] = String(bodyToForward.byteLength)
 
-  const proto = target.protocol === 'http:' ? http : https
-  const upstreamReq = proto.request({
-    hostname: target.hostname,
-    port: target.port || (target.protocol === 'http:' ? 80 : 443),
-    path: target.pathname + target.search,
-    method: req.method ?? 'GET',
-    headers: forwardHeaders,
-  })
-
-  upstreamReq.on('error', (err) => {
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: err.message }))
+  // Everything below returns ONE promise that resolves only after the response
+  // cycle finishes (success, aborted, or errored). The session queue awaits
+  // this promise, which enforces the G2 session sequencing invariant: a
+  // second /v1/messages for the same session cannot begin until the prior
+  // one's response_completed / response_aborted / upstream_error has fired.
+  await new Promise<void>((resolve) => {
+    let responseStarted = false
+    let terminalEmitted = false
+    const emitTerminal = (
+      topic: 'proxy.response_completed' | 'proxy.response_aborted' | 'proxy.upstream_error',
+      payload: object,
+      refs?: Parameters<typeof ctx.producer.emit>[3],
+    ): void => {
+      if (terminalEmitted) return
+      terminalEmitted = true
+      ctx.producer.emit(topic, payload, sessionId, refs)
     }
-    void ctx.producer.emit(
-      'proxy.upstream_error',
-      {
-        request_event_id: requestEvent.id,
-        status: 502,
-        error_message: err.message,
-      },
-      sessionId,
-    )
-  })
 
-  upstreamReq.on('response', async (upstreamRes) => {
-    const contentType = upstreamRes.headers['content-type'] ?? ''
-    const contentEncoding = String(upstreamRes.headers['content-encoding'] ?? 'identity')
-    const isSse = contentType.includes('text/event-stream')
-
-    const respHeaderJson = Buffer.from(JSON.stringify(redactHeaders(upstreamRes.headers, ctx.redactSet)), 'utf8')
-    const respHeaderBlob = await blobRefFromBytes(respHeaderJson)
-
-    res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers)
-
-    const responseChunks: Buffer[] = []
-    const sseParser = isSse ? new SseStopReasonParser() : null
-
-    let aborted = false
-    res.on('close', () => {
-      if (!res.writableEnded) aborted = true
+    const proto = target.protocol === 'http:' ? http : https
+    const upstreamReq = proto.request({
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'http:' ? 80 : 443),
+      path: target.pathname + target.search,
+      method: req.method ?? 'GET',
+      headers: forwardHeaders,
     })
 
-    upstreamRes.on('data', (chunk: Buffer) => {
-      // Pipe raw bytes to client immediately.
-      res.write(chunk)
-      responseChunks.push(chunk)
-      if (sseParser) sseParser.feed(chunk)
-    })
-
-    upstreamRes.on('end', async () => {
-      res.end()
-      if (sseParser) sseParser.end()
-
-      const rawResponse = Buffer.concat(responseChunks)
-      const respBodyBlob = await blobRefFromBytes(rawResponse)
-
-      let stopReason: string | null = null
-      if (isSse) {
-        stopReason = sseParser!.snapshot().stopReason
+    upstreamReq.on('error', (err) => {
+      // Only treat this as the terminal error if the response hadn't started —
+      // otherwise upstreamRes.on('error') owns it.
+      if (responseStarted) return
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: err.message }))
       }
-      else {
-        try {
-          const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
-          stopReason = extractStopReasonFromJsonBody(decompressed.toString('utf8'))
-        }
-        catch {
-          stopReason = null
-        }
-      }
-
-      if (aborted) {
-        ctx.producer.emit(
-          'proxy.response_aborted',
-          { request_event_id: requestEvent.id, reason: 'client_disconnect' },
-          sessionId,
-        )
-        return
-      }
-
-      ctx.producer.emit(
-        'proxy.response_completed',
+      emitTerminal(
+        'proxy.upstream_error',
         {
           request_event_id: requestEvent.id,
-          status: upstreamRes.statusCode ?? 0,
-          headers_cid: respHeaderBlob.cid,
-          body_cid: respBodyBlob.cid,
-          stop_reason: stopReason,
+          status: 502,
+          error_message: err.message,
         },
-        sessionId,
-        [respHeaderBlob.ref, respBodyBlob.ref],
       )
+      resolve()
     })
 
-    upstreamRes.on('error', (err) => {
-      ctx.producer.emit(
-        'proxy.response_aborted',
-        { request_event_id: requestEvent.id, reason: `upstream_stream_error: ${err.message}` },
-        sessionId,
-      )
+    upstreamReq.on('response', (upstreamRes) => {
+      responseStarted = true
+      void (async (): Promise<void> => {
+        try {
+          const contentType = upstreamRes.headers['content-type'] ?? ''
+          const contentEncoding = String(upstreamRes.headers['content-encoding'] ?? 'identity')
+          const isSse = contentType.includes('text/event-stream')
+
+          const respHeaderJson = Buffer.from(
+            JSON.stringify(redactHeaders(upstreamRes.headers, ctx.redactSet)),
+            'utf8',
+          )
+          const respHeaderBlob = await blobRefFromBytes(respHeaderJson)
+
+          res.writeHead(
+            upstreamRes.statusCode ?? 502,
+            filterResponseHeaders(upstreamRes.headers),
+          )
+
+          const responseChunks: Buffer[] = []
+          const sseParser = isSse ? new SseStopReasonParser() : null
+          let clientAborted = false
+          let upstreamEnded = false
+
+          res.on('close', () => {
+            if (!upstreamEnded && !res.writableEnded) clientAborted = true
+          })
+
+          upstreamRes.on('data', (chunk: Buffer) => {
+            res.write(chunk)
+            responseChunks.push(chunk)
+            if (sseParser) sseParser.feed(chunk)
+          })
+
+          await new Promise<void>((done) => {
+            upstreamRes.on('end', () => {
+              upstreamEnded = true
+              res.end()
+              if (sseParser) sseParser.end()
+              done()
+            })
+            upstreamRes.on('error', (err) => {
+              if (!res.writableEnded) res.destroy(err)
+              emitTerminal(
+                'proxy.response_aborted',
+                {
+                  request_event_id: requestEvent.id,
+                  reason: `upstream_stream_error: ${err.message}`,
+                },
+              )
+              done()
+            })
+          })
+
+          // Terminal event already emitted via the upstream_stream_error path.
+          if (terminalEmitted) {
+            resolve()
+            return
+          }
+
+          const rawResponse = Buffer.concat(responseChunks)
+          const respBodyBlob = await blobRefFromBytes(rawResponse)
+
+          let stopReason: string | null = null
+          if (isSse) {
+            stopReason = sseParser!.snapshot().stopReason
+          }
+          else {
+            try {
+              const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
+              stopReason = extractStopReasonFromJsonBody(decompressed.toString('utf8'))
+            }
+            catch {
+              stopReason = null
+            }
+          }
+
+          if (clientAborted) {
+            emitTerminal(
+              'proxy.response_aborted',
+              { request_event_id: requestEvent.id, reason: 'client_disconnect' },
+            )
+          }
+          else {
+            emitTerminal(
+              'proxy.response_completed',
+              {
+                request_event_id: requestEvent.id,
+                status: upstreamRes.statusCode ?? 0,
+                headers_cid: respHeaderBlob.cid,
+                body_cid: respBodyBlob.cid,
+                stop_reason: stopReason,
+              },
+              [respHeaderBlob.ref, respBodyBlob.ref],
+            )
+          }
+          resolve()
+        }
+        catch (err) {
+          // Any unexpected failure in the async response path: emit terminal
+          // error so the projector sees a dangling Version, and unblock the
+          // client if we haven't responded yet.
+          const message = (err as Error).message ?? String(err)
+          if (!res.headersSent) {
+            res.writeHead(500, { 'content-type': 'text/plain' })
+            res.end(`proxy error: ${message}\n`)
+          }
+          else if (!res.writableEnded) {
+            res.destroy(err as Error)
+          }
+          emitTerminal(
+            'proxy.upstream_error',
+            {
+              request_event_id: requestEvent.id,
+              status: 500,
+              error_message: `proxy_handler_exception: ${message}`,
+            },
+          )
+          resolve()
+        }
+      })()
     })
+
+    if (bodyToForward.byteLength > 0) upstreamReq.write(bodyToForward)
+    upstreamReq.end()
   })
-
-  if (bodyToForward.byteLength > 0) upstreamReq.write(bodyToForward)
-  upstreamReq.end()
 }

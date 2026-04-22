@@ -235,4 +235,142 @@ describe('proxy pass-through + event emission', () => {
     const payload = await waitForEvent(fx.db, 'proxy.upstream_error') as { status: number }
     expect(payload.status).toBe(502)
   })
+
+  it('rejects absolute URLs with 400 (SSRF guard)', async () => {
+    // Use a mock upstream we can observe: if SSRF worked, THIS server would
+    // see the request. We assert it does NOT.
+    let upstreamHit = false
+    mock = await startMock((_req, res) => {
+      upstreamHit = true
+      res.writeHead(200)
+      res.end('ok')
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: 'http://127.0.0.1:1',  // unreachable; any forwarded request fails
+    })
+
+    // Craft an absolute-form request line by hand. `fetch` normalizes paths,
+    // so we open a raw TCP socket.
+    const net = await import('node:net')
+    const response = await new Promise<string>((resolve, reject) => {
+      const sock = net.createConnection(proxy!.port, '127.0.0.1', () => {
+        const absPath = `http://127.0.0.1:${mock!.port}/v1/messages`
+        sock.write(
+          `POST ${absPath} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n`,
+        )
+      })
+      const chunks: Buffer[] = []
+      sock.on('data', (c: Buffer) => chunks.push(c))
+      sock.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+      sock.on('error', reject)
+      setTimeout(() => sock.end(), 500)
+    })
+    // The key property: the upstream we named in the absolute URL must NOT
+    // have been hit. Either the router rejects (404 because path doesn't
+    // start with /v1/) or the handler's SSRF guard rejects (400). Both are
+    // correct; both prevent the SSRF.
+    expect(response).toMatch(/HTTP\/1\.1 (400|404)/)
+    expect(upstreamHit).toBe(false)
+  })
+
+  it('serializes /v1/messages per session (second request waits for first response to complete)', async () => {
+    const order: string[] = []
+    let release1: (() => void) | null = null
+    mock = await startMock((_req, res, body) => {
+      const parsed = JSON.parse(body.toString('utf8')) as { tag: string }
+      order.push(`start:${parsed.tag}`)
+      const reply = (): void => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ stop_reason: 'end_turn' }))
+        order.push(`end:${parsed.tag}`)
+      }
+      if (parsed.tag === 'a') {
+        release1 = reply
+      }
+      else {
+        reply()
+      }
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    const send = (tag: string) => fetch(`http://127.0.0.1:${proxy!.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: 'sess-order' },
+      body: JSON.stringify({ tag }),
+    }).then(r => r.text())
+
+    const p1 = send('a')
+    // Give a beat for p1 to reach the mock.
+    await new Promise(r => setTimeout(r, 30))
+    const p2 = send('b')
+    await new Promise(r => setTimeout(r, 50))
+
+    // At this point, a should have started but b should not have — serialized.
+    expect(order).toEqual(['start:a'])
+    release1!()
+    await Promise.all([p1, p2])
+    expect(order).toEqual(['start:a', 'end:a', 'start:b', 'end:b'])
+  })
+
+  it('strips hop-by-hop response headers (transfer-encoding, connection)', async () => {
+    mock = await startMock((_req, res) => {
+      // Write with an explicit hop-by-hop header that must NOT reach the client.
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'connection': 'close',
+        'transfer-encoding': 'chunked',
+      })
+      res.end(JSON.stringify({ stop_reason: 'end_turn' }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: 'sess-hbh' },
+      body: JSON.stringify({}),
+    })
+    await res.text()
+    // Node's fetch normalizes casing. The hop-by-hop headers must not have
+    // been forwarded; Node re-frames the response itself.
+    expect(res.headers.get('connection')).not.toBe('close')
+  })
+
+  it('does NOT consume TOBE for non-messages /v1/* paths', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: [] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    const sessionId = 'sess-nontarget'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'only-apply-to-messages' }],
+      fork_point_version_id: 'v-keep',
+      source_view_id: 'view-keep',
+    })
+    // Hit /v1/models — must NOT consume the pending TOBE.
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/models`, {
+      method: 'GET',
+      headers: { [SESSION_HEADER]: sessionId },
+    })
+    // TOBE should still be there for the next /v1/messages.
+    const stillPending = fx.tobeStore.consume(sessionId)
+    expect(stillPending).not.toBeNull()
+    expect(stillPending!.fork_point_version_id).toBe('v-keep')
+  })
 })

@@ -46,7 +46,13 @@ export function createTobeStore(dir: string): TobeStore {
   }
 
   function write(sessionId: string, pending: TobePending): void {
-    fs.writeFileSync(fileFor(sessionId), JSON.stringify(pending))
+    // Atomic write: staging file + rename. Otherwise a concurrent consume()
+    // could read a partially flushed file, parse fails silently, and the
+    // fork intent is lost.
+    const target = fileFor(sessionId)
+    const tmp = `${target}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(pending))
+    fs.renameSync(tmp, target)
   }
 
   function consume(sessionId: string): TobePending | null {
