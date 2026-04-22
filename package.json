@@ -1,0 +1,70 @@
+{
+  "name": "@playtiss/proxy",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "description": "Recording + replay proxy for Claude Code sessions. Records LLM calls as an append-only event log in the Playtiss Collaboration Protocol vocabulary.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WujiLabs/playtiss.git",
+    "directory": "playtiss-proxy"
+  },
+  "homepage": "https://github.com/WujiLabs/playtiss/tree/master/playtiss-proxy",
+  "keywords": [
+    "playtiss",
+    "claude",
+    "claude-code",
+    "mcp",
+    "proxy",
+    "anthropic",
+    "event-sourcing",
+    "workflow",
+    "dag"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "playtiss-proxy": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo tsconfig.build.tsbuildinfo",
+    "prebuild": "npm run clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@playtiss/core": "workspace:*",
+    "better-sqlite3": "catalog:"
+  },
+  "devDependencies": {
+    "@eslint/js": "catalog:",
+    "@stylistic/eslint-plugin": "catalog:",
+    "@types/better-sqlite3": "catalog:",
+    "@types/node": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "eslint": "catalog:",
+    "globals": "catalog:",
+    "typescript": "catalog:",
+    "typescript-eslint": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
