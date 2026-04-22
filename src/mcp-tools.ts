@@ -16,11 +16,25 @@
 // yet for this session.
 
 import { generateTraceId } from '@playtiss/core'
+import { blobRefFromBytes } from './body-blob.js'
 import type { DB } from './db.js'
 import type { EventProducer } from './events.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpToolHandler } from './mcp-handler.js'
 import type { TobeStore } from './tobe.js'
+
+/**
+ * Safety cap on fork_back's user message. Anything larger hints at abuse;
+ * legit prompts stay well under this. Also applies to the whole serialized
+ * inputs object (n + message).
+ */
+export const MAX_FORK_BACK_MESSAGE_BYTES = 1024 * 1024  // 1 MiB
+
+/**
+ * Safety cap on fork_show walk-back depth. Prevents unbounded CPU from a
+ * cyclic parent chain (corrupted projection) or pathologically deep session.
+ */
+export const FORK_SHOW_MAX_DEPTH = 1000
 
 interface ForkToolDeps {
   db: DB
@@ -99,12 +113,15 @@ function requestBodyCidFor(db: DB, versionId: string): string | null {
 }
 
 /**
- * Find ANY child of a Version. Fork-point reconstruction needs the child's
- * request body to recover the messages[] prefix at the fork point.
+ * Find the EARLIEST child of a Version. Fork-point reconstruction needs the
+ * child's request body to recover the messages[] prefix at the fork point.
+ * Ordering by created_at/id gives deterministic behavior across SQLite builds
+ * and across projection rebuilds — same events → same reconstructed messages.
  */
 function firstChild(db: DB, parentVersionId: string): VersionRow | undefined {
   return db.prepare(`
-    SELECT * FROM versions WHERE parent_version_id = ? LIMIT 1
+    SELECT * FROM versions WHERE parent_version_id = ?
+     ORDER BY created_at ASC, id ASC LIMIT 1
   `).get(parentVersionId) as VersionRow | undefined
 }
 
@@ -162,11 +179,14 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     }
 
     // Walk backward to find the chain of open Versions preceding this one,
-    // up to (but not including) the previous closed_forkable. Gives the caller
-    // a view of the tool-use chain that produced this turn.
+    // up to (but not including) the previous closed_forkable. Capped in depth
+    // and by visited-set to survive corrupt or cyclic parent chains.
     const preceding: string[] = []
+    const visited = new Set<string>([ver.id])
     let cursor: string | null = ver.parent_version_id
-    while (cursor) {
+    for (let i = 0; cursor && i < FORK_SHOW_MAX_DEPTH; i++) {
+      if (visited.has(cursor)) break  // cycle — stop
+      visited.add(cursor)
       const parent = loadVersion(deps.db, cursor)
       if (!parent || parent.classification === 'closed_forkable') break
       preceding.push(parent.id)
@@ -224,15 +244,19 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     const message = typeof parsed?.message === 'string' ? parsed.message : null
     if (!Number.isInteger(n) || n < 1) return { error: '`n` must be an integer ≥ 1' }
     if (!message) return { error: '`message` is required' }
+    if (Buffer.byteLength(message, 'utf8') > MAX_FORK_BACK_MESSAGE_BYTES) {
+      return { error: `message exceeds ${MAX_FORK_BACK_MESSAGE_BYTES} bytes; trim your prompt` }
+    }
 
     // F7 feature gate.
     if (deps.forkBackEnabled === false) {
-      const bodyBytes = new TextEncoder().encode(JSON.stringify({ n, message }))
+      const bodyBytes = Buffer.from(JSON.stringify({ n, message }), 'utf8')
+      const inputsBlob = await blobRefFromBytes(bodyBytes)
       ctx.producer.emit(
         'fork.back_disabled_rejected',
-        { inputs_cid: 'inline' },
+        { inputs_cid: inputsBlob.cid },
         ctx.sessionId,
-        [{ cid: `bafy-inputs-${ctx.sessionId}-${Date.now()}`, bytes: bodyBytes }],
+        [inputsBlob.ref],
       )
       return {
         error: 'fork_back disabled; proxy running in recording-only mode. Set PLAYTISS_PROXY_FORK_BACK_ENABLED=1 to enable.',
@@ -282,23 +306,20 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
 
     // Reconstruct messages[] at the fork point. Prefer a child's request
     // body (which already includes target's assistant response); fall back
-    // to the target's own request body if no child exists yet.
-    const child = firstChild(deps.db, target.id)
-    let baseMessages: unknown[]
-    const sourceCid = child ? requestBodyCidFor(deps.db, child.id) : requestBodyCidFor(deps.db, target.id)
-    if (!sourceCid) {
-      return { error: 'unable to locate request body blob for fork reconstruction' }
-    }
-    const bytes = loadBlob(deps.db, sourceCid)
-    if (!bytes) return { error: 'fork source blob missing from store' }
-    try {
-      const parsedBody = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
-      baseMessages = Array.isArray(parsedBody.messages) ? [...parsedBody.messages] : []
-    }
-    catch {
-      return { error: 'fork source blob is not valid JSON' }
+    // to the target's own request body if no child exists OR the child's
+    // body is malformed. This maximises the chance of a successful fork
+    // reconstruction on imperfect data.
+    const baseMessages = reconstructForkMessages(deps.db, target)
+    if (!baseMessages) {
+      return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
     }
     baseMessages.push({ role: 'user', content: message })
+
+    // Compute a real CID for the new message so downstream consumers can
+    // resolve new_message_cid via the blobs table.
+    const newMessageBlob = await blobRefFromBytes(
+      Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
+    )
 
     // Report the prior fork's outcome (A-R8 "return outcome on next call"):
     // if the previous TOBE-applied request ended in failure, the LLM sees
@@ -306,12 +327,10 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     const prior = lastForkOutcome(deps.db, ctx.sessionId)
 
     const targetViewId = generateTraceId()
-    const forkBackEventId = generateTraceId()
     deps.tobeStore.write(ctx.sessionId, {
       messages: baseMessages,
       fork_point_version_id: target.id,
       source_view_id: ctx.sessionId,  // placeholder until explicit source view passed in
-      fork_back_event_id: forkBackEventId,
     })
 
     ctx.producer.emit(
@@ -319,11 +338,12 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       {
         source_view_id: ctx.sessionId,
         fork_point_version_id: target.id,
-        new_message_cid: 'inline',
+        new_message_cid: newMessageBlob.cid,
         target_view_id: targetViewId,
         task_id: sess.task_id,
       },
       ctx.sessionId,
+      [newMessageBlob.ref],
     )
 
     return {
@@ -336,4 +356,35 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
   })
 
   return tools
+}
+
+/**
+ * Reconstruct the messages[] array at a fork point. Tries the earliest
+ * child's request body first (contains target's assistant response); if that
+ * fails (no child / missing blob / malformed JSON), falls back to the
+ * target's OWN request body (won't include target's assistant response but
+ * is a valid conversation prefix).
+ *
+ * Returns null only if NEITHER source yields a valid messages array.
+ */
+function reconstructForkMessages(db: DB, target: VersionRow): unknown[] | null {
+  const attempts: string[] = []
+  const child = firstChild(db, target.id)
+  if (child) {
+    const childCid = requestBodyCidFor(db, child.id)
+    if (childCid) attempts.push(childCid)
+  }
+  const targetCid = requestBodyCidFor(db, target.id)
+  if (targetCid) attempts.push(targetCid)
+
+  for (const cid of attempts) {
+    const bytes = loadBlob(db, cid)
+    if (!bytes) continue
+    try {
+      const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
+      if (Array.isArray(parsed.messages)) return [...parsed.messages]
+    }
+    catch { /* try next */ }
+  }
+  return null
 }

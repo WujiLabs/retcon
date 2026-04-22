@@ -214,6 +214,43 @@ describe('MCP /mcp route', () => {
     expect((json as { result: unknown }).result).toEqual({})
   })
 
+  it('initialize is idempotent — reuses an existing Mcp-Session-Id', async () => {
+    handle = await startWithTools(fx, new Map())
+    const first = await postJsonRpc(handle.port, {
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { clientInfo: { name: 'c' } },
+    })
+    const firstSid = first.headers[MCP_SESSION_HEADER]
+    expect(firstSid).toBeTruthy()
+
+    // Client re-initializes (e.g. after reconnect) with the prior session id.
+    const second = await postJsonRpc(
+      handle.port,
+      { jsonrpc: '2.0', id: 2, method: 'initialize', params: { clientInfo: { name: 'c' } } },
+      { [MCP_SESSION_HEADER]: firstSid },
+    )
+    expect(second.headers[MCP_SESSION_HEADER]).toBe(firstSid)
+
+    // Only one sessions row exists.
+    const rows = fx.db
+      .prepare('SELECT COUNT(*) AS n FROM sessions WHERE id = ?')
+      .get(firstSid) as { n: number }
+    expect(rows.n).toBe(1)
+  })
+
+  it('rejects POST bodies over 1MB with 413', async () => {
+    handle = await startWithTools(fx, new Map())
+    // Craft a body just over the limit. JSON-parsing the oversize body never
+    // happens — the reader bails during data.
+    const big = 'x'.repeat(1024 * 1024 + 100)
+    const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: `{"jsonrpc":"2.0","id":1,"method":"ping","fluff":"${big}"}`,
+    })
+    expect(res.status).toBe(413)
+  })
+
   it('unknown method returns method not found', async () => {
     handle = await startWithTools(fx, new Map())
     const init = await postJsonRpc(handle.port, {

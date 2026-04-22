@@ -98,6 +98,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const mcpCtx: McpContext = {
     producer: options.producer,
     tools: options.mcpTools ?? new Map(),
+    sessionQueue,  // shared with the /v1/* proxy so tools/call serializes with /v1/messages
   }
 
   const server = http.createServer((req, res) => {

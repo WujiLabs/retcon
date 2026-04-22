@@ -21,16 +21,31 @@
 import http from 'node:http'
 import { generateTraceId } from '@playtiss/core'
 import type { EventProducer } from './events.js'
+import type { SessionQueue } from './session-queue.js'
 import { VERSION } from './version.js'
 
 export const MCP_SESSION_HEADER = 'mcp-session-id'
 
 export const PROTOCOL_VERSION = '2025-03-26'
 
+/**
+ * Cap on POST body size. MCP requests are small JSON-RPC envelopes; anything
+ * larger is either abuse or a client bug. 1 MiB leaves plenty of headroom for
+ * tools/call with reasonable argument sizes.
+ */
+export const MCP_MAX_BODY_BYTES = 1024 * 1024
+
 export interface McpContext {
   readonly producer: EventProducer
   /** Tool handlers keyed by name. Wired in C8. */
   readonly tools: Map<string, McpToolHandler>
+  /**
+   * Session queue shared with the /v1/* handler. `tools/call` invocations
+   * run through this queue so fork_back's guard reads + TOBE write + event
+   * emit are serialized with any concurrent /v1/messages for the same session
+   * (TOC/TOU defense per A-WR1).
+   */
+  readonly sessionQueue?: SessionQueue
 }
 
 export type McpToolHandler = (
@@ -84,7 +99,19 @@ export async function handleMcpRequest(
     return
   }
 
-  const raw = await readRequestBody(req)
+  let raw: Buffer
+  try {
+    raw = await readRequestBody(req)
+  }
+  catch (err) {
+    // Body read failed (oversize, network drop). Can't send a proper JSON-RPC
+    // reply on some error paths; best-effort 413 if headers not yet sent.
+    if (!res.headersSent) {
+      res.writeHead(413, { 'content-type': 'text/plain' })
+      res.end((err as Error).message + '\n')
+    }
+    return
+  }
   let parsed: JsonRpcRequest
   try {
     parsed = JSON.parse(raw.toString('utf8')) as JsonRpcRequest
@@ -104,7 +131,7 @@ export async function handleMcpRequest(
   try {
     switch (parsed.method) {
       case 'initialize':
-        await handleInitialize(parsed, res, ctx)
+        await handleInitialize(parsed, req, res, ctx)
         return
       case 'initialized':
       case 'notifications/initialized':
@@ -146,12 +173,24 @@ function listTools(ctx: McpContext): Array<{ name: string, description: string }
 
 async function handleInitialize(
   req: JsonRpcRequest,
+  httpReq: http.IncomingMessage,
   res: http.ServerResponse,
   ctx: McpContext,
 ): Promise<void> {
-  // Mint a new MCP session id. Emits mcp.session_initialized which sessions_v1
-  // projects into a sessions row.
-  const sessionId = generateTraceId()
+  // Idempotent initialize: if the client echoed an existing Mcp-Session-Id
+  // (e.g. reconnect after a transient network blip), reuse that id rather
+  // than minting a fresh session. Prevents duplicate sessions rows and
+  // follows MCP spec intent — initialize is part of session setup, not
+  // session creation per call.
+  //
+  // Note: we don't read the sessions table here because sessions_v1 runs in
+  // the same projector chain as the producer we're emitting on, and cross-
+  // transaction consistency would require a separate query. Instead we re-
+  // emit on the existing id; projector INSERT OR IGNORE + ON CONFLICT keeps
+  // the row stable.
+  const existing = extractSessionId(httpReq)
+  const sessionId = existing && existing.length > 0 ? existing : generateTraceId()
+
   const params = (req.params ?? {}) as {
     clientInfo?: { name?: string, version?: string }
   }
@@ -200,10 +239,17 @@ async function handleToolsCall(
     sendJsonRpcError(res, req.id ?? null, METHOD_NOT_FOUND, `unknown tool: ${toolName}`)
     return
   }
-  const result = await handler(params?.arguments ?? {}, {
+  // Route tool invocation through the shared session queue if provided.
+  // This closes a TOC/TOU window in fork_back: the handler's guard read +
+  // TOBE write + event emit are atomic with respect to any concurrent
+  // /v1/messages the proxy is processing for the same session.
+  const invoke = (): Promise<unknown> => handler(params?.arguments ?? {}, {
     sessionId,
     producer: ctx.producer,
   })
+  const result = ctx.sessionQueue
+    ? await ctx.sessionQueue.run(sessionId, invoke)
+    : await invoke()
   sendJsonRpcResult(res, req.id ?? null, sessionId, {
     content: [{ type: 'text', text: JSON.stringify(result) }],
   })
@@ -243,8 +289,28 @@ function extractSessionId(req: http.IncomingMessage): string | undefined {
 function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    req.on('data', (c: Buffer) => chunks.push(c))
-    req.on('end', () => resolve(Buffer.concat(chunks)))
+    let total = 0
+    let overflowed = false
+    req.on('data', (c: Buffer) => {
+      total += c.length
+      if (total > MCP_MAX_BODY_BYTES) {
+        overflowed = true
+        // Keep draining to a no-op so the client finishes cleanly and the
+        // 413 response actually reaches it. Destroying the request aborts
+        // the TCP socket and the client surfaces a generic network error
+        // instead of the 413 status.
+        return
+      }
+      if (!overflowed) chunks.push(c)
+    })
+    req.on('end', () => {
+      if (overflowed) {
+        reject(new Error(`request body exceeds ${MCP_MAX_BODY_BYTES} bytes`))
+      }
+      else {
+        resolve(Buffer.concat(chunks))
+      }
+    })
     req.on('error', reject)
   })
 }

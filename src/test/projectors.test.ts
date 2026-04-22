@@ -76,6 +76,49 @@ describe('sessions_v1', () => {
     expect(row.task_id).toBeTruthy()
   })
 
+  it('upgrades an orphan session when mcp.session_initialized arrives later (A-WR7)', () => {
+    const { db, producer } = fixture()
+    // /v1/* traffic arrives first → orphan row.
+    producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b' },
+      'sess-upgrade',
+    )
+    const before = db.prepare('SELECT harness, pid FROM sessions WHERE id = ?').get('sess-upgrade') as
+      | { harness: string, pid: number | null } | undefined
+    expect(before?.harness).toBe('orphan')
+
+    // Later, the MCP skill initializes for the same session.
+    producer.emit(
+      'mcp.session_initialized',
+      { mcp_session_id: 'sess-upgrade', pid: 4242, harness: 'claude-code' },
+      'sess-upgrade',
+    )
+    const after = db.prepare('SELECT harness, pid FROM sessions WHERE id = ?').get('sess-upgrade') as
+      { harness: string, pid: number | null }
+    expect(after.harness).toBe('claude-code')
+    expect(after.pid).toBe(4242)
+  })
+
+  it('does NOT downgrade a real harness back to orphan on second init (A-WR7 edge)', () => {
+    const { db, producer } = fixture()
+    producer.emit(
+      'mcp.session_initialized',
+      { mcp_session_id: 's', pid: 1, harness: 'claude-code' },
+      'sess-stay',
+    )
+    // Another init with no harness arg (e.g. a reconnect with missing clientInfo).
+    producer.emit(
+      'mcp.session_initialized',
+      { mcp_session_id: 's', harness: 'unknown' },
+      'sess-stay',
+    )
+    const row = db.prepare('SELECT harness FROM sessions WHERE id = ?').get('sess-stay') as
+      { harness: string }
+    // UPSERT only overrides orphan; real harness stays.
+    expect(row.harness).toBe('claude-code')
+  })
+
   it('mints deterministic task_id across replays', () => {
     const { db: db1, producer: p1 } = fixture()
     const { db: db2, producer: p2 } = fixture()

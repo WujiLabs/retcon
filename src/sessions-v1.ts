@@ -45,13 +45,21 @@ export class SessionsV1Projector implements Projection {
 
   private onMcpInitialized(event: Event<McpSessionInitializedPayload>, tx: DB): void {
     if (!event.sessionId) return
-    // Insert session + task as a pair. INSERT OR IGNORE makes the projector
-    // idempotent on replay: if sessions_v1's offset gets rewound and the
-    // same event replays, we don't create duplicate rows.
     const taskId = this.getOrMintTaskId(event.sessionId, tx)
+    // UPSERT so an existing orphan row (created by onOrphanFallback when a
+    // /v1/* request arrived before mcp.session_initialized) gets upgraded to
+    // the real harness + pid. Without this, the orphan harness sticks and
+    // fork_back refuses to work on what is actually a proper MCP session.
+    // Replay-safe: same event id projected twice sets the same values.
     tx.prepare(`
-      INSERT OR IGNORE INTO sessions (id, task_id, pid, harness, created_at)
+      INSERT INTO sessions (id, task_id, pid, harness, created_at)
       VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        pid = COALESCE(excluded.pid, sessions.pid),
+        harness = CASE
+          WHEN sessions.harness = 'orphan' THEN excluded.harness
+          ELSE sessions.harness
+        END
     `).run(
       event.sessionId,
       taskId,

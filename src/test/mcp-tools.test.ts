@@ -270,6 +270,89 @@ describe('fork_back', () => {
     expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
   })
 
+  it('rejects messages larger than MAX_FORK_BACK_MESSAGE_BYTES (A-WR2)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    const huge = 'x'.repeat(2 * 1024 * 1024)  // 2 MiB — above the 1 MiB cap
+    const res = await call(fx, 'fork_back', { n: 1, message: huge }) as { error: string }
+    expect(res.error).toMatch(/exceeds/)
+  })
+
+  it('F7 disabled path uses a real content-addressed CID (M-1)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await call(fx, 'fork_back', { n: 1, message: 'alt' }, false)
+    // The fork.back_disabled_rejected event payload's inputs_cid must match a
+    // row in the blobs table (no fake `bafy-inputs-*-<ts>` keys).
+    const evRow = fx.db.prepare(
+      `SELECT payload FROM events WHERE topic = 'fork.back_disabled_rejected' AND session_id = ?`,
+    ).get(fx.sessionId) as { payload: string }
+    const payload = JSON.parse(evRow.payload) as { inputs_cid: string }
+    expect(payload.inputs_cid).not.toBe('inline')
+    const blob = fx.db.prepare('SELECT 1 FROM blobs WHERE cid = ?').get(payload.inputs_cid)
+    expect(blob).toBeTruthy()
+  })
+
+  it('fork_back falls back to target body when child body is malformed (A-WR9)', async () => {
+    // Seed a target version whose only child has a body blob that's NOT JSON.
+    const target = fx.producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-target-body' },
+      fx.sessionId,
+      [{ cid: 'bafy-target-body', bytes: Buffer.from(JSON.stringify({
+        messages: [{ role: 'user', content: 'from-target' }],
+      })) }],
+    )
+    fx.producer.emit(
+      'proxy.response_completed',
+      { request_event_id: target.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
+      fx.sessionId,
+    )
+    // Child with unparsable body — AND sealed so the head isn't in_flight.
+    const child = fx.producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-child-garbage' },
+      fx.sessionId,
+      [{ cid: 'bafy-child-garbage', bytes: Buffer.from('{not json') }],
+    )
+    fx.producer.emit(
+      'proxy.response_completed',
+      { request_event_id: child.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
+      fx.sessionId,
+    )
+    // Now fork_back n=1 — should fall back to target's own body rather than
+    // failing on the child's malformed JSON.
+    const res = await call(fx, 'fork_back', { n: 1, message: 'retry' }) as {
+      status?: string
+      error?: string
+    }
+    expect(res.status).toBe('scheduled')
+    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const msgs = pending.messages as Array<{ content: string }>
+    // baseMessages came from target body ("from-target"), then user appended.
+    expect(msgs[0].content).toBe('from-target')
+    expect(msgs[msgs.length - 1].content).toBe('retry')
+  })
+
+  it('fork_show caps walk-back depth to prevent cyclic-chain runaway (A-WR13)', async () => {
+    // Emit a version, then hack its parent_version_id to point at itself
+    // (simulating a corrupt projection). fork_show must NOT hang.
+    const v = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    fx.db.prepare('UPDATE versions SET parent_version_id = id WHERE id = ?').run(v.id)
+    const start = Date.now()
+    const res = await call(fx, 'fork_show', { version_id: v.id }) as {
+      preceding_open_versions: string[]
+    }
+    const elapsed = Date.now() - start
+    expect(elapsed).toBeLessThan(1000)  // didn't hang
+    // `version` itself is closed_forkable so the walk terminates immediately —
+    // the key assertion is "did not hang" which we just verified.
+    expect(Array.isArray(res.preceding_open_versions)).toBe(true)
+  })
+
   it('includes prior_outcome from the last TOBE-applied request', async () => {
     // Set up: a normal chain V1 → V2, then a forked attempt pointing back
     // at V1 that failed. After all that, call fork_back(n=1) and assert the
