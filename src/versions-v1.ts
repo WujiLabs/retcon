@@ -161,6 +161,16 @@ export class VersionsV1Projector implements Projection {
     // one becomes seal-ready). Per the session sequencing invariant, there's
     // never more than one in-flight Version per task at a time, so the prior
     // sealed Version is unambiguous.
+    //
+    // KNOWN LIMITATION (KL-1 in the plan, adversarial finding A-WR3): this
+    // query picks the most-recently-sealed Version for the Task with no
+    // awareness of which branch the user is currently on. If a user on a
+    // fork branch issues a non-fork request (no `tobe_applied_from`), the
+    // new Version will be parented to the fork's leaf rather than the main
+    // branch's leaf. Not reachable through Claude Code's normal turn-serial
+    // flow; switching branches always goes through fork_back which sets
+    // tobe_applied_from and bypasses this fallback. v1.1 adds a per-request
+    // branch context that will replace this heuristic.
     const prior = tx.prepare(`
       SELECT id FROM versions
        WHERE task_id = ?

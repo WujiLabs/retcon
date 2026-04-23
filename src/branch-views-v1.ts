@@ -92,6 +92,15 @@ export class BranchViewsV1Projector implements Projection {
   private onResponseCompleted(event: Event<ResponseCompletedPayload>, tx: DB): void {
     // Advance any branch_view whose head was the parent of this newly-sealed
     // Version. versions_v1 has already set parent_version_id in this same tx.
+    //
+    // KNOWN LIMITATION (KL-2 in the plan, adversarial finding A-WR4): the
+    // UPDATE matches ALL views with head=parent, so two views sitting at the
+    // same Version advance in lock-step forever. In the v1 UX this is actually
+    // the desired behavior — `fork_bookmark` creates a view at the current
+    // head alongside any existing view, and they track together until the user
+    // forks. True branch divergence without fork_back is a v1.1 concern; fixed
+    // when per-request branch context is plumbed through (see versions-v1.ts
+    // KL-1 comment).
     const ver = tx.prepare(
       `SELECT id, task_id, parent_version_id FROM versions WHERE id = ?`,
     ).get(event.payload.request_event_id) as
