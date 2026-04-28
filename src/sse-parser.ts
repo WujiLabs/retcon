@@ -153,3 +153,16 @@ export function extractStopReasonFromJsonBody(body: string): string | null {
     return null
   }
 }
+
+/**
+ * Extract `stop_reason` from a complete (already-decompressed) Anthropic SSE
+ * response body. Wraps the streaming parser for callers that have buffered
+ * the full body — simpler than maintaining a streaming-decompress pipeline
+ * during chunk arrival when content-encoding is gzip.
+ */
+export function extractStopReasonFromSseBody(body: string): string | null {
+  const parser = new SseStopReasonParser()
+  parser.feed(body)
+  parser.end()
+  return parser.snapshot().stopReason
+}

@@ -27,7 +27,7 @@ import type { EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import type { SessionQueue } from './session-queue.js'
-import { extractStopReasonFromJsonBody, SseStopReasonParser } from './sse-parser.js'
+import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
 import { computeRevisionAsset } from './revisions-v1.js'
 
@@ -47,13 +47,6 @@ const SKIP_REQUEST_HEADERS = new Set([
   'trailer',
   'upgrade',
   'expect',           // Expect: 100-continue would stall upstream
-  // Strip accept-encoding so upstream sends UNCOMPRESSED bytes. We need raw
-  // SSE frames to feed to SseStopReasonParser as the stream arrives — if we
-  // forwarded gzip and got gzip back, the parser would see compressed
-  // garbage and fail to extract stop_reason from message_delta events,
-  // which would mis-classify every revision as dangling_unforkable. Cost:
-  // a few extra bytes on the localhost loopback. Worth it.
-  'accept-encoding',
 ])
 
 // Same list for the RESPONSE direction: Node re-chunks and re-frames the
@@ -371,7 +364,6 @@ async function dispatch(
           )
 
           const responseChunks: Buffer[] = []
-          const sseParser = isSse ? new SseStopReasonParser() : null
           let clientAborted = false
           let upstreamEnded = false
 
@@ -379,17 +371,21 @@ async function dispatch(
             if (!upstreamEnded && !res.writableEnded) clientAborted = true
           })
 
+          // Pass through raw chunks to the client unchanged. Stop-reason
+          // extraction happens AFTER the stream ends, off the buffered body
+          // (decompressing as needed) — see below. We deliberately don't
+          // tap-parse during streaming because that would require a stream-
+          // ing zlib pipeline to handle content-encoding: gzip responses,
+          // and we already buffer the full body for blob storage anyway.
           upstreamRes.on('data', (chunk: Buffer) => {
             res.write(chunk)
             responseChunks.push(chunk)
-            if (sseParser) sseParser.feed(chunk)
           })
 
           await new Promise<void>((done) => {
             upstreamRes.on('end', () => {
               upstreamEnded = true
               res.end()
-              if (sseParser) sseParser.end()
               done()
             })
             upstreamRes.on('error', (err) => {
@@ -415,17 +411,15 @@ async function dispatch(
           const respBodyBlob = await blobRefFromBytes(rawResponse)
 
           let stopReason: string | null = null
-          if (isSse) {
-            stopReason = sseParser!.snapshot().stopReason
+          try {
+            const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
+            const text = decompressed.toString('utf8')
+            stopReason = isSse
+              ? extractStopReasonFromSseBody(text)
+              : extractStopReasonFromJsonBody(text)
           }
-          else {
-            try {
-              const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
-              stopReason = extractStopReasonFromJsonBody(decompressed.toString('utf8'))
-            }
-            catch {
-              stopReason = null
-            }
+          catch {
+            stopReason = null
           }
 
           if (clientAborted) {
