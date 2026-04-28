@@ -36,7 +36,7 @@ function warnUnknownOnce(stopReason: string): void {
   if (warned.has(stopReason)) return
   warned.add(stopReason)
   // eslint-disable-next-line no-console
-  console.warn(`[playtiss-proxy] unknown stop_reason="${stopReason}" — classified as dangling_unforkable`)
+  console.warn(`[retcon] unknown stop_reason="${stopReason}" — classified as dangling_unforkable`)
 }
 
 /** Test helper: reset the once-per-value warning cache. */

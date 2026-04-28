@@ -25,7 +25,7 @@ describe('db migrations', () => {
       'projection_offsets',
       'sessions',
       'tasks',
-      'versions',
+      'revisions',
       'branch_views',
     ]) {
       expect(names.has(expected)).toBe(true)

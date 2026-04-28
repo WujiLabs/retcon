@@ -96,25 +96,25 @@ describe('fork_list', () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
     const res = await call(fx, 'fork_list', {}) as {
       total: number
-      versions: Array<{ version_id: string, stop_reason: string }>
+      revisions: Array<{ revision_id: string, stop_reason: string }>
     }
     expect(res.total).toBe(2)
-    expect(res.versions.every(v => v.stop_reason === 'end_turn')).toBe(true)
+    expect(res.revisions.every(v => v.stop_reason === 'end_turn')).toBe(true)
   })
 
   it('returns empty list when no closed_forkable turns exist', async () => {
     emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])  // open only
     const res = await call(fx, 'fork_list', {}) as { total: number, versions: unknown[] }
     expect(res.total).toBe(0)
-    expect(res.versions).toEqual([])
+    expect(res.revisions).toEqual([])
   })
 
   it('respects limit and offset', async () => {
     for (let i = 0; i < 5; i++) emitTurn(fx, 'end_turn', [{ role: 'user', content: `q${i}` }])
     const r1 = await call(fx, 'fork_list', { limit: 2 }) as { versions: unknown[] }
-    expect(r1.versions.length).toBe(2)
+    expect(r1.revisions.length).toBe(2)
     const r2 = await call(fx, 'fork_list', { limit: 10, offset: 3 }) as { versions: unknown[] }
-    expect(r2.versions.length).toBe(2)  // 5 total, offset 3 → 2 remaining
+    expect(r2.revisions.length).toBe(2)  // 5 total, offset 3 → 2 remaining
   })
 })
 
@@ -127,17 +127,17 @@ describe('fork_show', () => {
     const t1 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
     const t2 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
     const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const res = await call(fx, 'fork_show', { version_id: t3.id }) as {
-      version: { id: string, classification: string }
-      preceding_open_versions: string[]
+    const res = await call(fx, 'fork_show', { revision_id: t3.id }) as {
+      revision: { id: string, classification: string }
+      preceding_open_revisions: string[]
     }
-    expect(res.version.id).toBe(t3.id)
-    expect(res.version.classification).toBe('closed_forkable')
-    expect(res.preceding_open_versions).toEqual([t2.id, t1.id])
+    expect(res.revision.id).toBe(t3.id)
+    expect(res.revision.classification).toBe('closed_forkable')
+    expect(res.preceding_open_revisions).toEqual([t2.id, t1.id])
   })
 
   it('errors when version_id is from a different session', async () => {
-    const res = await call(fx, 'fork_show', { version_id: 'ver-unknown' }) as { error: string }
+    const res = await call(fx, 'fork_show', { revision_id: 'rev-unknown' }) as { error: string }
     expect(res.error).toMatch(/not found/)
   })
 })
@@ -151,13 +151,13 @@ describe('fork_bookmark', () => {
     const req = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'fork_bookmark', { label: 'my-spot' }) as {
       view_id: string
-      head_version_id: string
+      head_revision_id: string
       label: string
     }
-    expect(res.head_version_id).toBe(req.id)
+    expect(res.head_revision_id).toBe(req.id)
     expect(res.label).toBe('my-spot')
     const row = fx.db.prepare('SELECT * FROM branch_views WHERE id = ?').get(res.view_id) as
-      | { label: string, head_version_id: string } | undefined
+      | { label: string, head_revision_id: string } | undefined
     expect(row?.label).toBe('my-spot')
   })
 
@@ -210,7 +210,7 @@ describe('fork_back', () => {
     // TOBE file written with the alternate user message appended.
     const pending = fx.tobeStore.peek(fx.sessionId)
     expect(pending).toBeTruthy()
-    expect(pending!.fork_point_version_id).toBe(t1.id)
+    expect(pending!.fork_point_revision_id).toBe(t1.id)
     const lastMsg = pending!.messages[pending!.messages.length - 1] as { role: string, content: string }
     expect(lastMsg.role).toBe('user')
     expect(lastMsg.content).toBe('alternate')
@@ -341,16 +341,16 @@ describe('fork_back', () => {
     // Emit a version, then hack its parent_version_id to point at itself
     // (simulating a corrupt projection). fork_show must NOT hang.
     const v = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    fx.db.prepare('UPDATE versions SET parent_version_id = id WHERE id = ?').run(v.id)
+    fx.db.prepare('UPDATE revisions SET parent_revision_id = id WHERE id = ?').run(v.id)
     const start = Date.now()
-    const res = await call(fx, 'fork_show', { version_id: v.id }) as {
-      preceding_open_versions: string[]
+    const res = await call(fx, 'fork_show', { revision_id: v.id }) as {
+      preceding_open_revisions: string[]
     }
     const elapsed = Date.now() - start
     expect(elapsed).toBeLessThan(1000)  // didn't hang
     // `version` itself is closed_forkable so the walk terminates immediately —
     // the key assertion is "did not hang" which we just verified.
-    expect(Array.isArray(res.preceding_open_versions)).toBe(true)
+    expect(Array.isArray(res.preceding_open_revisions)).toBe(true)
   })
 
   it('includes prior_outcome from the last TOBE-applied request', async () => {
@@ -375,7 +375,7 @@ describe('fork_back', () => {
       {
         method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid,
         tobe_applied_from: {
-          fork_point_version_id: V1.id,
+          fork_point_revision_id: V1.id,
           source_view_id: 'view-old',
           original_body_cid: 'b-orig',
         },

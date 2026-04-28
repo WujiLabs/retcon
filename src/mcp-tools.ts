@@ -8,11 +8,11 @@
 // Mcp-Session-Id header that the MCP handler extracts) and the producer,
 // and operates on the proxy's own SQLite DB.
 //
-// fork_back's F4 guard: reject when the current head Version is `open`
+// fork_back's F4 guard: reject when the current head Revision is `open`
 // (mid-tool-use) or `in_flight`. A fork from that state would inject a
 // fresh user message where Anthropic expects a tool_result.
 //
-// fork_bookmark's G10 guard: reject when no closed_forkable Version exists
+// fork_bookmark's G10 guard: reject when no closed_forkable Revision exists
 // yet for this session.
 
 import { generateTraceId } from '@playtiss/core'
@@ -48,11 +48,11 @@ interface SessionRow {
   harness: string | null
 }
 
-interface VersionRow {
+interface RevisionRow {
   id: string
   task_id: string
   asset_cid: string | null
-  parent_version_id: string | null
+  parent_revision_id: string | null
   classification: string
   stop_reason: string | null
   sealed_at: number | null
@@ -65,25 +65,25 @@ function loadSession(db: DB, sessionId: string): SessionRow | undefined {
     | undefined
 }
 
-function loadVersion(db: DB, versionId: string): VersionRow | undefined {
-  return db.prepare('SELECT * FROM versions WHERE id = ?').get(versionId) as VersionRow | undefined
+function loadRevision(db: DB, revisionId: string): RevisionRow | undefined {
+  return db.prepare('SELECT * FROM revisions WHERE id = ?').get(revisionId) as RevisionRow | undefined
 }
 
-function mostRecentVersion(db: DB, taskId: string): VersionRow | undefined {
-  // id DESC breaks ties when multiple Versions land in the same millisecond.
+function mostRecentRevision(db: DB, taskId: string): RevisionRow | undefined {
+  // id DESC breaks ties when multiple Revisions land in the same millisecond.
   // Event ids are monotonic within a producer (TraceIdGenerator sequence),
   // so id DESC is the correct stable order.
   return db.prepare(
-    'SELECT * FROM versions WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
-  ).get(taskId) as VersionRow | undefined
+    'SELECT * FROM revisions WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
+  ).get(taskId) as RevisionRow | undefined
 }
 
-function mostRecentForkableVersion(db: DB, taskId: string): VersionRow | undefined {
+function mostRecentForkableRevision(db: DB, taskId: string): RevisionRow | undefined {
   return db.prepare(`
-    SELECT * FROM versions
+    SELECT * FROM revisions
      WHERE task_id = ? AND classification = 'closed_forkable' AND sealed_at IS NOT NULL
      ORDER BY sealed_at DESC, id DESC LIMIT 1
-  `).get(taskId) as VersionRow | undefined
+  `).get(taskId) as RevisionRow | undefined
 }
 
 function loadBlob(db: DB, cid: string): Uint8Array | undefined {
@@ -93,15 +93,15 @@ function loadBlob(db: DB, cid: string): Uint8Array | undefined {
 }
 
 /**
- * Look up the request_received event for a given version id and return its
- * request body CID. Versions table doesn't carry this directly (the Version's
+ * Look up the request_received event for a given revision id and return its
+ * request body CID. Revisions table doesn't carry this directly (the Revision's
  * asset_cid points at the {request_body_cid, response_body_cid} DictAsset);
- * rather than parsing the asset, we query the events table by the version id.
+ * rather than parsing the asset, we query the events table by the revision id.
  */
-function requestBodyCidFor(db: DB, versionId: string): string | null {
+function requestBodyCidFor(db: DB, revisionId: string): string | null {
   const row = db.prepare(`
     SELECT payload FROM events WHERE event_id = ? AND topic = 'proxy.request_received'
-  `).get(versionId) as { payload: string } | undefined
+  `).get(revisionId) as { payload: string } | undefined
   if (!row) return null
   try {
     const parsed = JSON.parse(row.payload) as { body_cid?: string }
@@ -113,16 +113,16 @@ function requestBodyCidFor(db: DB, versionId: string): string | null {
 }
 
 /**
- * Find the EARLIEST child of a Version. Fork-point reconstruction needs the
+ * Find the EARLIEST child of a Revision. Fork-point reconstruction needs the
  * child's request body to recover the messages[] prefix at the fork point.
  * Ordering by created_at/id gives deterministic behavior across SQLite builds
  * and across projection rebuilds — same events → same reconstructed messages.
  */
-function firstChild(db: DB, parentVersionId: string): VersionRow | undefined {
+function firstChild(db: DB, parentRevisionId: string): RevisionRow | undefined {
   return db.prepare(`
-    SELECT * FROM versions WHERE parent_version_id = ?
+    SELECT * FROM revisions WHERE parent_revision_id = ?
      ORDER BY created_at ASC, id ASC LIMIT 1
-  `).get(parentVersionId) as VersionRow | undefined
+  `).get(parentRevisionId) as RevisionRow | undefined
 }
 
 export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler> {
@@ -139,7 +139,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
 
     const rows = deps.db.prepare(`
       SELECT id, stop_reason, sealed_at, created_at
-        FROM versions
+        FROM revisions
        WHERE task_id = ? AND classification = 'closed_forkable'
        ORDER BY sealed_at DESC
        LIMIT ? OFFSET ?
@@ -151,14 +151,14 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     }>
 
     const total = (deps.db.prepare(`
-      SELECT COUNT(*) AS n FROM versions
+      SELECT COUNT(*) AS n FROM revisions
        WHERE task_id = ? AND classification = 'closed_forkable'
     `).get(sess.task_id) as { n: number }).n
 
     return {
       total,
-      versions: rows.map(r => ({
-        version_id: r.id,
+      revisions: rows.map(r => ({
+        revision_id: r.id,
         sealed_at: r.sealed_at,
         stop_reason: r.stop_reason,
       })),
@@ -167,43 +167,43 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
 
   // ── fork_show ─────────────────────────────────────────────────────────────
   tools.set('fork_show', async (args, ctx) => {
-    const parsed = args as { version_id?: string } | undefined
-    if (!parsed?.version_id) return { error: 'version_id is required' }
+    const parsed = args as { revision_id?: string } | undefined
+    if (!parsed?.revision_id) return { error: 'revision_id is required' }
 
     const sess = loadSession(deps.db, ctx.sessionId)
     if (!sess) return { error: 'session not found' }
 
-    const ver = loadVersion(deps.db, parsed.version_id)
-    if (!ver || ver.task_id !== sess.task_id) {
-      return { error: 'version not found in this session' }
+    const rev = loadRevision(deps.db, parsed.revision_id)
+    if (!rev || rev.task_id !== sess.task_id) {
+      return { error: 'revision not found in this session' }
     }
 
-    // Walk backward to find the chain of open Versions preceding this one,
+    // Walk backward to find the chain of open Revisions preceding this one,
     // up to (but not including) the previous closed_forkable. Capped in depth
     // and by visited-set to survive corrupt or cyclic parent chains.
     const preceding: string[] = []
-    const visited = new Set<string>([ver.id])
-    let cursor: string | null = ver.parent_version_id
+    const visited = new Set<string>([rev.id])
+    let cursor: string | null = rev.parent_revision_id
     for (let i = 0; cursor && i < FORK_SHOW_MAX_DEPTH; i++) {
       if (visited.has(cursor)) break  // cycle — stop
       visited.add(cursor)
-      const parent = loadVersion(deps.db, cursor)
+      const parent = loadRevision(deps.db, cursor)
       if (!parent || parent.classification === 'closed_forkable') break
       preceding.push(parent.id)
-      cursor = parent.parent_version_id
+      cursor = parent.parent_revision_id
     }
 
     return {
-      version: {
-        id: ver.id,
-        classification: ver.classification,
-        stop_reason: ver.stop_reason,
-        parent_version_id: ver.parent_version_id,
-        asset_cid: ver.asset_cid,
-        sealed_at: ver.sealed_at,
-        created_at: ver.created_at,
+      revision: {
+        id: rev.id,
+        classification: rev.classification,
+        stop_reason: rev.stop_reason,
+        parent_revision_id: rev.parent_revision_id,
+        asset_cid: rev.asset_cid,
+        sealed_at: rev.sealed_at,
+        created_at: rev.created_at,
       },
-      preceding_open_versions: preceding,
+      preceding_open_revisions: preceding,
     }
   })
 
@@ -215,7 +215,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     if (!sess) return { error: 'session not found' }
 
     // G10: reject if no closed_forkable exists yet.
-    const head = mostRecentForkableVersion(deps.db, sess.task_id)
+    const head = mostRecentForkableRevision(deps.db, sess.task_id)
     if (!head) {
       return {
         error: 'no forkable turn yet — wait for the current turn to close before bookmarking',
@@ -228,13 +228,13 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       {
         view_id: viewId,
         task_id: sess.task_id,
-        head_version_id: head.id,
+        head_revision_id: head.id,
         label: parsed?.label ?? null,
         auto_label: `bookmark@${new Date().toISOString()}`,
       },
       ctx.sessionId,
     )
-    return { view_id: viewId, head_version_id: head.id, label: parsed?.label ?? null }
+    return { view_id: viewId, head_revision_id: head.id, label: parsed?.label ?? null }
   })
 
   // ── fork_back ─────────────────────────────────────────────────────────────
@@ -270,7 +270,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     }
 
     // F4: reject if the current head is open (mid-tool-use) or in_flight.
-    const currentHead = mostRecentVersion(deps.db, sess.task_id)
+    const currentHead = mostRecentRevision(deps.db, sess.task_id)
     if (!currentHead) {
       return { error: 'no turns yet — nothing to fork from' }
     }
@@ -281,22 +281,22 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       }
     }
 
-    // Walk back `n` closed_forkable Versions. We always start walking from
+    // Walk back `n` closed_forkable Revisions. We always start walking from
     // the current head's parent (the current head itself is "where we are";
     // n=1 means go to the nearest parent forkable, n=2 means two back, etc).
-    let target: VersionRow | undefined
+    let target: RevisionRow | undefined
     let walked = 0
-    let cursor: string | null = currentHead.parent_version_id
+    let cursor: string | null = currentHead.parent_revision_id
     while (walked < n) {
       if (!cursor) break
-      const ver: VersionRow | undefined = loadVersion(deps.db, cursor)
-      if (!ver) break
-      if (ver.classification === 'closed_forkable') {
-        target = ver
+      const rev: RevisionRow | undefined = loadRevision(deps.db, cursor)
+      if (!rev) break
+      if (rev.classification === 'closed_forkable') {
+        target = rev
         walked++
         if (walked >= n) break
       }
-      cursor = ver.parent_version_id
+      cursor = rev.parent_revision_id
     }
     if (!target || walked < n) {
       return {
@@ -329,7 +329,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
     const targetViewId = generateTraceId()
     deps.tobeStore.write(ctx.sessionId, {
       messages: baseMessages,
-      fork_point_version_id: target.id,
+      fork_point_revision_id: target.id,
       source_view_id: ctx.sessionId,  // placeholder until explicit source view passed in
     })
 
@@ -337,7 +337,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       'fork.back_requested',
       {
         source_view_id: ctx.sessionId,
-        fork_point_version_id: target.id,
+        fork_point_revision_id: target.id,
         new_message_cid: newMessageBlob.cid,
         target_view_id: targetViewId,
         task_id: sess.task_id,
@@ -367,7 +367,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
  *
  * Returns null only if NEITHER source yields a valid messages array.
  */
-function reconstructForkMessages(db: DB, target: VersionRow): unknown[] | null {
+function reconstructForkMessages(db: DB, target: RevisionRow): unknown[] | null {
   const attempts: string[] = []
   const child = firstChild(db, target.id)
   if (child) {

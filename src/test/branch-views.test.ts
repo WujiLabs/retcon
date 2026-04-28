@@ -6,12 +6,12 @@ import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
 import { SessionsV1Projector } from '../sessions-v1.js'
-import { VersionsV1Projector } from '../versions-v1.js'
+import { RevisionsV1Projector } from '../revisions-v1.js'
 
 interface BranchViewRow {
   id: string
   task_id: string
-  head_version_id: string
+  head_revision_id: string
   label: string | null
   auto_label: string
   updated_at: number
@@ -22,7 +22,7 @@ function fixture(): { db: DB, producer: EventProducer, taskId: string, sessionId
   migrate(db)
   const producer = createEventProducer(db, [
     new SessionsV1Projector(),
-    new VersionsV1Projector(),
+    new RevisionsV1Projector(),
     new BranchViewsV1Projector(),
   ])
   const sessionId = 'sess-bv'
@@ -46,7 +46,7 @@ describe('branch_views_v1', () => {
       {
         view_id: 'view-1',
         task_id: fx.taskId,
-        head_version_id: 'ver-head',
+        head_revision_id: 'rev-head',
         label: 'my-bookmark',
         auto_label: 'main',
       },
@@ -55,7 +55,7 @@ describe('branch_views_v1', () => {
     const row = loadView(fx.db, 'view-1')!
     expect(row.label).toBe('my-bookmark')
     expect(row.auto_label).toBe('main')
-    expect(row.head_version_id).toBe('ver-head')
+    expect(row.head_revision_id).toBe('rev-head')
   })
 
   it('creates a fork view with auto-label on fork.back_requested', () => {
@@ -63,7 +63,7 @@ describe('branch_views_v1', () => {
       'fork.back_requested',
       {
         source_view_id: 'view-src',
-        fork_point_version_id: 'ver-fp-abcdef1234567890',
+        fork_point_revision_id: 'rev-fp-abcdef1234567890',
         new_message_cid: 'bafy-msg',
         target_view_id: 'view-fork',
         task_id: fx.taskId,
@@ -71,16 +71,16 @@ describe('branch_views_v1', () => {
       fx.sessionId,
     )
     const row = loadView(fx.db, 'view-fork')!
-    expect(row.head_version_id).toBe('ver-fp-abcdef1234567890')
+    expect(row.head_revision_id).toBe('rev-fp-abcdef1234567890')
     expect(row.label).toBeNull()
     expect(row.auto_label).toMatch(/^fork@/)
-    expect(row.auto_label).toContain('ver-fp-a')  // first 8 chars of fork point
+    expect(row.auto_label).toContain('rev-fp-a')  // first 8 chars of fork point
   })
 
   it('updates label on fork.label_updated', () => {
     fx.producer.emit(
       'fork.bookmark_created',
-      { view_id: 'view-2', task_id: fx.taskId, head_version_id: 'v', label: null, auto_label: 'a' },
+      { view_id: 'view-2', task_id: fx.taskId, head_revision_id: 'v', label: null, auto_label: 'a' },
       fx.sessionId,
     )
     fx.producer.emit(
@@ -92,7 +92,7 @@ describe('branch_views_v1', () => {
     expect(row.label).toBe('renamed')
   })
 
-  it('advances head_version_id when a response_completed seals a Version whose parent was the view head', () => {
+  it('advances head_revision_id when a response_completed seals a Revision whose parent was the view head', () => {
     // Set up: turn 1 seals → bookmark points at v1 → turn 2 arrives with v1 as parent → view advances to v2.
     const v1 = fx.producer.emit(
       'proxy.request_received',
@@ -106,7 +106,7 @@ describe('branch_views_v1', () => {
     )
     fx.producer.emit(
       'fork.bookmark_created',
-      { view_id: 'view-advance', task_id: fx.taskId, head_version_id: v1.id, label: null, auto_label: 'main' },
+      { view_id: 'view-advance', task_id: fx.taskId, head_revision_id: v1.id, label: null, auto_label: 'main' },
       fx.sessionId,
     )
     // Next HTTP call — non-fork, chains from v1.
@@ -121,7 +121,7 @@ describe('branch_views_v1', () => {
       fx.sessionId,
     )
     const row = loadView(fx.db, 'view-advance')!
-    expect(row.head_version_id).toBe(v2.id)
+    expect(row.head_revision_id).toBe(v2.id)
   })
 
   it('does NOT advance views that point elsewhere', () => {
@@ -135,10 +135,10 @@ describe('branch_views_v1', () => {
       { request_event_id: v1.id, status: 200, headers_cid: 'h', body_cid: 'r1', stop_reason: 'end_turn', asset_cid: 'a1' },
       fx.sessionId,
     )
-    // View points at some UNRELATED version id.
+    // View points at some UNRELATED revision id.
     fx.producer.emit(
       'fork.bookmark_created',
-      { view_id: 'view-stable', task_id: fx.taskId, head_version_id: 'other-version', label: null, auto_label: 'other' },
+      { view_id: 'view-stable', task_id: fx.taskId, head_revision_id: 'other-revision', label: null, auto_label: 'other' },
       fx.sessionId,
     )
     const v2 = fx.producer.emit(
@@ -152,6 +152,6 @@ describe('branch_views_v1', () => {
       fx.sessionId,
     )
     const row = loadView(fx.db, 'view-stable')!
-    expect(row.head_version_id).toBe('other-version')  // not advanced
+    expect(row.head_revision_id).toBe('other-revision')  // not advanced
   })
 })

@@ -9,7 +9,7 @@
 // array with the pending one, and consumes the file (one-shot).
 //
 // Fold-in (per G2 in the plan review): when a TOBE is applied, the proxy
-// passes the fork_point_version_id / source_view_id / original_body_cid
+// passes the fork_point_revision_id / source_view_id / original_body_cid
 // into `proxy.request_received.payload.tobe_applied_from` so projectors
 // can resolve the parent at request-time without a separate event.
 
@@ -18,7 +18,7 @@ import path from 'node:path'
 
 export interface TobePending {
   messages: unknown[]
-  fork_point_version_id: string
+  fork_point_revision_id: string
   source_view_id: string
   /** Optional hint: the TraceId of the fork.back_requested event that wrote this file. */
   fork_back_event_id?: string

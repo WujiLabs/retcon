@@ -196,7 +196,7 @@ describe('proxy pass-through + event emission', () => {
     const sessionId = 'sess-tobe'
     fx.tobeStore.write(sessionId, {
       messages: [{ role: 'user', content: 'rewritten' }],
-      fork_point_version_id: 'ver-fork-point-xyz',
+      fork_point_revision_id: 'ver-fork-point-xyz',
       source_view_id: 'view-origin',
     })
 
@@ -209,10 +209,10 @@ describe('proxy pass-through + event emission', () => {
     expect(body.echoed_messages[0].content).toBe('rewritten')
 
     const reqPayload = await waitForEvent(fx.db, 'proxy.request_received') as {
-      tobe_applied_from?: { fork_point_version_id: string, source_view_id: string, original_body_cid: string }
+      tobe_applied_from?: { fork_point_revision_id: string, source_view_id: string, original_body_cid: string }
     }
     expect(reqPayload.tobe_applied_from).toBeDefined()
-    expect(reqPayload.tobe_applied_from!.fork_point_version_id).toBe('ver-fork-point-xyz')
+    expect(reqPayload.tobe_applied_from!.fork_point_revision_id).toBe('ver-fork-point-xyz')
     expect(reqPayload.tobe_applied_from!.source_view_id).toBe('view-origin')
     expect(typeof reqPayload.tobe_applied_from!.original_body_cid).toBe('string')
 
@@ -258,7 +258,7 @@ describe('proxy pass-through + event emission', () => {
     // Versions view: one sealed Version with end_turn classification.
     const version = db.prepare(
       `SELECT id, task_id, classification, stop_reason, asset_cid, sealed_at
-         FROM versions WHERE task_id = ?`,
+         FROM revisions WHERE task_id = ?`,
     ).get(session!.task_id) as {
       id: string
       classification: string
@@ -427,7 +427,7 @@ describe('proxy pass-through + event emission', () => {
     const sessionId = 'sess-retry'
     fx.tobeStore.write(sessionId, {
       messages: [{ role: 'user', content: 'retry-me' }],
-      fork_point_version_id: 'v-retry-fp',
+      fork_point_revision_id: 'v-retry-fp',
       source_view_id: 'view-retry',
     })
 
@@ -464,7 +464,7 @@ describe('proxy pass-through + event emission', () => {
     const sessionId = 'sess-await'
     fx.tobeStore.write(sessionId, {
       messages: [{ role: 'user', content: 'forked' }],
-      fork_point_version_id: 'v-await-fp',
+      fork_point_revision_id: 'v-await-fp',
       source_view_id: 'view-await',
     })
     // Register the waiter BEFORE the HTTP call so the awaiter is primed.
@@ -479,7 +479,7 @@ describe('proxy pass-through + event emission', () => {
     expect(outcome.status).toBe('completed')
     expect(outcome.http_status).toBe(200)
     expect(outcome.stop_reason).toBe('end_turn')
-    expect(outcome.fork_point_version_id).toBe('v-await-fp')
+    expect(outcome.fork_point_revision_id).toBe('v-await-fp')
     expect(outcome.source_view_id).toBe('view-await')
   })
 
@@ -493,7 +493,7 @@ describe('proxy pass-through + event emission', () => {
     const sessionId = 'sess-await-err'
     fx.tobeStore.write(sessionId, {
       messages: [{ role: 'user', content: 'forked' }],
-      fork_point_version_id: 'v-fp',
+      fork_point_revision_id: 'v-fp',
       source_view_id: 'view-err',
     })
     const outcomeP = proxy.forkAwaiter.wait(sessionId, 5000)
@@ -523,7 +523,7 @@ describe('proxy pass-through + event emission', () => {
     const sessionId = 'sess-nontarget'
     fx.tobeStore.write(sessionId, {
       messages: [{ role: 'user', content: 'only-apply-to-messages' }],
-      fork_point_version_id: 'v-keep',
+      fork_point_revision_id: 'v-keep',
       source_view_id: 'view-keep',
     })
     // Hit /v1/models — must NOT consume the pending TOBE.
@@ -534,6 +534,6 @@ describe('proxy pass-through + event emission', () => {
     // TOBE should still be there for the next /v1/messages.
     const stillPending = fx.tobeStore.peek(sessionId)
     expect(stillPending).not.toBeNull()
-    expect(stillPending!.fork_point_version_id).toBe('v-keep')
+    expect(stillPending!.fork_point_revision_id).toBe('v-keep')
   })
 })

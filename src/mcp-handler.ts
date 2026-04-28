@@ -88,7 +88,7 @@ export async function handleMcpRequest(
   }
   if (req.method === 'GET') {
     // Streamable HTTP transport allows GET to open an SSE stream for
-    // server→client messages. v1 of playtiss-proxy has no server-initiated
+    // server→client messages. v1 of retcon has no server-initiated
     // messages; acknowledge with 200 + empty SSE stream that stays open
     // until the client disconnects, so MCP clients that open this channel
     // don't see an error.
@@ -166,7 +166,7 @@ function listTools(ctx: McpContext): Array<{ name: string, description: string }
   // tool definitions (schemas, descriptions) live in mcp-tools.ts (C8).
   const out: Array<{ name: string, description: string }> = []
   for (const name of ctx.tools.keys()) {
-    out.push({ name, description: `playtiss-proxy ${name}` })
+    out.push({ name, description: `retcon ${name}` })
   }
   return out
 }
@@ -212,7 +212,7 @@ async function handleInitialize(
       tools: {},
     },
     serverInfo: {
-      name: 'playtiss-proxy',
+      name: 'retcon',
       version: VERSION,
     },
   })
@@ -276,7 +276,7 @@ function handleMcpGet(_req: http.IncomingMessage, res: http.ServerResponse): voi
     'cache-control': 'no-cache',
     'connection': 'keep-alive',
   })
-  res.write(': playtiss-proxy mcp sse\n\n')
+  res.write(': retcon mcp sse\n\n')
   // Don't call res.end() — leave it open. It'll close when the client disconnects.
 }
 

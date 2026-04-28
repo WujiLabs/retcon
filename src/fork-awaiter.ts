@@ -27,8 +27,8 @@ export type ForkOutcomeStatus =
 
 export interface ForkOutcome {
   status: ForkOutcomeStatus
-  /** The Version id (= request_event_id) that was forked. */
-  version_id?: string
+  /** The Revision id (= request_event_id) that was forked. */
+  revision_id?: string
   /** Raw stop_reason from the LLM, if the call completed. */
   stop_reason?: string | null
   /** HTTP status code, for completed or http_error. */
@@ -36,7 +36,7 @@ export interface ForkOutcome {
   /** Error message, if any terminal carried one. */
   error_message?: string
   /** Fork context (carried from the tobe_applied_from payload). */
-  fork_point_version_id?: string
+  fork_point_revision_id?: string
   source_view_id?: string
 }
 
@@ -110,12 +110,12 @@ export function lastForkOutcome(db: DB, sessionId: string): ForkOutcome | null {
   if (!reqRow) return null
 
   const reqPayload = JSON.parse(reqRow.payload) as {
-    tobe_applied_from?: { fork_point_version_id: string, source_view_id: string }
+    tobe_applied_from?: { fork_point_revision_id: string, source_view_id: string }
   }
   const fork = reqPayload.tobe_applied_from
-  const baseOutcome: Pick<ForkOutcome, 'version_id' | 'fork_point_version_id' | 'source_view_id'> = {
-    version_id: reqRow.event_id,
-    fork_point_version_id: fork?.fork_point_version_id,
+  const baseOutcome: Pick<ForkOutcome, 'revision_id' | 'fork_point_revision_id' | 'source_view_id'> = {
+    revision_id: reqRow.event_id,
+    fork_point_revision_id: fork?.fork_point_revision_id,
     source_view_id: fork?.source_view_id,
   }
 

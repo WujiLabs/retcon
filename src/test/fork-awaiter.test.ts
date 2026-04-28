@@ -10,10 +10,10 @@ describe('ForkAwaiter', () => {
   it('resolves when notify() fires', async () => {
     const a = new ForkAwaiter()
     const p = a.wait('s1', 5000)
-    a.notify('s1', { status: 'completed', version_id: 'v-1' })
+    a.notify('s1', { status: 'completed', revision_id: 'v-1' })
     const o = await p
     expect(o.status).toBe('completed')
-    expect(o.version_id).toBe('v-1')
+    expect(o.revision_id).toBe('v-1')
     expect(a.hasWaiter('s1')).toBe(false)
   })
 
@@ -27,7 +27,7 @@ describe('ForkAwaiter', () => {
     const a = new ForkAwaiter()
     const first = a.wait('s3', 5000)
     const second = a.wait('s3', 5000)
-    a.notify('s3', { status: 'completed', version_id: 'v-new' })
+    a.notify('s3', { status: 'completed', revision_id: 'v-new' })
     const [r1, r2] = await Promise.all([first, second])
     expect(r1.status).toBe('superseded')
     expect(r2.status).toBe('completed')
@@ -60,7 +60,7 @@ describe('lastForkOutcome', () => {
       {
         path: '/v1/messages',
         tobe_applied_from: {
-          fork_point_version_id: 'v-fp',
+          fork_point_revision_id: 'v-fp',
           source_view_id: 'view-s',
           original_body_cid: 'bafy-orig',
         },
@@ -74,10 +74,10 @@ describe('lastForkOutcome', () => {
     )
     const outcome = lastForkOutcome(db, 'sess-ok')
     expect(outcome?.status).toBe('completed')
-    expect(outcome?.version_id).toBe(reqEvt.id)
+    expect(outcome?.revision_id).toBe(reqEvt.id)
     expect(outcome?.http_status).toBe(200)
     expect(outcome?.stop_reason).toBe('end_turn')
-    expect(outcome?.fork_point_version_id).toBe('v-fp')
+    expect(outcome?.fork_point_revision_id).toBe('v-fp')
     expect(outcome?.source_view_id).toBe('view-s')
   })
 
@@ -85,7 +85,7 @@ describe('lastForkOutcome', () => {
     const producer = createEventProducer(db, [])
     const reqEvt = producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
       'sess-5xx',
     )
     producer.emit(
@@ -102,7 +102,7 @@ describe('lastForkOutcome', () => {
     const producer = createEventProducer(db, [])
     const reqEvt = producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
       'sess-ab',
     )
     producer.emit(
@@ -119,7 +119,7 @@ describe('lastForkOutcome', () => {
     const producer = createEventProducer(db, [])
     const reqEvt = producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
       'sess-ue',
     )
     producer.emit(
@@ -137,13 +137,13 @@ describe('lastForkOutcome', () => {
     const producer = createEventProducer(db, [])
     producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-fp', source_view_id: 'v-s', original_body_cid: 'b' } },
       'sess-inflight',
     )
     // No terminal event emitted — request is still in-flight.
     const outcome = lastForkOutcome(db, 'sess-inflight')
     expect(outcome?.status).toBe('in_flight')
-    expect(outcome?.fork_point_version_id).toBe('v-fp')
+    expect(outcome?.fork_point_revision_id).toBe('v-fp')
   })
 
   it('returns the MOST RECENT TOBE-applied request when there are multiple', () => {
@@ -151,7 +151,7 @@ describe('lastForkOutcome', () => {
     // Older: failed.
     const r1 = producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-old', source_view_id: 'view-old', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-old', source_view_id: 'view-old', original_body_cid: 'b' } },
       'sess-multi',
     )
     producer.emit(
@@ -162,7 +162,7 @@ describe('lastForkOutcome', () => {
     // Newer: succeeded.
     const r2 = producer.emit(
       'proxy.request_received',
-      { path: '/v1/messages', tobe_applied_from: { fork_point_version_id: 'v-new', source_view_id: 'view-new', original_body_cid: 'b' } },
+      { path: '/v1/messages', tobe_applied_from: { fork_point_revision_id: 'v-new', source_view_id: 'view-new', original_body_cid: 'b' } },
       'sess-multi',
     )
     producer.emit(
@@ -172,6 +172,6 @@ describe('lastForkOutcome', () => {
     )
     const outcome = lastForkOutcome(db, 'sess-multi')
     expect(outcome?.status).toBe('completed')
-    expect(outcome?.fork_point_version_id).toBe('v-new')
+    expect(outcome?.fork_point_revision_id).toBe('v-new')
   })
 })

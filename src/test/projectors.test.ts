@@ -10,13 +10,13 @@ import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
 import { SessionsV1Projector } from '../sessions-v1.js'
-import { VersionsV1Projector } from '../versions-v1.js'
+import { RevisionsV1Projector } from '../revisions-v1.js'
 
-interface VersionRow {
+interface RevisionRow {
   id: string
   task_id: string
   asset_cid: string | null
-  parent_version_id: string | null
+  parent_revision_id: string | null
   classification: string
   stop_reason: string | null
   sealed_at: number | null
@@ -33,13 +33,13 @@ interface SessionRow {
 function fixture(): { db: DB, producer: EventProducer } {
   const db = openDb({ path: ':memory:' })
   migrate(db)
-  // Dispatch order: sessions_v1 → versions_v1 (per server.ts defaultProjectors).
-  const producer = createEventProducer(db, [new SessionsV1Projector(), new VersionsV1Projector()])
+  // Dispatch order: sessions_v1 → revisions_v1 (per server.ts defaultProjectors).
+  const producer = createEventProducer(db, [new SessionsV1Projector(), new RevisionsV1Projector()])
   return { db, producer }
 }
 
-function latestVersion(db: DB, id: TraceId | string): VersionRow | undefined {
-  return db.prepare('SELECT * FROM versions WHERE id = ?').get(id) as VersionRow | undefined
+function latestRevision(db: DB, id: TraceId | string): RevisionRow | undefined {
+  return db.prepare('SELECT * FROM revisions WHERE id = ?').get(id) as RevisionRow | undefined
 }
 
 describe('sessions_v1', () => {
@@ -130,8 +130,8 @@ describe('sessions_v1', () => {
   })
 })
 
-describe('versions_v1', () => {
-  it('inserts an in_flight Version on proxy.request_received', () => {
+describe('revisions_v1', () => {
+  it('inserts an in_flight Revision on proxy.request_received', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-v1')
     const evt = producer.emit(
@@ -139,14 +139,14 @@ describe('versions_v1', () => {
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b-req' },
       'sess-v1',
     )
-    const ver = latestVersion(db, evt.id)!
-    expect(ver.classification).toBe('in_flight')
-    expect(ver.asset_cid).toBeNull()
-    expect(ver.sealed_at).toBeNull()
-    expect(ver.parent_version_id).toBeNull()
+    const rev = latestRevision(db, evt.id)!
+    expect(rev.classification).toBe('in_flight')
+    expect(rev.asset_cid).toBeNull()
+    expect(rev.sealed_at).toBeNull()
+    expect(rev.parent_revision_id).toBeNull()
   })
 
-  it('sets parent_version_id from tobe_applied_from at request time', () => {
+  it('sets parent_revision_id from tobe_applied_from at request time', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-fork')
     const evt = producer.emit(
@@ -154,18 +154,18 @@ describe('versions_v1', () => {
       {
         method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b',
         tobe_applied_from: {
-          fork_point_version_id: 'ver-fp-123',
+          fork_point_revision_id: 'rev-fp-123',
           source_view_id: 'view-a',
           original_body_cid: 'b-orig',
         },
       },
       'sess-fork',
     )
-    const ver = latestVersion(db, evt.id)!
-    expect(ver.parent_version_id).toBe('ver-fp-123')
+    const rev = latestRevision(db, evt.id)!
+    expect(rev.parent_revision_id).toBe('rev-fp-123')
   })
 
-  it('seals a Version on proxy.response_completed with classification + asset_cid', () => {
+  it('seals a Revision on proxy.response_completed with classification + asset_cid', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-seal')
     const req = producer.emit(
@@ -185,14 +185,14 @@ describe('versions_v1', () => {
       },
       'sess-seal',
     )
-    const ver = latestVersion(db, req.id)!
-    expect(ver.classification).toBe('closed_forkable')
-    expect(ver.stop_reason).toBe('end_turn')
-    expect(ver.asset_cid).toBe('bafy-asset-xyz')
-    expect(ver.sealed_at).toBeGreaterThan(0)
+    const rev = latestRevision(db, req.id)!
+    expect(rev.classification).toBe('closed_forkable')
+    expect(rev.stop_reason).toBe('end_turn')
+    expect(rev.asset_cid).toBe('bafy-asset-xyz')
+    expect(rev.sealed_at).toBeGreaterThan(0)
   })
 
-  it('resolves parent at seal time for non-fork Versions (most recent sealed)', () => {
+  it('resolves parent at seal time for non-fork Revisions (most recent sealed)', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-chain')
     const v1 = producer.emit(
@@ -221,12 +221,12 @@ describe('versions_v1', () => {
       },
       'sess-chain',
     )
-    const ver2 = latestVersion(db, v2.id)!
-    expect(ver2.parent_version_id).toBe(v1.id)
-    expect(ver2.classification).toBe('open')
+    const rev2 = latestRevision(db, v2.id)!
+    expect(rev2.parent_revision_id).toBe(v1.id)
+    expect(rev2.classification).toBe('open')
   })
 
-  it('marks Version dangling_unforkable on response_aborted', () => {
+  it('marks Revision dangling_unforkable on response_aborted', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-abort')
     const req = producer.emit(
@@ -239,12 +239,12 @@ describe('versions_v1', () => {
       { request_event_id: req.id, reason: 'client_disconnect' },
       'sess-abort',
     )
-    const ver = latestVersion(db, req.id)!
-    expect(ver.classification).toBe('dangling_unforkable')
-    expect(ver.sealed_at).toBeGreaterThan(0)
+    const rev = latestRevision(db, req.id)!
+    expect(rev.classification).toBe('dangling_unforkable')
+    expect(rev.sealed_at).toBeGreaterThan(0)
   })
 
-  it('marks Version dangling_unforkable on upstream_error', () => {
+  it('marks Revision dangling_unforkable on upstream_error', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-up')
     const req = producer.emit(
@@ -257,11 +257,11 @@ describe('versions_v1', () => {
       { request_event_id: req.id, status: 502, error_message: 'ECONNREFUSED' },
       'sess-up',
     )
-    const ver = latestVersion(db, req.id)!
-    expect(ver.classification).toBe('dangling_unforkable')
+    const rev = latestRevision(db, req.id)!
+    expect(rev.classification).toBe('dangling_unforkable')
   })
 
-  it('fork siblings share a parent_version_id', () => {
+  it('fork siblings share a parent_revision_id', () => {
     const { db, producer } = fixture()
     producer.emit('mcp.session_initialized', { mcp_session_id: 'x' }, 'sess-sib')
     // First turn closes cleanly — becomes the fork anchor.
@@ -283,7 +283,7 @@ describe('versions_v1', () => {
       'proxy.request_received',
       {
         method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bA',
-        tobe_applied_from: { fork_point_version_id: anchor.id, source_view_id: 'v', original_body_cid: 'o' },
+        tobe_applied_from: { fork_point_revision_id: anchor.id, source_view_id: 'v', original_body_cid: 'o' },
       },
       'sess-sib',
     )
@@ -291,12 +291,12 @@ describe('versions_v1', () => {
       'proxy.request_received',
       {
         method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bB',
-        tobe_applied_from: { fork_point_version_id: anchor.id, source_view_id: 'v', original_body_cid: 'o' },
+        tobe_applied_from: { fork_point_revision_id: anchor.id, source_view_id: 'v', original_body_cid: 'o' },
       },
       'sess-sib',
     )
-    expect(latestVersion(db, siblingA.id)!.parent_version_id).toBe(anchor.id)
-    expect(latestVersion(db, siblingB.id)!.parent_version_id).toBe(anchor.id)
+    expect(latestRevision(db, siblingA.id)!.parent_revision_id).toBe(anchor.id)
+    expect(latestRevision(db, siblingB.id)!.parent_revision_id).toBe(anchor.id)
   })
 
   it('idempotent on replay — same event emitted twice does not duplicate rows', () => {

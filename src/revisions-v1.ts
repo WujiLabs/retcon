@@ -1,16 +1,16 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 //
-// versions_v1 projector — maintains the immutable `versions` DAG view.
+// revisions_v1 projector — maintains the immutable `revisions` DAG view.
 //
-// One Version per /v1/messages HTTP call (flat model). Chains via
-// parent_version_id. Forks are sibling Versions sharing a parent.
+// One Revision per /v1/messages HTTP call (flat model). Chains via
+// parent_revision_id. Forks are sibling Revisions sharing a parent.
 //
-// parent_version_id resolution (G2):
+// parent_revision_id resolution (G2):
 //   - fork case: set at request_received time from tobe_applied_from.
-//     fork_point_version_id.
+//     fork_point_revision_id.
 //   - non-fork case: NULL at request_received; resolved at seal time as
-//     "last Version sealed before this one in this session's Task." Per
+//     "last Revision sealed before this one in this session's Task." Per
 //     the session-sequencing invariant (one in-flight /v1/messages per
 //     session), this lookup is deterministic.
 //
@@ -29,7 +29,7 @@ interface RequestReceivedPayload {
   headers_cid: string
   body_cid: string
   tobe_applied_from?: {
-    fork_point_version_id: string
+    fork_point_revision_id: string
     source_view_id: string
     original_body_cid: string
   }
@@ -56,8 +56,8 @@ interface UpstreamErrorPayload {
   error_message?: string
 }
 
-export class VersionsV1Projector implements Projection {
-  readonly id = 'versions_v1'
+export class RevisionsV1Projector implements Projection {
+  readonly id = 'revisions_v1'
   readonly subscribedTopics: ReadonlyArray<string> = [
     'proxy.request_received',
     'proxy.response_completed',
@@ -88,33 +88,33 @@ export class VersionsV1Projector implements Projection {
       .get(event.sessionId) as { task_id: string } | undefined
     if (!taskRow) {
       // sessions_v1 should have created the session already (ordered before
-      // versions_v1). If we're here, something reordered the dispatch — skip
+      // revisions_v1). If we're here, something reordered the dispatch — skip
       // rather than FK-violate, and let the operator notice via a missing row.
       return
     }
 
-    const parent = event.payload.tobe_applied_from?.fork_point_version_id ?? null
+    const parent = event.payload.tobe_applied_from?.fork_point_revision_id ?? null
     tx.prepare(`
-      INSERT OR IGNORE INTO versions
-        (id, task_id, asset_cid, parent_version_id, classification, stop_reason, sealed_at, created_at)
+      INSERT OR IGNORE INTO revisions
+        (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
       VALUES (?, ?, NULL, ?, 'in_flight', NULL, NULL, ?)
     `).run(event.id, taskRow.task_id, parent, event.createdAt)
   }
 
   private onCompleted(event: Event<ResponseCompletedPayload>, tx: DB): void {
     const reqId = event.payload.request_event_id
-    const ver = tx.prepare('SELECT task_id, parent_version_id, created_at FROM versions WHERE id = ?').get(reqId) as
-      | { task_id: string, parent_version_id: string | null, created_at: number }
+    const rev = tx.prepare('SELECT task_id, parent_revision_id, created_at FROM revisions WHERE id = ?').get(reqId) as
+      | { task_id: string, parent_revision_id: string | null, created_at: number }
       | undefined
-    if (!ver) return
+    if (!rev) return
 
-    const parentId = ver.parent_version_id ?? this.resolveParentAtSealTime(tx, ver.task_id, ver.created_at)
+    const parentId = rev.parent_revision_id ?? this.resolveParentAtSealTime(tx, rev.task_id, rev.created_at)
     const classification = classify(event.payload.stop_reason)
 
     tx.prepare(`
-      UPDATE versions
+      UPDATE revisions
          SET asset_cid = ?,
-             parent_version_id = ?,
+             parent_revision_id = ?,
              classification = ?,
              stop_reason = ?,
              sealed_at = ?
@@ -138,16 +138,16 @@ export class VersionsV1Projector implements Projection {
   }
 
   private markDangling(tx: DB, requestEventId: string, sealedAt: number): void {
-    const ver = tx
-      .prepare('SELECT task_id, parent_version_id, created_at FROM versions WHERE id = ?')
+    const rev = tx
+      .prepare('SELECT task_id, parent_revision_id, created_at FROM revisions WHERE id = ?')
       .get(requestEventId) as
-        | { task_id: string, parent_version_id: string | null, created_at: number }
+        | { task_id: string, parent_revision_id: string | null, created_at: number }
         | undefined
-    if (!ver) return
-    const parentId = ver.parent_version_id ?? this.resolveParentAtSealTime(tx, ver.task_id, ver.created_at)
+    if (!rev) return
+    const parentId = rev.parent_revision_id ?? this.resolveParentAtSealTime(tx, rev.task_id, rev.created_at)
     tx.prepare(`
-      UPDATE versions
-         SET parent_version_id = ?,
+      UPDATE revisions
+         SET parent_revision_id = ?,
              classification = 'dangling_unforkable',
              sealed_at = ?
        WHERE id = ?
@@ -157,22 +157,22 @@ export class VersionsV1Projector implements Projection {
   private resolveParentAtSealTime(tx: DB, taskId: string, createdAt: number): string | null {
     // Use `created_at <= ?` combined with sealed_at ordering for correctness
     // even when emits land in the same millisecond — they sort deterministically
-    // by sealed_at (the instant the prior Version sealed, strictly before this
+    // by sealed_at (the instant the prior Revision sealed, strictly before this
     // one becomes seal-ready). Per the session sequencing invariant, there's
-    // never more than one in-flight Version per task at a time, so the prior
-    // sealed Version is unambiguous.
+    // never more than one in-flight Revision per task at a time, so the prior
+    // sealed Revision is unambiguous.
     //
     // KNOWN LIMITATION (KL-1 in the plan, adversarial finding A-WR3): this
-    // query picks the most-recently-sealed Version for the Task with no
+    // query picks the most-recently-sealed Revision for the Task with no
     // awareness of which branch the user is currently on. If a user on a
     // fork branch issues a non-fork request (no `tobe_applied_from`), the
-    // new Version will be parented to the fork's leaf rather than the main
+    // new Revision will be parented to the fork's leaf rather than the main
     // branch's leaf. Not reachable through Claude Code's normal turn-serial
     // flow; switching branches always goes through fork_back which sets
     // tobe_applied_from and bypasses this fallback. v1.1 adds a per-request
     // branch context that will replace this heuristic.
     const prior = tx.prepare(`
-      SELECT id FROM versions
+      SELECT id FROM revisions
        WHERE task_id = ?
          AND sealed_at IS NOT NULL
          AND sealed_at <= ?
@@ -184,7 +184,7 @@ export class VersionsV1Projector implements Projection {
 }
 
 /**
- * Helper used by the proxy-handler to pre-compute the Version asset
+ * Helper used by the proxy-handler to pre-compute the Revision asset
  * (dag-json of {request_body_cid, response_body_cid}) BEFORE emitting
  * proxy.response_completed. Returns the CID (as AssetId string) + the
  * bytes to save as a blob via the StorageProvider.
@@ -193,7 +193,7 @@ export class VersionsV1Projector implements Projection {
  * the bytes flow into emit's referencedBlobs[] so the save is atomic with
  * the event insert.
  */
-export async function computeVersionAsset(
+export async function computeRevisionAsset(
   requestBodyCid: string,
   responseBodyCid: string,
 ): Promise<{ cid: string, bytes: Uint8Array }> {

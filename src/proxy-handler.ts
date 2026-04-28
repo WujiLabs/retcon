@@ -29,7 +29,7 @@ import { redactHeaders } from './redaction.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, SseStopReasonParser } from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
-import { computeVersionAsset } from './versions-v1.js'
+import { computeRevisionAsset } from './revisions-v1.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
@@ -188,7 +188,7 @@ async function dispatch(
   const pending = isMessagesPath ? ctx.tobeStore.peek(sessionId) : null
   let bodyToForward = rawBody
   let tobeAppliedFrom: {
-    fork_point_version_id: string
+    fork_point_revision_id: string
     source_view_id: string
     original_body_cid: string
   } | undefined
@@ -197,7 +197,7 @@ async function dispatch(
     bodyToForward = rewritten
     const originalCid = (await blobRefFromBytes(originalBody)).cid
     tobeAppliedFrom = {
-      fork_point_version_id: pending.fork_point_version_id,
+      fork_point_revision_id: pending.fork_point_revision_id,
       source_view_id: pending.source_view_id,
       original_body_cid: originalCid,
     }
@@ -238,7 +238,7 @@ async function dispatch(
   const rawPath = req.url ?? '/'
   if (!rawPath.startsWith('/')) {
     res.writeHead(400, { 'content-type': 'text/plain' })
-    res.end('playtiss-proxy: absolute URLs not allowed; send path only\n')
+    res.end('retcon: absolute URLs not allowed; send path only\n')
     return
   }
   const target = new URL(rawPath, ctx.upstream)
@@ -286,29 +286,29 @@ async function dispatch(
             const s = typeof payload.status === 'number' ? payload.status : 0
             return {
               status: s >= 500 ? 'http_error' : 'completed',
-              version_id: requestEvent.id,
+              revision_id: requestEvent.id,
               http_status: s,
               stop_reason: (payload.stop_reason ?? null) as string | null,
-              fork_point_version_id: pending.fork_point_version_id,
+              fork_point_revision_id: pending.fork_point_revision_id,
               source_view_id: pending.source_view_id,
             }
           }
           if (topic === 'proxy.response_aborted') {
             return {
               status: 'aborted',
-              version_id: requestEvent.id,
+              revision_id: requestEvent.id,
               error_message: typeof payload.reason === 'string' ? payload.reason : undefined,
-              fork_point_version_id: pending.fork_point_version_id,
+              fork_point_revision_id: pending.fork_point_revision_id,
               source_view_id: pending.source_view_id,
             }
           }
           return {
             status: 'upstream_error',
-            version_id: requestEvent.id,
+            revision_id: requestEvent.id,
             http_status: typeof payload.status === 'number' ? payload.status : undefined,
             error_message:
               typeof payload.error_message === 'string' ? payload.error_message : undefined,
-            fork_point_version_id: pending.fork_point_version_id,
+            fork_point_revision_id: pending.fork_point_revision_id,
             source_view_id: pending.source_view_id,
           }
         })()
@@ -432,7 +432,7 @@ async function dispatch(
             // response_body_cid}) so the projector can stay synchronous.
             // Hashing is async; the single-tx event-emit invariant requires
             // all hashing to happen before we enter the transaction.
-            const asset = await computeVersionAsset(bodyBlob.cid, respBodyBlob.cid)
+            const asset = await computeRevisionAsset(bodyBlob.cid, respBodyBlob.cid)
             emitTerminal(
               'proxy.response_completed',
               {

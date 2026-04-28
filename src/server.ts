@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 //
-// Unified HTTP server for playtiss-proxy.
+// Unified HTTP server for retcon.
 //
 // Routes:
 //   /v1/*   → transparent proxy to api.anthropic.com (pass-through)
@@ -27,21 +27,21 @@ import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { SessionQueue } from './session-queue.js'
 import { SessionsV1Projector } from './sessions-v1.js'
 import type { TobeStore } from './tobe.js'
-import { VersionsV1Projector } from './versions-v1.js'
+import { RevisionsV1Projector } from './revisions-v1.js'
 
 /**
  * Build the standard set of projectors wired into a v1 producer.
  *
  * Declared dispatch order:
  *   1. sessions_v1     — must run first so a session/task row exists before
- *                        versions_v1 tries to reference it on FK.
- *   2. versions_v1     — sets versions.parent_version_id on response_completed;
+ *                        revisions_v1 tries to reference it on FK.
+ *   2. revisions_v1    — sets revisions.parent_revision_id on response_completed;
  *                        branch_views_v1 reads that field later in the same tx.
  *   3. branch_views_v1 — advances matching branch_view's head to the newly
- *                        sealed Version.
+ *                        sealed Revision.
  */
 export function defaultProjectors(): Projection[] {
-  return [new SessionsV1Projector(), new VersionsV1Projector(), new BranchViewsV1Projector()]
+  return [new SessionsV1Projector(), new RevisionsV1Projector(), new BranchViewsV1Projector()]
 }
 
 /** Convenience: build an EventProducer pre-wired with the v1 projectors. */

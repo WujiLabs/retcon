@@ -67,7 +67,7 @@ describe('MCP /mcp route', () => {
     expect(headers[MCP_SESSION_HEADER]).toBeTruthy()
     const result = (json as { result: { protocolVersion: string, serverInfo: { name: string } } }).result
     expect(result.protocolVersion).toBe('2025-03-26')
-    expect(result.serverInfo.name).toBe('playtiss-proxy')
+    expect(result.serverInfo.name).toBe('retcon')
   })
 
   it('emits mcp.session_initialized which sessions_v1 projects', async () => {

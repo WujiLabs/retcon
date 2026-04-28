@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 //
-// playtiss-proxy CLI entry.
+// retcon CLI entry.
 //
 // Scaffolded for v0.1.0-alpha.0. Subcommand handlers (server, stats,
 // --install-skill) land in later commits as the server + projectors
@@ -12,11 +12,11 @@ import { VERSION } from './version.js'
 
 function usage(): void {
   process.stdout.write(
-    `playtiss-proxy ${VERSION}\n`
+    `retcon ${VERSION}\n`
     + 'Usage:\n'
-    + '  playtiss-proxy              start the proxy server (not yet wired)\n'
-    + '  playtiss-proxy --version    print version\n'
-    + '  playtiss-proxy --help       print this message\n',
+    + '  retcon              start the proxy server (not yet wired)\n'
+    + '  retcon --version    print version\n'
+    + '  retcon --help       print this message\n',
   )
 }
 
@@ -30,7 +30,7 @@ function main(): void {
     usage()
     return
   }
-  process.stderr.write(`playtiss-proxy: unknown args: ${args.join(' ')}\n`)
+  process.stderr.write(`retcon: unknown args: ${args.join(' ')}\n`)
   process.exit(2)
 }
 
