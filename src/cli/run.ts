@@ -10,6 +10,12 @@
 //      - /mcp  via inline --mcp-config JSON whose `headers` field carries
 //        `Mcp-Session-Id`
 //      - --session-id <id>  so claude's local jsonl filename matches
+//        (NEW SESSION ONLY — `--session-id` conflicts with `--resume`/
+//        `--continue`; in that case we omit it and rely on the SessionStart
+//        hook to bind the transport id to claude's actual session_id post-
+//        picker.)
+//      - --settings inline JSON installs a SessionStart HTTP hook that
+//        POSTs to /hooks/session-start with the binding token in headers.
 //   4. wait for claude exit, propagate exit code
 //
 // Why pre-mint instead of capturing claude's MCP-Session-Id mid-stream:
@@ -38,6 +44,21 @@ export interface RunAgentOptions {
 }
 
 /**
+ * Detect whether user-supplied args put claude into resume mode. `--resume`
+ * accepts an optional positional id (`--resume <session-id>`) or runs the
+ * picker UI when used alone. `--continue` always picks the most recent.
+ * Either flag is incompatible with `--session-id`, so we have to choose.
+ */
+export function detectResumeMode(args: readonly string[]): boolean {
+  for (const a of args) {
+    if (a === '--resume' || a === '--continue' || a === '-r' || a === '-c') return true
+    // Long-form with `=` syntax: `--resume=<id>`
+    if (a.startsWith('--resume=') || a.startsWith('--continue=')) return true
+  }
+  return false
+}
+
+/**
  * Run the agent (typically claude) under the retcon proxy. Returns the
  * agent's exit code (or 127 if the agent binary isn't on PATH).
  */
@@ -59,9 +80,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
     process.stderr.write(`[retcon] daemon started on http://${host}:${port}\n`)
   }
 
-  // Step 2: mint one session id to bind /v1/* and /mcp under one identity.
-  // Must be a valid UUID for claude's --session-id flag.
-  const sessionId = randomUUID()
+  // Step 2: mint one transport id to bind /v1/* and /mcp under one identity.
+  // For new sessions this becomes claude's session_id (--session-id T).
+  // For --resume/--continue we cannot pass --session-id, so this stays as a
+  // binding_token until the SessionStart hook arrives with claude's real id.
+  const transportId = randomUUID()
+  const isResume = detectResumeMode(opts.args)
 
   // Step 3: build the per-invocation MCP config that claude will load via
   // --mcp-config. Inline JSON keeps our config out of ~/.claude.json so
@@ -76,9 +100,40 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
         // daemon's handleInitialize respects an incoming Mcp-Session-Id
         // header in preference to minting a fresh one.
         headers: {
-          'Mcp-Session-Id': sessionId,
+          'Mcp-Session-Id': transportId,
         },
       },
+    },
+  })
+
+  // SessionStart hook config. Claude calls our daemon on session start +
+  // resume so we can learn its actual session_id and rebind the transport id.
+  //
+  // We use a command hook (not http) because Claude Code rejects http hooks
+  // for SessionStart specifically: "HTTP hooks are not supported for
+  // SessionStart" (verified against v2.1.122). The command pipes stdin (the
+  // hook payload JSON) to curl, which POSTs to our daemon. The transport id
+  // travels via the RETCON_BINDING env var, which we set on the child.
+  //
+  // For new-session it's a harmless echo (transport id == claude session_id);
+  // for resumed sessions it's how we learn claude's session_id post-picker.
+  const hookCmd
+    = `curl -sS -X POST -H 'content-type: application/json' `
+    + `-H "x-playtiss-session: $RETCON_BINDING" `
+    + `--data-binary @- http://${host}:${port}/hooks/session-start >/dev/null`
+  const settings = JSON.stringify({
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: hookCmd,
+              timeout: 5,
+            },
+          ],
+        },
+      ],
     },
   })
 
@@ -86,10 +141,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   // args still win on conflict — but conflicts on --session-id /
   // --mcp-config from the user are unusual and would defeat the binding,
   // so we don't try to be clever about deduping).
-  const injectedArgs = [
-    '--session-id', sessionId,
-    '--mcp-config', mcpConfig,
-  ]
+  //
+  // For resume mode, omit --session-id (claude rejects --session-id together
+  // with --resume/--continue unless --fork-session is also set).
+  const injectedArgs = isResume
+    ? ['--mcp-config', mcpConfig, '--settings', settings]
+    : ['--session-id', transportId, '--mcp-config', mcpConfig, '--settings', settings]
   const result = await spawnAgent({
     agent: opts.agent,
     args: [...injectedArgs, ...opts.args],
@@ -97,7 +154,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
     envOverrides: {
       // Tells claude's Anthropic SDK to add this header on every /v1/*
       // request. Format is newline-separated `Header: value` pairs.
-      ANTHROPIC_CUSTOM_HEADERS: `x-playtiss-session: ${sessionId}`,
+      ANTHROPIC_CUSTOM_HEADERS: `x-playtiss-session: ${transportId}`,
+      // Available to the SessionStart command hook so it can echo the
+      // binding token back to the daemon (see settings JSON above).
+      RETCON_BINDING: transportId,
     },
   })
   if (result.spawnError) {

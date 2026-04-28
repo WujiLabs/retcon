@@ -20,6 +20,7 @@
 
 import http from 'node:http'
 import { generateTraceId } from '@playtiss/core'
+import type { BindingTable } from './binding-table.js'
 import type { EventProducer } from './events.js'
 import type { SessionQueue } from './session-queue.js'
 import { VERSION } from './version.js'
@@ -46,6 +47,13 @@ export interface McpContext {
    * (TOC/TOU defense per A-WR1).
    */
   readonly sessionQueue?: SessionQueue
+  /**
+   * Optional: late-binding table mapping transport ids (binding tokens issued
+   * for `claude --resume`) to claude's actual session_id once the SessionStart
+   * hook has fired. When present, every Mcp-Session-Id read is resolved
+   * through it so MCP traffic post-rebind attributes to the actual session.
+   */
+  readonly bindingTable?: BindingTable
 }
 
 export type McpToolHandler = (
@@ -144,7 +152,7 @@ export async function handleMcpRequest(
     return
   }
 
-  const clientSessionId = extractSessionId(req)
+  const clientSessionId = extractSessionId(req, ctx.bindingTable)
 
   try {
     switch (parsed.method) {
@@ -204,7 +212,7 @@ async function handleInitialize(
   // transaction consistency would require a separate query. Instead we re-
   // emit on the existing id; projector INSERT OR IGNORE + ON CONFLICT keeps
   // the row stable.
-  const existing = extractSessionId(httpReq)
+  const existing = extractSessionId(httpReq, ctx.bindingTable)
   const sessionId = existing && existing.length > 0 ? existing : generateTraceId()
 
   const params = (req.params ?? {}) as {
@@ -276,7 +284,7 @@ async function handleMcpDelete(
   res: http.ServerResponse,
   ctx: McpContext,
 ): Promise<void> {
-  const sessionId = extractSessionId(req)
+  const sessionId = extractSessionId(req, ctx.bindingTable)
   if (sessionId) {
     ctx.producer.emit('mcp.session_closed', {}, sessionId)
   }
@@ -296,7 +304,7 @@ function handleMcpGet(_req: http.IncomingMessage, res: http.ServerResponse): voi
   // Don't call res.end() — leave it open. It'll close when the client disconnects.
 }
 
-function extractSessionId(req: http.IncomingMessage): string | undefined {
+function extractSessionId(req: http.IncomingMessage, bindingTable?: BindingTable): string | undefined {
   // Mcp-Session-Id may arrive duplicated when multiple sources set it on the
   // same request — for example, Claude Code's --mcp-config "headers" injects
   // it AND the MCP transport's own session-id-echo logic also sets it. Node's
@@ -306,7 +314,8 @@ function extractSessionId(req: http.IncomingMessage): string | undefined {
   const raw = req.headers[MCP_SESSION_HEADER]
   if (typeof raw !== 'string' || raw.length === 0) return undefined
   const first = raw.split(',')[0].trim()
-  return first.length > 0 ? first : undefined
+  if (first.length === 0) return undefined
+  return bindingTable ? bindingTable.resolve(first) : first
 }
 
 function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {

@@ -16,10 +16,12 @@
 
 import fs from 'node:fs'
 import http from 'node:http'
+import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
+import { handleSessionStartHook } from './hook-handler.js'
 import { handleMcpRequest, type McpContext, type McpTool } from './mcp-handler.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
@@ -114,6 +116,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const host = options.host ?? '127.0.0.1'
   const sessionQueue = new SessionQueue()
   const forkAwaiter = options.forkAwaiter ?? new ForkAwaiter()
+  const bindingTable = new BindingTable()
   const proxyCtx: ProxyContext = {
     producer: options.producer,
     sessionQueue,
@@ -121,11 +124,13 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     redactSet: options.redactSet ?? DEFAULT_REDACTED_HEADERS,
     upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
     forkAwaiter,
+    bindingTable,
   }
   const mcpCtx: McpContext = {
     producer: options.producer,
     tools: options.mcpTools ?? new Map(),
     sessionQueue,  // shared with the /v1/* proxy so tools/call serializes with /v1/messages
+    bindingTable,
   }
 
   const startedAt = Date.now()
@@ -168,6 +173,20 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
 
     if (path === '/mcp' || path.startsWith('/mcp?') || path.startsWith('/mcp/')) {
       void handleMcpRequest(req, res, mcpCtx)
+      return
+    }
+
+    if (path === '/hooks/session-start') {
+      if (!options.db) {
+        res.writeHead(503, { 'content-type': 'text/plain' })
+        res.end('hook unavailable: server started without a DB handle\n')
+        return
+      }
+      void handleSessionStartHook(req, res, {
+        db: options.db,
+        bindingTable,
+        producer: options.producer,
+      })
       return
     }
 

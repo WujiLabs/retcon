@@ -22,6 +22,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { URL } from 'node:url'
 import zlib from 'node:zlib'
+import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes } from './body-blob.js'
 import type { EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
@@ -82,6 +83,14 @@ export interface ProxyContext {
   readonly redactSet: ReadonlySet<string>
   readonly upstream: string
   readonly forkAwaiter: ForkAwaiter
+  /**
+   * Optional binding table for late-bound resumed sessions. When the SessionStart
+   * hook has fired, the transport id (binding_token) resolves to the actual
+   * claude session_id; events get attributed there directly. When undefined or
+   * the transport id has no binding, requests stay attributed under the transport
+   * id (which becomes the canonical session_id for new sessions).
+   */
+  readonly bindingTable?: BindingTable
 }
 
 /**
@@ -90,10 +99,15 @@ export interface ProxyContext {
  * mode. A socket-tuple fallback would collide when the OS reuses ports — two
  * unrelated orphan requests sharing `remoteAddress:remotePort` would cross-read
  * each other's TOBE files and cross-project events.
+ *
+ * If a binding table is provided and the header is set, we resolve through it
+ * so resumed sessions land under claude's actual session_id post-rebind.
  */
-export function resolveSessionId(req: http.IncomingMessage): string {
+export function resolveSessionId(req: http.IncomingMessage, bindingTable?: BindingTable): string {
   const raw = req.headers[SESSION_HEADER]
-  if (typeof raw === 'string' && raw.length > 0) return raw
+  if (typeof raw === 'string' && raw.length > 0) {
+    return bindingTable ? bindingTable.resolve(raw) : raw
+  }
   return `orphan-${crypto.randomUUID()}`
 }
 
@@ -148,7 +162,7 @@ export async function handleProxyRequest(
   res: http.ServerResponse,
   ctx: ProxyContext,
 ): Promise<void> {
-  const sessionId = resolveSessionId(req)
+  const sessionId = resolveSessionId(req, ctx.bindingTable)
   // Per-session serialization for /v1/messages only. Other /v1/* calls
   // (e.g., /v1/models listing) don't need ordering.
   const shouldSerialize = (req.url ?? '').includes('/messages')
