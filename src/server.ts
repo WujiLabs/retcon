@@ -6,16 +6,15 @@
 // Routes:
 //   /v1/*   → transparent proxy to api.anthropic.com (pass-through)
 //   /mcp    → MCP Streamable HTTP transport (JSON-RPC POST + SSE GET)
-//   /health → liveness check
+//   /health → JSON liveness + identity check (used by retcon CLI to detect
+//             whether port 4099 is occupied by us or by a foreign process)
 //   anything else → 404
 //
 // Both route groups share one `http.createServer`, one SQLite DB, one
 // EventProducer, and one SessionQueue in the same process. The per-session
 // in-flight queue enforces the G2 session sequencing invariant for /v1/messages.
-//
-// Sub-handlers are wired here as stubs and filled in by later commits (HTTP
-// pass-through in C4, MCP route in week-2 commits).
 
+import fs from 'node:fs'
 import http from 'node:http'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
@@ -24,10 +23,11 @@ import { ForkAwaiter } from './fork-awaiter.js'
 import { handleMcpRequest, type McpContext, type McpToolHandler } from './mcp-handler.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
+import { RevisionsV1Projector } from './revisions-v1.js'
 import { SessionQueue } from './session-queue.js'
 import { SessionsV1Projector } from './sessions-v1.js'
 import type { TobeStore } from './tobe.js'
-import { RevisionsV1Projector } from './revisions-v1.js'
+import { VERSION } from './version.js'
 
 /**
  * Build the standard set of projectors wired into a v1 producer.
@@ -50,6 +50,20 @@ export function createDefaultProducer(db: DB): EventProducer {
 }
 
 export const DEFAULT_PORT = 4099
+
+/** Stable server identity reported on /health. */
+export const SERVER_NAME = 'retcon'
+
+export interface HealthSnapshot {
+  name: typeof SERVER_NAME
+  version: string
+  port: number
+  pid: number
+  started_at: number
+  uptime_s: number
+  sessions: number
+  db_size_bytes: number
+}
 
 export interface ServerOptions {
   port?: number
@@ -74,12 +88,25 @@ export interface ServerOptions {
    * tools/list still work, just with a zero-length tool list.
    */
   mcpTools?: Map<string, McpToolHandler>
+  /**
+   * Optional: DB handle for /health to count sessions. When omitted (e.g.
+   * unit tests that don't care about /health detail), sessions reads as 0.
+   */
+  db?: DB
+  /**
+   * Optional: SQLite file path for /health to report db_size_bytes. When
+   * omitted, db_size_bytes reads as 0.
+   */
+  dbPath?: string
 }
 
 export interface ServerHandle {
   readonly port: number
   readonly forkAwaiter: ForkAwaiter
+  /** Graceful close: closes idle keep-alive connections, then waits for in-flight requests. */
   close(): Promise<void>
+  /** Forcible close: drops all open keep-alive connections (e.g. MCP SSE channels) so close() can complete. */
+  closeAllConnections(): void
 }
 
 export function startServer(options: ServerOptions): Promise<ServerHandle> {
@@ -101,12 +128,41 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     sessionQueue,  // shared with the /v1/* proxy so tools/call serializes with /v1/messages
   }
 
+  const startedAt = Date.now()
+  let resolvedPort = port
+
+  function buildHealth(): HealthSnapshot {
+    let sessions = 0
+    if (options.db) {
+      try {
+        sessions = (options.db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n
+      }
+      catch { /* DB closed or migration mid-flight: report 0 */ }
+    }
+    let dbSize = 0
+    if (options.dbPath) {
+      try { dbSize = fs.statSync(options.dbPath).size }
+      catch { /* file may not exist yet on first boot */ }
+    }
+    return {
+      name: SERVER_NAME,
+      version: VERSION,
+      port: resolvedPort,
+      pid: process.pid,
+      started_at: startedAt,
+      uptime_s: Math.floor((Date.now() - startedAt) / 1000),
+      sessions,
+      db_size_bytes: dbSize,
+    }
+  }
+
   const server = http.createServer((req, res) => {
     const path = req.url ?? ''
 
     if (path === '/health' || path === '/healthz') {
-      res.writeHead(200, { 'content-type': 'text/plain' })
-      res.end('ok\n')
+      const body = JSON.stringify(buildHealth())
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(body + '\n')
       return
     }
 
@@ -128,7 +184,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     server.once('error', reject)
     server.listen(port, host, () => {
       const addr = server.address()
-      const resolvedPort = typeof addr === 'object' && addr ? addr.port : port
+      resolvedPort = typeof addr === 'object' && addr ? addr.port : port
       resolve({
         port: resolvedPort,
         forkAwaiter,
@@ -136,8 +192,13 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
           new Promise<void>((done, fail) => {
             server.close(err => (err ? fail(err) : done()))
           }),
+        closeAllConnections: () => {
+          // Node 18.2+: forcibly drop persistent connections (MCP SSE, HTTP
+          // keep-alive) so close()'s drain promise can resolve. Without this,
+          // a held-open SSE channel keeps the daemon alive past SIGTERM.
+          server.closeAllConnections()
+        },
       })
     })
   })
 }
-

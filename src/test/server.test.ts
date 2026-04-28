@@ -49,11 +49,34 @@ describe('startServer routing', () => {
     return { status: res.status, body }
   }
 
-  it('serves /health', async () => {
-    handle = await startServer({ port: 0, producer: fx!.producer, tobeStore: fx!.tobeStore })
+  it('serves /health as JSON identity + status', async () => {
+    handle = await startServer({
+      port: 0,
+      producer: fx!.producer,
+      tobeStore: fx!.tobeStore,
+      db: fx!.db,
+    })
     const { status, body } = await get('/health')
     expect(status).toBe(200)
-    expect(body.trim()).toBe('ok')
+    const parsed = JSON.parse(body) as {
+      name: string
+      version: string
+      port: number
+      pid: number
+      started_at: number
+      uptime_s: number
+      sessions: number
+      db_size_bytes: number
+    }
+    expect(parsed.name).toBe('retcon')
+    expect(parsed.version).toMatch(/^\d+\.\d+\.\d+(-[a-z0-9.]+)?$/)
+    expect(parsed.port).toBe(handle!.port)
+    expect(parsed.pid).toBe(process.pid)
+    expect(parsed.started_at).toBeGreaterThan(0)
+    expect(parsed.uptime_s).toBeGreaterThanOrEqual(0)
+    // Empty in-memory DB → 0 sessions, 0 db_size_bytes (no path provided).
+    expect(parsed.sessions).toBe(0)
+    expect(parsed.db_size_bytes).toBe(0)
   })
 
   it('/mcp GET returns 200 with text/event-stream (spec-compliant SSE open)', async () => {
