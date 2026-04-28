@@ -1,0 +1,277 @@
+// Copyright (c) 2026 Wuji Labs Inc
+// SPDX-License-Identifier: MIT
+//
+// Daemon lifecycle control: start (detached spawn), stop (SIGTERM with SIGKILL
+// fallback), status (uptime + disk usage), and the ensureDaemon entrypoint
+// used by `retcon` on every invocation.
+//
+// State machine for ensureDaemon(version):
+//
+//   ┌──────────────────────────────┐
+//   │     read PID file            │
+//   └────────────┬─────────────────┘
+//                │
+//      ┌─────────┴────────┐
+//      ▼                  ▼
+//   missing           exists
+//      │                  │
+//      │           ┌──────┴──────┐
+//      │           ▼             ▼
+//      │       kill(pid,0)    /health probe
+//      │       ESRCH (stale)  on saved port
+//      │           │             │
+//      │           ▼          ┌──┴───────────┐
+//      │       cleanup        ▼              ▼
+//      │           │       match           foreign / mismatch
+//      │           │          │                 │
+//      │           │       reuse           SIGTERM old + cleanup
+//      │           │       (return)              │
+//      │           ▼                             ▼
+//      └────► spawn detached daemon ◄────────────┘
+//                │
+//                ▼
+//             wait for /health up to ~5s
+//                │
+//             return { port }
+//
+
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import { DEFAULT_PORT } from '../server.js'
+import { VERSION } from '../version.js'
+import { probeHealth, type HealthSnapshotShape } from './health-probe.js'
+import { ensureRetconDirs, retconHome, retconLogFile, retconPidFile } from './paths.js'
+
+const SPAWN_READY_TIMEOUT_MS = 5000
+const STOP_SIGTERM_GRACE_MS = 5000
+
+export interface EnsureDaemonResult {
+  port: number
+  /** True if this invocation spawned the daemon; false if reusing existing. */
+  spawnedNew: boolean
+  /** Status snapshot if reusing; null if just spawned (caller can probe again). */
+  reusedSnapshot: HealthSnapshotShape | null
+}
+
+/**
+ * Make sure a retcon daemon is running on `port`. Returns once /health
+ * confirms a matching version is up. Throws if the port is held by a
+ * foreign process or the daemon refused to come up.
+ */
+export async function ensureDaemon(port: number = resolvedDefaultPort()): Promise<EnsureDaemonResult> {
+  ensureRetconDirs()
+
+  // Stale PID file? Clean up first so the probe path is the only signal.
+  const stalePid = readPidIfStale()
+  if (stalePid !== null) {
+    cleanupPidFile()
+  }
+
+  const probe = await probeHealth(port, VERSION)
+
+  if (probe.kind === 'match') {
+    return { port, spawnedNew: false, reusedSnapshot: probe.snapshot }
+  }
+
+  if (probe.kind === 'mismatch') {
+    // A retcon daemon at a different version is on the port. Replace it.
+    await stopExistingDaemon('mismatched-version')
+    return spawnAndWait(port)
+  }
+
+  if (probe.kind === 'foreign') {
+    throw new Error(
+      `port ${port} is owned by a non-retcon process (${probe.reason}). `
+      + `Set RETCON_PORT to a free port, or stop the conflicting process.`,
+    )
+  }
+
+  // free → spawn
+  return spawnAndWait(port)
+}
+
+export interface StopResult {
+  kind: 'stopped' | 'not_running' | 'cleaned_stale'
+  pid?: number
+}
+
+/** Stop the running daemon. Idempotent — no-ops if not running. */
+export async function stopDaemon(): Promise<StopResult> {
+  const pid = readPidFile()
+  if (pid === null) return { kind: 'not_running' }
+  if (!isAlive(pid)) {
+    cleanupPidFile()
+    return { kind: 'cleaned_stale', pid }
+  }
+  try { process.kill(pid, 'SIGTERM') }
+  catch { /* race: died between alive check and signal */ }
+
+  // Poll for exit up to STOP_SIGTERM_GRACE_MS, then SIGKILL.
+  const deadline = Date.now() + STOP_SIGTERM_GRACE_MS
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      cleanupPidFile()
+      return { kind: 'stopped', pid }
+    }
+    await sleep(100)
+  }
+  try { process.kill(pid, 'SIGKILL') }
+  catch { /* race */ }
+  cleanupPidFile()
+  return { kind: 'stopped', pid }
+}
+
+export type StatusResult =
+  | { kind: 'not_running' }
+  | { kind: 'running', snapshot: HealthSnapshotShape, diskBytes: number }
+  | { kind: 'degraded', pid: number, reason: string }
+
+/**
+ * Inspect the running daemon. Returns running status + health snapshot +
+ * total bytes used by ~/.retcon/. Computes disk usage by recursive stat.
+ */
+export async function statusDaemon(port: number = resolvedDefaultPort()): Promise<StatusResult> {
+  const pid = readPidFile()
+  if (pid === null || !isAlive(pid)) {
+    return { kind: 'not_running' }
+  }
+  const probe = await probeHealth(port, VERSION)
+  if (probe.kind !== 'match') {
+    const reason = probe.kind === 'mismatch'
+      ? `version mismatch (running ${probe.snapshot.version}, this binary is ${VERSION})`
+      : probe.kind === 'foreign'
+        ? `port owned by foreign process: ${probe.reason}`
+        : 'no daemon listening'
+    return { kind: 'degraded', pid, reason }
+  }
+  const diskBytes = await dirSize(retconHome())
+  return { kind: 'running', snapshot: probe.snapshot, diskBytes }
+}
+
+// ─── internals ────────────────────────────────────────────────────────────
+
+/** Resolve port the same way the daemon does (RETCON_PORT or DEFAULT_PORT). */
+export function resolvedDefaultPort(): number {
+  return Number(process.env.RETCON_PORT) || DEFAULT_PORT
+}
+
+function readPidFile(): number | null {
+  try {
+    const raw = fs.readFileSync(retconPidFile(), 'utf8').trim()
+    const pid = Number.parseInt(raw, 10)
+    return Number.isInteger(pid) && pid > 0 ? pid : null
+  }
+  catch { return null }
+}
+
+/** Read the PID file IF it exists AND the PID is dead. Otherwise null. */
+function readPidIfStale(): number | null {
+  const pid = readPidFile()
+  if (pid === null) return null
+  return isAlive(pid) ? null : pid
+}
+
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true }
+  catch (err) {
+    const e = err as NodeJS.ErrnoException
+    // EPERM means the process exists but we can't signal it. Still "alive."
+    return e.code === 'EPERM'
+  }
+}
+
+function cleanupPidFile(): void {
+  try { fs.unlinkSync(retconPidFile()) }
+  catch { /* not there */ }
+}
+
+async function stopExistingDaemon(reason: string): Promise<void> {
+  // Replicates a subset of stopDaemon, but quieter — caller logs the reason.
+  void reason
+  const pid = readPidFile()
+  if (pid === null || !isAlive(pid)) {
+    cleanupPidFile()
+    return
+  }
+  try { process.kill(pid, 'SIGTERM') }
+  catch { /* race */ }
+  const deadline = Date.now() + STOP_SIGTERM_GRACE_MS
+  while (Date.now() < deadline && isAlive(pid)) {
+    await sleep(100)
+  }
+  if (isAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL') }
+    catch { /* race */ }
+  }
+  cleanupPidFile()
+}
+
+async function spawnAndWait(port: number): Promise<EnsureDaemonResult> {
+  const logFd = fs.openSync(retconLogFile(), 'a')
+  try {
+    // Spawn the same node binary, re-invoking this CLI with --daemon. We
+    // resolve the script path from RETCON_CLI_ENTRY (set in tests so we can
+    // point at dist/cli.js while vitest is the actual argv[1]) or fall back
+    // to process.argv[1] in the real install.
+    const cliPath = process.env.RETCON_CLI_ENTRY ?? process.argv[1]
+    const child = spawn(process.execPath, [cliPath, '--daemon'], {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env: { ...process.env, RETCON_PORT: String(port) },
+    })
+    child.unref()
+    // Don't await child.exit — we WANT it to outlive us.
+  }
+  finally {
+    fs.closeSync(logFd)
+  }
+
+  const ready = await waitForHealthMatch(port, SPAWN_READY_TIMEOUT_MS)
+  if (!ready) {
+    throw new Error(
+      `retcon daemon failed to come up on port ${port} within ${SPAWN_READY_TIMEOUT_MS}ms. `
+      + `Check ~/.retcon/daemon.log for details.`,
+    )
+  }
+  return { port, spawnedNew: true, reusedSnapshot: null }
+}
+
+async function waitForHealthMatch(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const probe = await probeHealth(port, VERSION, { timeoutMs: 500 })
+    if (probe.kind === 'match') return true
+    await sleep(100)
+  }
+  return false
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
+}
+
+/**
+ * Walk a directory and sum file sizes. Best-effort; returns 0 on missing
+ * paths. Handles the symlink case by following links — `~/.retcon/` is
+ * never expected to contain symlinks but we don't want to throw if it does.
+ */
+async function dirSize(dir: string): Promise<number> {
+  let total = 0
+  let entries: fs.Dirent[]
+  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }) }
+  catch { return 0 }
+  for (const e of entries) {
+    const full = `${dir}/${e.name}`
+    if (e.isDirectory()) {
+      total += await dirSize(full)
+    }
+    else {
+      try {
+        const st = await fs.promises.stat(full)
+        total += st.size
+      }
+      catch { /* file vanished mid-walk; skip */ }
+    }
+  }
+  return total
+}
