@@ -6,7 +6,13 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { migrate, openDb } from '../db.js'
 import { createEventConsumer, type EventProducer } from '../events.js'
-import { MCP_SESSION_HEADER, type McpToolHandler } from '../mcp-handler.js'
+import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'
+
+// Test helper: build a minimal McpTool from just a handler. Real tools have
+// proper inputSchema; for unit tests we use empty objects.
+function tool(handler: McpTool['handler'], description = 'test tool'): McpTool {
+  return { handler, description, inputSchema: { type: 'object' } }
+}
 import { createDefaultProducer, startServer, type ServerHandle } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
@@ -19,7 +25,7 @@ function fixture() {
   return { db, producer, tobeStore, tmp, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
 }
 
-async function startWithTools(fx: ReturnType<typeof fixture>, tools: Map<string, McpToolHandler>) {
+async function startWithTools(fx: ReturnType<typeof fixture>, tools: Map<string, McpTool>) {
   return startServer({
     port: 0,
     producer: fx.producer,
@@ -91,9 +97,9 @@ describe('MCP /mcp route', () => {
   })
 
   it('tools/list returns handler names from the registered map', async () => {
-    const tools = new Map<string, McpToolHandler>([
-      ['fork_list', async () => ({})],
-      ['fork_back', async () => ({})],
+    const tools = new Map<string, McpTool>([
+      ['fork_list', tool(async () => ({}))],
+      ['fork_back', tool(async () => ({}))],
     ])
     handle = await startWithTools(fx, tools)
     // Initialize first so we have a session id to echo.
@@ -115,11 +121,11 @@ describe('MCP /mcp route', () => {
 
   it('tools/call invokes the registered handler with arguments', async () => {
     let receivedArgs: unknown
-    const tools = new Map<string, McpToolHandler>([
-      ['echo', async (args) => {
+    const tools = new Map<string, McpTool>([
+      ['echo', tool(async (args) => {
         receivedArgs = args
         return { echoed: args }
-      }],
+      })],
     ])
     handle = await startWithTools(fx, tools)
     const init = await postJsonRpc(handle.port, {

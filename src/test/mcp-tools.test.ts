@@ -80,9 +80,9 @@ function emitTurn(
 
 async function call(fx: TestFixture, name: string, args: unknown, forkBackEnabled = true): Promise<unknown> {
   const tools = createForkTools({ db: fx.db, tobeStore: fx.tobeStore, forkBackEnabled })
-  const handler = tools.get(name)
-  if (!handler) throw new Error(`no such tool: ${name}`)
-  return handler(args, { sessionId: fx.sessionId, producer: fx.producer })
+  const tool = tools.get(name)
+  if (!tool) throw new Error(`no such tool: ${name}`)
+  return tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer })
 }
 
 describe('fork_list', () => {
@@ -240,8 +240,8 @@ describe('fork_back', () => {
     try {
       emitTurn(orphan, 'end_turn', [{ role: 'user', content: 'q' }])
       const tools = createForkTools({ db: orphan.db, tobeStore: orphan.tobeStore })
-      const handler = tools.get('fork_back')!
-      const res = await handler(
+      const tool = tools.get('fork_back')!
+      const res = await tool.handler(
         { n: 1, message: 'alt' },
         { sessionId: orphan.sessionId, producer: orphan.producer },
       ) as { error: string }

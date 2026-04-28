@@ -20,7 +20,7 @@ import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
-import { handleMcpRequest, type McpContext, type McpToolHandler } from './mcp-handler.js'
+import { handleMcpRequest, type McpContext, type McpTool } from './mcp-handler.js'
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { RevisionsV1Projector } from './revisions-v1.js'
@@ -87,7 +87,7 @@ export interface ServerOptions {
    * (e.g. "fork_list", "fork_back"). Empty map means no tools — initialize +
    * tools/list still work, just with a zero-length tool list.
    */
-  mcpTools?: Map<string, McpToolHandler>
+  mcpTools?: Map<string, McpTool>
   /**
    * Optional: DB handle for /health to count sessions. When omitted (e.g.
    * unit tests that don't care about /health detail), sessions reads as 0.

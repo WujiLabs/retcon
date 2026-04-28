@@ -20,7 +20,7 @@ import { blobRefFromBytes } from './body-blob.js'
 import type { DB } from './db.js'
 import type { EventProducer } from './events.js'
 import { lastForkOutcome } from './fork-awaiter.js'
-import type { McpToolHandler } from './mcp-handler.js'
+import type { McpTool } from './mcp-handler.js'
 import type { TobeStore } from './tobe.js'
 
 /**
@@ -125,11 +125,24 @@ function firstChild(db: DB, parentRevisionId: string): RevisionRow | undefined {
   `).get(parentRevisionId) as RevisionRow | undefined
 }
 
-export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler> {
-  const tools = new Map<string, McpToolHandler>()
+export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
+  const tools = new Map<string, McpTool>()
 
   // ── fork_list ─────────────────────────────────────────────────────────────
-  tools.set('fork_list', async (args, ctx) => {
+  tools.set('fork_list', {
+    description:
+      'List recent forkable Revisions in this session. A Revision is one /v1/messages turn; '
+      + 'a "forkable" Revision is one that closed cleanly (end_turn / stop_sequence) and can be '
+      + 'used as a fork_back target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max revisions to return (1-200, default 20).' },
+        offset: { type: 'number', description: 'Pagination offset (default 0).' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
     const parsed = args as { limit?: number, offset?: number } | undefined
     const limit = Math.min(Math.max(parsed?.limit ?? 20, 1), 200)
     const offset = Math.max(parsed?.offset ?? 0, 0)
@@ -163,10 +176,23 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
         stop_reason: r.stop_reason,
       })),
     }
+    },
   })
 
   // ── fork_show ─────────────────────────────────────────────────────────────
-  tools.set('fork_show', async (args, ctx) => {
+  tools.set('fork_show', {
+    description:
+      'Show details of a single Revision by id, including the chain of preceding open Revisions '
+      + '(tool_use / pause_turn turns) leading up to it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        revision_id: { type: 'string', description: 'Revision id (TraceId) returned by fork_list.' },
+      },
+      required: ['revision_id'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
     const parsed = args as { revision_id?: string } | undefined
     if (!parsed?.revision_id) return { error: 'revision_id is required' }
 
@@ -205,10 +231,22 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       },
       preceding_open_revisions: preceding,
     }
+    },
   })
 
   // ── fork_bookmark ─────────────────────────────────────────────────────────
-  tools.set('fork_bookmark', async (args, ctx) => {
+  tools.set('fork_bookmark', {
+    description:
+      'Bookmark the most recent forkable Revision in this session with an optional human label, '
+      + 'so you can return to it later via fork_back.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Human-readable label for the bookmark.' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
     const parsed = args as { label?: string } | undefined
 
     const sess = loadSession(deps.db, ctx.sessionId)
@@ -235,10 +273,26 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       ctx.sessionId,
     )
     return { view_id: viewId, head_revision_id: head.id, label: parsed?.label ?? null }
+    },
   })
 
   // ── fork_back ─────────────────────────────────────────────────────────────
-  tools.set('fork_back', async (args, ctx) => {
+  tools.set('fork_back', {
+    description:
+      'Walk back N forkable Revisions and replace the current turn with a new user message. '
+      + 'The next /v1/messages call from the same session will have its messages[] rewritten so '
+      + 'the conversation continues from the chosen fork point with your new message — letting '
+      + 'you "edit the past turn and replay forward."',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        n: { type: 'number', description: 'How many forkable turns back to go (≥1).' },
+        message: { type: 'string', description: 'New user message to inject at the fork point.' },
+      },
+      required: ['n', 'message'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
     const parsed = args as { n?: number, message?: string } | undefined
     const n = typeof parsed?.n === 'number' ? Math.floor(parsed.n) : NaN
     const message = typeof parsed?.message === 'string' ? parsed.message : null
@@ -353,6 +407,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpToolHandler>
       pending_path: deps.tobeStore.fileFor(ctx.sessionId),
       prior_outcome: prior,
     }
+    },
   })
 
   return tools

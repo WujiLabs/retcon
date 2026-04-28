@@ -37,8 +37,8 @@ export const MCP_MAX_BODY_BYTES = 1024 * 1024
 
 export interface McpContext {
   readonly producer: EventProducer
-  /** Tool handlers keyed by name. Wired in C8. */
-  readonly tools: Map<string, McpToolHandler>
+  /** Tool handlers keyed by name (with MCP-spec metadata). Wired in C8. */
+  readonly tools: Map<string, McpTool>
   /**
    * Session queue shared with the /v1/* handler. `tools/call` invocations
    * run through this queue so fork_back's guard reads + TOBE write + event
@@ -52,6 +52,24 @@ export type McpToolHandler = (
   args: unknown,
   ctx: { sessionId: string, producer: EventProducer },
 ) => Promise<unknown>
+
+/**
+ * MCP-spec-compliant tool advertisement. `tools/list` returns one entry per
+ * registered tool with name + description + JSON-Schema for arguments. The
+ * inputSchema is REQUIRED by the spec — without it, Claude Code accepts the
+ * MCP server connection but silently refuses to expose the tool to the LLM.
+ */
+export interface McpTool {
+  description: string
+  /** JSON Schema describing the `arguments` payload accepted by `tools/call`. */
+  inputSchema: {
+    type: 'object'
+    properties?: Record<string, unknown>
+    required?: readonly string[]
+    additionalProperties?: boolean
+  }
+  handler: McpToolHandler
+}
 
 interface JsonRpcRequest {
   jsonrpc: '2.0'
@@ -161,12 +179,10 @@ export async function handleMcpRequest(
   }
 }
 
-function listTools(ctx: McpContext): Array<{ name: string, description: string }> {
-  // In v1 we advertise every handler present in the tools map. The real
-  // tool definitions (schemas, descriptions) live in mcp-tools.ts (C8).
-  const out: Array<{ name: string, description: string }> = []
-  for (const name of ctx.tools.keys()) {
-    out.push({ name, description: `retcon ${name}` })
+function listTools(ctx: McpContext): Array<{ name: string, description: string, inputSchema: McpTool['inputSchema'] }> {
+  const out: Array<{ name: string, description: string, inputSchema: McpTool['inputSchema'] }> = []
+  for (const [name, tool] of ctx.tools) {
+    out.push({ name, description: tool.description, inputSchema: tool.inputSchema })
   }
   return out
 }
@@ -234,8 +250,8 @@ async function handleToolsCall(
     sendJsonRpcError(res, req.id ?? null, INVALID_REQUEST, 'tools/call missing `name`')
     return
   }
-  const handler = ctx.tools.get(toolName)
-  if (!handler) {
+  const tool = ctx.tools.get(toolName)
+  if (!tool) {
     sendJsonRpcError(res, req.id ?? null, METHOD_NOT_FOUND, `unknown tool: ${toolName}`)
     return
   }
@@ -243,7 +259,7 @@ async function handleToolsCall(
   // This closes a TOC/TOU window in fork_back: the handler's guard read +
   // TOBE write + event emit are atomic with respect to any concurrent
   // /v1/messages the proxy is processing for the same session.
-  const invoke = (): Promise<unknown> => handler(params?.arguments ?? {}, {
+  const invoke = (): Promise<unknown> => tool.handler(params?.arguments ?? {}, {
     sessionId,
     producer: ctx.producer,
   })
