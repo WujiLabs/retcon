@@ -47,6 +47,13 @@ const SKIP_REQUEST_HEADERS = new Set([
   'trailer',
   'upgrade',
   'expect',           // Expect: 100-continue would stall upstream
+  // Strip accept-encoding so upstream sends UNCOMPRESSED bytes. We need raw
+  // SSE frames to feed to SseStopReasonParser as the stream arrives — if we
+  // forwarded gzip and got gzip back, the parser would see compressed
+  // garbage and fail to extract stop_reason from message_delta events,
+  // which would mis-classify every revision as dangling_unforkable. Cost:
+  // a few extra bytes on the localhost loopback. Worth it.
+  'accept-encoding',
 ])
 
 // Same list for the RESPONSE direction: Node re-chunks and re-frames the

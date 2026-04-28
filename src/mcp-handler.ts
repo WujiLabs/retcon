@@ -297,9 +297,16 @@ function handleMcpGet(_req: http.IncomingMessage, res: http.ServerResponse): voi
 }
 
 function extractSessionId(req: http.IncomingMessage): string | undefined {
+  // Mcp-Session-Id may arrive duplicated when multiple sources set it on the
+  // same request — for example, Claude Code's --mcp-config "headers" injects
+  // it AND the MCP transport's own session-id-echo logic also sets it. Node's
+  // http parser concatenates duplicate header values into a single comma-
+  // separated string ("id, id, id"). Take the first value; legitimate uses
+  // always set the same id, so any of them is correct.
   const raw = req.headers[MCP_SESSION_HEADER]
-  if (typeof raw === 'string' && raw.length > 0) return raw
-  return undefined
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const first = raw.split(',')[0].trim()
+  return first.length > 0 ? first : undefined
 }
 
 function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
