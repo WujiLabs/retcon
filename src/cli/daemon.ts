@@ -44,6 +44,13 @@ import { ensureRetconDirs, retconDbPath, retconPidFile, retconTobeDir } from './
 const SHUTDOWN_DEADLINE_MS = 2000
 
 /**
+ * TTL for `pending_actors` rows on daemon startup. Anything older than
+ * this is treated as an abandoned launch (the user CTRL-C'd claude
+ * before it made its first /v1/messages call) and swept on boot.
+ */
+const PENDING_ACTOR_GC_TTL_MS = 60 * 60 * 1000
+
+/**
  * Run the daemon body. Blocks until SIGTERM/SIGINT (clean shutdown) or
  * uncaughtException (emergency shutdown). Resolves with the exit code.
  *
@@ -64,10 +71,10 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   // Garbage-collect stale pending_actors entries. A row leaks here if a
   // `retcon` invocation registered an actor but the user CTRL-C'd before
   // claude made its first /v1/messages call (so the projector's consume-
-  // on-first-event never ran). One hour is well past any normal launch
-  // delay; anything older is abandoned.
+  // on-first-event never ran). PENDING_ACTOR_GC_TTL_MS is past any normal
+  // launch delay; anything older is abandoned.
   db.prepare('DELETE FROM pending_actors WHERE registered_at < ?')
-    .run(Date.now() - 3600_000)
+    .run(Date.now() - PENDING_ACTOR_GC_TTL_MS)
 
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())

@@ -118,7 +118,7 @@ export async function handleSessionStartHook(
             session_id: sessionId,
             existing_actor: err.existingActor,
             requested_actor: err.requestedActor,
-            source: typeof payload.source === 'string' ? payload.source : null,
+            source,
           },
           sessionId,
         )

@@ -16,6 +16,7 @@ import crypto from 'node:crypto'
 
 import type { DB } from './db.js'
 import type { Event, Projection } from './events.js'
+import { DEFAULT_ACTOR } from './util/actor-name.js'
 
 interface McpSessionInitializedPayload {
   mcp_session_id: string
@@ -61,6 +62,10 @@ export class SessionsV1Projector implements Projection {
         harness = CASE
           WHEN sessions.harness = 'orphan' THEN excluded.harness
           ELSE sessions.harness
+        END,
+        actor = CASE
+          WHEN sessions.actor = 'default' THEN excluded.actor
+          ELSE sessions.actor
         END
     `).run(
       event.sessionId,
@@ -131,7 +136,7 @@ function takePendingActor(transportId: string, tx: DB): string {
   const row = tx
     .prepare('SELECT actor FROM pending_actors WHERE transport_id = ?')
     .get(transportId) as { actor: string } | undefined
-  if (!row) return 'default'
+  if (!row) return DEFAULT_ACTOR
   tx.prepare('DELETE FROM pending_actors WHERE transport_id = ?').run(transportId)
   return row.actor
 }

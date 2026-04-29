@@ -79,6 +79,7 @@ describe('runClean', () => {
     expect(r.revisions).toBe(2)
     expect(r.tasks).toBe(2)
     expect(r.branchViews).toBe(2) // one per task under 'test'
+    expect(r.pendingActors).toBe(0) // none seeded
     expect(r.tobeFilesRemoved).toBe(0) // dry-run: no fs change
 
     // Verify rows still exist
@@ -117,6 +118,7 @@ describe('runClean', () => {
     const r = runClean({ actor: 'nonexistent', yes: true, force: false })
     expect(r.sessions).toBe(0)
     expect(r.events).toBe(0)
+    expect(r.pendingActors).toBe(0)
     expect(r.applied).toBe(true)
 
     const db = openDb({ path: dbPath })
@@ -130,13 +132,53 @@ describe('runClean', () => {
     const r = runClean({ actor: 'test', yes: true, force: false })
     expect(r.sessions).toBe(0)
   })
+
+  it('--yes deletes orphan pending_actors entries for the actor (no session needed)', () => {
+    // Seed an orphan pending entry: actor='test' registered an actor, then
+    // the user CTRL-C'd before claude posted. No session row, no session_id
+    // in `sessions` matches, but the pending entry should still be cleaned.
+    const db = openDb({ path: dbPath })
+    db.prepare('INSERT INTO pending_actors (transport_id, actor, registered_at) VALUES (?, ?, ?)')
+      .run('orphan-tid-1', 'test', Date.now())
+    db.prepare('INSERT INTO pending_actors (transport_id, actor, registered_at) VALUES (?, ?, ?)')
+      .run('orphan-tid-keep', 'keep', Date.now())
+    db.close()
+
+    const r = runClean({ actor: 'test', yes: true, force: false })
+    expect(r.applied).toBe(true)
+    expect(r.pendingActors).toBe(1) // only 'test'
+
+    const db2 = openDb({ path: dbPath })
+    const remaining = db2.prepare('SELECT transport_id FROM pending_actors').all() as Array<{ transport_id: string }>
+    db2.close()
+    expect(remaining.map(r => r.transport_id)).toEqual(['orphan-tid-keep'])
+  })
+
+  it('--yes runs even when actor has no sessions but has orphan pending entries', () => {
+    // Wipe all 'test' sessions first so only the orphan pending matters.
+    const db = openDb({ path: dbPath })
+    db.prepare(`DELETE FROM sessions WHERE actor='test'`).run()
+    db.prepare('INSERT INTO pending_actors (transport_id, actor, registered_at) VALUES (?, ?, ?)')
+      .run('lonely-orphan', 'test', Date.now())
+    db.close()
+
+    const r = runClean({ actor: 'test', yes: true, force: false })
+    expect(r.applied).toBe(true)
+    expect(r.sessions).toBe(0)
+    expect(r.pendingActors).toBe(1)
+
+    const db2 = openDb({ path: dbPath })
+    const remaining = (db2.prepare(`SELECT COUNT(*) AS n FROM pending_actors WHERE actor='test'`).get() as { n: number }).n
+    db2.close()
+    expect(remaining).toBe(0)
+  })
 })
 
 describe('formatCleanResult', () => {
   it('labels output as dry-run when not applied', () => {
     const out = formatCleanResult(
       { actor: 'test', yes: false, force: false },
-      { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, tobeFilesRemoved: 0, applied: false },
+      { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, pendingActors: 0, tobeFilesRemoved: 0, applied: false },
     )
     expect(out).toContain('would delete')
     expect(out).toContain('dry-run')
@@ -144,9 +186,10 @@ describe('formatCleanResult', () => {
   it('labels output as deleted when applied', () => {
     const out = formatCleanResult(
       { actor: 'test', yes: true, force: false },
-      { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, tobeFilesRemoved: 1, applied: true },
+      { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, pendingActors: 1, tobeFilesRemoved: 1, applied: true },
     )
     expect(out).toContain('deleted')
+    expect(out).toContain('pending_actors:')
     expect(out).not.toContain('dry-run')
   })
 })

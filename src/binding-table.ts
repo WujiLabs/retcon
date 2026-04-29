@@ -15,6 +15,7 @@
 // (we pass --session-id T), so the SessionStart hook's rebind is a no-op.
 
 import type { DB } from './db.js'
+import { DEFAULT_ACTOR } from './util/actor-name.js'
 
 export class BindingTable {
   private readonly map = new Map<string, string>()
@@ -117,10 +118,10 @@ export function rebindSession(db: DB, oldId: string, newId: string): void {
           .prepare('SELECT actor FROM sessions WHERE id=?')
           .get(newId) as { actor: string } | undefined
         if (existingNew) {
-          if (existingNew.actor !== 'default' && existingNew.actor !== pending.actor) {
+          if (existingNew.actor !== DEFAULT_ACTOR && existingNew.actor !== pending.actor) {
             throw new ActorConflictError(newId, existingNew.actor, pending.actor)
           }
-          if (existingNew.actor === 'default' && pending.actor !== 'default') {
+          if (existingNew.actor === DEFAULT_ACTOR && pending.actor !== DEFAULT_ACTOR) {
             db.prepare('UPDATE sessions SET actor=? WHERE id=?').run(pending.actor, newId)
           }
           db.prepare('DELETE FROM pending_actors WHERE transport_id=?').run(oldId)
@@ -150,14 +151,14 @@ export function rebindSession(db: DB, oldId: string, newId: string): void {
       // non-default explicit actor and they differ, refuse the merge.
       const requestedActor = pending?.actor ?? oldSession.actor
       if (
-        existingNew.actor !== 'default'
-        && requestedActor !== 'default'
+        existingNew.actor !== DEFAULT_ACTOR
+        && requestedActor !== DEFAULT_ACTOR
         && existingNew.actor !== requestedActor
       ) {
         throw new ActorConflictError(newId, existingNew.actor, requestedActor)
       }
       // Upgrade existingNew.actor from default → requested if applicable.
-      if (existingNew.actor === 'default' && requestedActor !== 'default') {
+      if (existingNew.actor === DEFAULT_ACTOR && requestedActor !== DEFAULT_ACTOR) {
         db.prepare('UPDATE sessions SET actor=? WHERE id=?').run(requestedActor, newId)
       }
 

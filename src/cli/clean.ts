@@ -23,7 +23,7 @@ import fs from 'node:fs'
 
 import { closeDb, openDb } from '../db.js'
 import { createTobeStore } from '../tobe.js'
-import { ACTOR_RE } from '../util/actor-name.js'
+import { validateActor } from '../util/actor-name.js'
 import { retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
 
 export interface CleanOptions {
@@ -41,6 +41,9 @@ export interface CleanResult {
   revisions: number
   branchViews: number
   events: number
+  /** pending_actors rows tagged with this actor (orphan registrations
+   *  + any in-flight ones at delete time). */
+  pendingActors: number
   tobeFilesRemoved: number
   /** True if writes were applied; false if dry-run. */
   applied: boolean
@@ -80,7 +83,13 @@ export function parseCleanArgs(args: readonly string[]): CleanOptions {
   if (!actor) {
     throw new Error('--actor <name> is required (refusing to clean without an explicit scope)')
   }
-  if (!ACTOR_RE.test(actor)) {
+  // Defer to the shared validator so the regex + message live in one place.
+  // Re-throw with the `--actor` prefix so the user's CLI sees a flag-aware
+  // error rather than a generic "actor ..." one.
+  try {
+    validateActor(actor)
+  }
+  catch {
     throw new Error(
       `--actor "${actor}" is not a valid name. `
       + `Allowed: 1–64 characters from [A-Za-z0-9_-].`,
@@ -94,6 +103,13 @@ export function parseCleanArgs(args: readonly string[]): CleanOptions {
  * the PID if alive, null otherwise. We use a 0-signal kill to test for the
  * process; ESRCH (no process) and stale-file are both treated as "no live
  * daemon".
+ *
+ * TOCTOU note: a daemon can in theory start in the gap between this check
+ * and the actual DELETEs in runClean(). SQLite WAL prevents corruption,
+ * but split-state is possible (the daemon's mid-flight INSERTs may land
+ * while clean is mid-DELETE). Accepted under the local single-user trust
+ * model — the same actor invoking `clean` is the one who'd start a
+ * daemon. If we ever go multi-user we'd need a flock or BEGIN EXCLUSIVE.
  */
 export function detectLiveDaemon(): number | null {
   let raw: string
@@ -131,6 +147,7 @@ export function runClean(opts: CleanOptions): CleanResult {
       revisions: 0,
       branchViews: 0,
       events: 0,
+      pendingActors: 0,
       tobeFilesRemoved: 0,
       applied: opts.yes,
     }
@@ -144,13 +161,22 @@ export function runClean(opts: CleanOptions): CleanResult {
     const sessionIds = sessionRows.map(r => r.id)
     const taskIds = sessionRows.map(r => r.task_id)
 
-    if (sessionIds.length === 0) {
+    // Pending registrations for this actor that never landed a session
+    // (e.g. user CTRL-C'd between /actor/register and the first /v1/*).
+    // Counted + deleted independently of sessionIds; they don't overlap
+    // with consumed entries (takePendingActor deletes on consume).
+    const pendingActorsCount = (db
+      .prepare('SELECT COUNT(*) AS n FROM pending_actors WHERE actor = ?')
+      .get(opts.actor) as { n: number }).n
+
+    if (sessionIds.length === 0 && pendingActorsCount === 0) {
       return {
         sessions: 0,
         tasks: 0,
         revisions: 0,
         branchViews: 0,
         events: 0,
+        pendingActors: 0,
         tobeFilesRemoved: 0,
         applied: opts.yes,
       }
@@ -161,35 +187,48 @@ export function runClean(opts: CleanOptions): CleanResult {
     const taskPlaceholders = placeholders(taskIds.length)
 
     // Count what would be deleted — same query whether we apply or not.
-    const eventsCount = (db
-      .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id IN (${sessionPlaceholders})`)
-      .get(...sessionIds) as { n: number }).n
-    const branchViewsCount = (db
-      .prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE task_id IN (${taskPlaceholders})`)
-      .get(...taskIds) as { n: number }).n
-    const revisionsCount = (db
-      .prepare(`SELECT COUNT(*) AS n FROM revisions WHERE task_id IN (${taskPlaceholders})`)
-      .get(...taskIds) as { n: number }).n
-    const tasksCount = (db
-      .prepare(`SELECT COUNT(*) AS n FROM tasks WHERE id IN (${taskPlaceholders})`)
-      .get(...taskIds) as { n: number }).n
+    const eventsCount = sessionIds.length === 0
+      ? 0
+      : (db
+          .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id IN (${sessionPlaceholders})`)
+          .get(...sessionIds) as { n: number }).n
+    const branchViewsCount = taskIds.length === 0
+      ? 0
+      : (db
+          .prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE task_id IN (${taskPlaceholders})`)
+          .get(...taskIds) as { n: number }).n
+    const revisionsCount = taskIds.length === 0
+      ? 0
+      : (db
+          .prepare(`SELECT COUNT(*) AS n FROM revisions WHERE task_id IN (${taskPlaceholders})`)
+          .get(...taskIds) as { n: number }).n
+    const tasksCount = taskIds.length === 0
+      ? 0
+      : (db
+          .prepare(`SELECT COUNT(*) AS n FROM tasks WHERE id IN (${taskPlaceholders})`)
+          .get(...taskIds) as { n: number }).n
 
     let tobeFilesRemoved = 0
 
     if (opts.yes) {
       const tx = db.transaction(() => {
-        db.prepare(`DELETE FROM events WHERE session_id IN (${sessionPlaceholders})`)
-          .run(...sessionIds)
-        db.prepare(`DELETE FROM branch_views WHERE task_id IN (${taskPlaceholders})`)
-          .run(...taskIds)
-        db.prepare(`DELETE FROM revisions WHERE task_id IN (${taskPlaceholders})`)
-          .run(...taskIds)
-        db.prepare(`DELETE FROM tasks WHERE id IN (${taskPlaceholders})`)
-          .run(...taskIds)
-        db.prepare(`DELETE FROM sessions WHERE id IN (${sessionPlaceholders})`)
-          .run(...sessionIds)
-        db.prepare(`DELETE FROM pending_actors WHERE transport_id IN (${sessionPlaceholders})`)
-          .run(...sessionIds)
+        if (sessionIds.length > 0) {
+          db.prepare(`DELETE FROM events WHERE session_id IN (${sessionPlaceholders})`)
+            .run(...sessionIds)
+          db.prepare(`DELETE FROM branch_views WHERE task_id IN (${taskPlaceholders})`)
+            .run(...taskIds)
+          db.prepare(`DELETE FROM revisions WHERE task_id IN (${taskPlaceholders})`)
+            .run(...taskIds)
+          db.prepare(`DELETE FROM tasks WHERE id IN (${taskPlaceholders})`)
+            .run(...taskIds)
+          db.prepare(`DELETE FROM sessions WHERE id IN (${sessionPlaceholders})`)
+            .run(...sessionIds)
+        }
+        // Wipe orphan + active pending registrations for this actor.
+        // Strict superset of any "transport_id matches a sessionId" logic
+        // because consumed pending entries are already deleted by
+        // takePendingActor — only orphans remain at delete time.
+        db.prepare('DELETE FROM pending_actors WHERE actor = ?').run(opts.actor)
       })
       tx()
 
@@ -214,6 +253,7 @@ export function runClean(opts: CleanOptions): CleanResult {
       revisions: revisionsCount,
       branchViews: branchViewsCount,
       events: eventsCount,
+      pendingActors: pendingActorsCount,
       tobeFilesRemoved,
       applied: opts.yes,
     }
@@ -232,12 +272,13 @@ export function formatCleanResult(opts: CleanOptions, result: CleanResult): stri
   const lines = [
     `retcon clean --actor ${opts.actor}${result.applied ? ' --yes' : ''}`,
     `  ${verb}:`,
-    `    sessions:      ${result.sessions}`,
-    `    tasks:         ${result.tasks}`,
-    `    revisions:     ${result.revisions}`,
-    `    branch_views:  ${result.branchViews}`,
-    `    events:        ${result.events}`,
-    `    TOBE files:    ${result.tobeFilesRemoved}`,
+    `    sessions:        ${result.sessions}`,
+    `    tasks:           ${result.tasks}`,
+    `    revisions:       ${result.revisions}`,
+    `    branch_views:    ${result.branchViews}`,
+    `    events:          ${result.events}`,
+    `    pending_actors:  ${result.pendingActors}`,
+    `    TOBE files:      ${result.tobeFilesRemoved}`,
   ]
   if (!result.applied) {
     lines.push(``, `  (dry-run; pass --yes to actually delete)`)

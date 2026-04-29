@@ -17,7 +17,15 @@ import Database from 'better-sqlite3'
 
 export type DB = Database.Database
 
-export const CURRENT_SCHEMA_VERSION = 4
+// v5 = Phase 2 of the asset-store migration: per-message CIDs switched
+// from flat-hash (Block.encode of the inline-encoded value) to Merkle-hash
+// (computeStorageBlock / computeTopBlock). For Anthropic messages with a
+// nested `content` array, the two hashes produce different CIDs for the
+// same logical content. Bumping the schema forces nuke-and-reinit on
+// upgrade per the alpha policy so dedup stays intact (otherwise a v4 DB
+// would carry forward flat-hashed leaves and new writes would double-
+// store the same content under Merkle-hashed CIDs).
+export const CURRENT_SCHEMA_VERSION = 5
 
 // Single source of truth for the schema_version table DDL. Used in three
 // places (initial create in migrate(), the SOURCE_OF_TRUTH_SCHEMA bundle,

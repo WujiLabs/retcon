@@ -70,9 +70,11 @@ export async function handleActorRegister(
     return
   }
 
-  // INSERT OR REPLACE: if the same transport id is registered twice (rare,
-  // but harmless — e.g. a CLI retried after a transient failure), the latest
-  // value wins.
+  // ON CONFLICT DO UPDATE: if the same transport id is registered twice
+  // (rare but harmless — e.g. a CLI retried after a transient failure),
+  // the latest value wins. We deliberately use UPDATE rather than the
+  // older INSERT OR REPLACE: REPLACE deletes-then-inserts and would
+  // disturb FK behavior, while DO UPDATE preserves row identity.
   db.prepare(`
     INSERT INTO pending_actors (transport_id, actor, registered_at)
     VALUES (?, ?, ?)

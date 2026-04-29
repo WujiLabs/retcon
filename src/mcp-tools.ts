@@ -8,9 +8,11 @@
 // Mcp-Session-Id header that the MCP handler extracts) and the producer,
 // and operates on the proxy's own SQLite DB.
 //
-// fork_back's F4 guard: reject when the current head Revision is `open`
-// (mid-tool-use) or `in_flight`. A fork from that state would inject a
-// fresh user message where Anthropic expects a tool_result.
+// fork_back's F4 guard: walk past `open` (mid-tool-use) and `in_flight`
+// (request_received, no response yet) revisions to the nearest settled
+// ancestor. Both states are the model mid-thought from Anthropic's POV;
+// a fresh user message there would inject where Anthropic expects a
+// tool_result. Errors only when no settled revision is reachable.
 //
 // fork_bookmark's G10 guard: reject when no closed_forkable Revision exists
 // yet for this session.
@@ -503,8 +505,11 @@ async function hydrateMessages(
   if (hydrated && Array.isArray(hydrated.messages)) {
     return hydrated.messages
   }
-  // Legacy fallback: a single raw-codec blob containing JSON for the
-  // whole body. fetchBuffer throws on missing; treat that as null.
+  // Legacy fallback: the top blob predates the messages-body split, OR
+  // its decoded value isn't a recognizable link-walk shape (raw codec,
+  // top-level array, primitive, etc.). Try parsing the bytes as
+  // straight JSON to extract messages[]. fetchBuffer throws on missing;
+  // treat that as null.
   let bytes: Uint8Array
   try {
     bytes = await deps.storageProvider.fetchBuffer(cid)

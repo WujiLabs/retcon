@@ -162,6 +162,26 @@ function applyTobe(
 }
 
 /**
+ * Hard cap on the JSON-encoded size of `branch_context_json`. The column
+ * grows by one user/assistant turn per /v1/messages once a fork is active.
+ * 8 MiB is well past any model's context window (≈2M+ tokens), so hitting
+ * this cap means something went wrong: a runaway tool loop, an
+ * adversarial LLM, or a misbehaving client. On overflow we wipe the
+ * override and fall back to claude's local view — the fork is lost, but
+ * we don't grow the column further.
+ */
+export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
+
+export interface BranchContextRewriteResult {
+  /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
+  body: Buffer
+  /** True iff the fork's branch_context_json crossed BRANCH_CONTEXT_MAX_BYTES
+   *  on this turn. Caller wipes the column, emits an audit event, and
+   *  forwards the original (unrewritten) body. */
+  overflow: boolean
+}
+
+/**
  * Persistent fork-context rewrite. If the session has a `branch_context_json`
  * stored (set by `fork_back`), splice it into claude's outgoing /v1/messages
  * request body and persist the extended branch_context for next time.
@@ -196,27 +216,11 @@ function applyTobe(
  *   - claude's body isn't parseable JSON
  *   - claude has fewer than 2 user messages (shouldn't happen post-fork
  *     since the fork always followed at least 2 user turns)
+ *
+ * Returns `{overflow: true}` when extending the branch_context would push
+ * the JSON-encoded column past BRANCH_CONTEXT_MAX_BYTES. Caller wipes the
+ * column, emits an audit event, and forwards claude's body unchanged.
  */
-/**
- * Hard cap on the JSON-encoded size of `branch_context_json`. The column
- * grows by one user/assistant turn per /v1/messages once a fork is active.
- * 8 MiB is well past any model's context window (≈2M+ tokens), so hitting
- * this cap means something went wrong: a runaway tool loop, an
- * adversarial LLM, or a misbehaving client. On overflow we wipe the
- * override and fall back to claude's local view — the fork is lost, but
- * we don't grow the column further.
- */
-export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
-
-export interface BranchContextRewriteResult {
-  /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
-  body: Buffer
-  /** True iff the fork's branch_context_json crossed BRANCH_CONTEXT_MAX_BYTES
-   *  on this turn. Caller wipes the column, emits an audit event, and
-   *  forwards the original (unrewritten) body. */
-  overflow: boolean
-}
-
 export function applyBranchContextRewrite(
   rawBody: Buffer,
   sessionId: string,
@@ -372,14 +376,17 @@ async function dispatch(
     source_view_id: string
     original_body_cid: string
   } | undefined
+  // Same bytes get hashed by both the tobe_applied_from metadata block
+  // and the proxy.request_received emit. Compute once.
+  let originalBodyBlob: Awaited<ReturnType<typeof blobRefFromBytes>> | undefined
   if (pending) {
     const { rewritten, originalBody } = applyTobe(rawBody, pending)
     bodyToForward = rewritten
-    const originalCid = (await blobRefFromBytes(originalBody)).cid
+    originalBodyBlob = await blobRefFromBytes(originalBody)
     tobeAppliedFrom = {
       fork_point_revision_id: pending.fork_point_revision_id,
       source_view_id: pending.source_view_id,
-      original_body_cid: originalCid,
+      original_body_cid: originalBodyBlob.cid,
     }
   }
   else if (isMessagesPath && ctx.db) {
@@ -434,9 +441,7 @@ async function dispatch(
     bodyRefs = [single.ref]
   }
 
-  const originalBodyBlob = tobeAppliedFrom
-    ? await blobRefFromBytes(rawBody)
-    : undefined
+  // originalBodyBlob was already set in the `pending` branch above.
 
   // Emit proxy.request_received (atomic with blobs, per G1).
   const requestEvent = ctx.producer.emit(
