@@ -15,9 +15,10 @@
 // fork_bookmark's G10 guard: reject when no closed_forkable Revision exists
 // yet for this session.
 
+import type { AssetId } from '@playtiss/core'
 import { generateTraceId } from '@playtiss/core'
 
-import { blobRefFromBytes } from './body-blob.js'
+import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
@@ -466,35 +467,45 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
  *
  * Without the slice in case 1, the rolled-back user input would land
  * back in the upstream request — defeating the fork.
+ *
+ * Bodies are stored as content-addressed splits (one blob per message
+ * + tool, top blob holds CID links) — see body-blob.ts. We hydrate
+ * via loadHydratedMessagesBody so the messages[] array we return is
+ * fully expanded inline, not link refs.
  */
 export function reconstructForkMessages(db: DB, target: RevisionRow): unknown[] | null {
   const child = firstChild(db, target.id)
   if (child) {
     const childCid = requestBodyCidFor(db, child.id)
     if (childCid) {
-      const bytes = loadBlob(db, childCid)
-      if (bytes) {
-        try {
-          const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
-          if (Array.isArray(parsed.messages) && parsed.messages.length > 0) {
-            // Drop child_user_input. Result ends at target's assistant response.
-            return parsed.messages.slice(0, -1)
-          }
-        }
-        catch { /* fall through to target's own body */ }
+      const messages = hydrateMessages(db, childCid as AssetId)
+      if (messages && messages.length > 0) {
+        // Drop child_user_input. Result ends at target's assistant response.
+        return messages.slice(0, -1)
       }
     }
   }
   const targetCid = requestBodyCidFor(db, target.id)
   if (targetCid) {
-    const bytes = loadBlob(db, targetCid)
-    if (bytes) {
-      try {
-        const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
-        if (Array.isArray(parsed.messages)) return [...parsed.messages]
-      }
-      catch { /* nothing else to try */ }
-    }
+    const messages = hydrateMessages(db, targetCid as AssetId)
+    if (messages) return [...messages]
   }
+  return null
+}
+
+function hydrateMessages(db: DB, cid: AssetId): unknown[] | null {
+  // Try the content-addressed (link-ified) layout first.
+  const hydrated = loadHydratedMessagesBody(db, cid)
+  if (hydrated && Array.isArray(hydrated.messages)) {
+    return hydrated.messages
+  }
+  // Legacy fallback: a single raw blob containing JSON for the whole body.
+  const bytes = loadBlob(db, cid)
+  if (!bytes) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
+    if (Array.isArray(parsed.messages)) return parsed.messages
+  }
+  catch { /* not JSON */ }
   return null
 }

@@ -24,9 +24,9 @@ import { URL } from 'node:url'
 import zlib from 'node:zlib'
 
 import type { BindingTable } from './binding-table.js'
-import { blobRefFromBytes } from './body-blob.js'
+import { blobRefFromBytes, blobRefFromMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
-import type { EventProducer } from './events.js'
+import type { BlobRef, EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
@@ -370,10 +370,29 @@ async function dispatch(
 
   // Compute blobs (request body + redacted headers) BEFORE upstream dispatch
   // so the event we emit at request time references committed blobs.
+  //
+  // For /v1/messages requests we use blobRefFromMessagesBody, which splits
+  // each message and tool into its own dag-json blob. That deduplicates the
+  // long static prefix (system-reminder, repeated user/assistant pairs) so
+  // storage scales linearly with NEW content rather than O(N²) with the
+  // conversation length. Other /v1/* paths (model listing, etc.) use the
+  // single-byte-blob path.
   const redactedHeaders = redactHeaders(req.headers, ctx.redactSet)
   const headerJson = Buffer.from(JSON.stringify(redactedHeaders), 'utf8')
-  const bodyBlob = await blobRefFromBytes(bodyToForward)
   const headerBlob = await blobRefFromBytes(headerJson)
+
+  let bodyCid: string
+  let bodyRefs: BlobRef[]
+  if (isMessagesPath) {
+    const split = await blobRefFromMessagesBody(bodyToForward)
+    bodyCid = split.topCid
+    bodyRefs = split.refs
+  }
+  else {
+    const single = await blobRefFromBytes(bodyToForward)
+    bodyCid = single.cid
+    bodyRefs = [single.ref]
+  }
 
   const originalBodyBlob = tobeAppliedFrom
     ? await blobRefFromBytes(rawBody)
@@ -386,13 +405,13 @@ async function dispatch(
       method: req.method ?? 'GET',
       path: req.url ?? '/',
       headers_cid: headerBlob.cid,
-      body_cid: bodyBlob.cid,
+      body_cid: bodyCid,
       ...(tobeAppliedFrom ? { tobe_applied_from: tobeAppliedFrom } : {}),
     },
     sessionId,
     originalBodyBlob
-      ? [bodyBlob.ref, headerBlob.ref, originalBodyBlob.ref]
-      : [bodyBlob.ref, headerBlob.ref],
+      ? [...bodyRefs, headerBlob.ref, originalBodyBlob.ref]
+      : [...bodyRefs, headerBlob.ref],
   )
 
   // Build upstream request. req.url must be treated as path-only — if a client
@@ -605,7 +624,7 @@ async function dispatch(
             // response_body_cid}) so the projector can stay synchronous.
             // Hashing is async; the single-tx event-emit invariant requires
             // all hashing to happen before we enter the transaction.
-            const asset = await computeRevisionAsset(bodyBlob.cid, respBodyBlob.cid)
+            const asset = await computeRevisionAsset(bodyCid, respBodyBlob.cid)
             emitTerminal(
               'proxy.response_completed',
               {
