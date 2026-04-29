@@ -54,6 +54,15 @@
 //       body. The penultimate-user-suffix algorithm depends on this.
 //   C3. claude's body always ends with the most recent user-side entry
 //       (a plain text user message OR a tool_result-content user msg).
+//   C4. /compact's summarization is a regular /v1/messages call to
+//       ANTHROPIC_BASE_URL whose `messages[]` is the existing
+//       conversation with a user-role "summarize..." instruction
+//       APPENDED at the tail. Empirically verified 2026-04-29: 5
+//       entries, last is a 5.7KB user message starting "CRITICAL:
+//       Respond with TEXT ONLY... create a detailed summary...".
+//       This is what makes /compact's summary represent the forked
+//       branch (our branch_context_json applies to it like any other
+//       /v1/messages). See ARCHITECTURE.md §6.
 //
 // RESPONSE FORMAT:
 //   R1. stop_reason values in scope: end_turn, tool_use, max_tokens,
@@ -64,6 +73,7 @@
 // Tested below:
 //   - A1, A2: direct claude exit-code probes (no retcon involved)
 //   - H1 + H2 (clear, compact): real /clear and /compact triggers
+//   - C4: /compact summarization shape (proxied + appended-user)
 //
 // Tested in cli-tmux-integration.test.ts (the implementation suite):
 //   - H1 (startup, resume), H2 (startup, resume), H3, H5
@@ -333,6 +343,155 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     )
     expect(remaining).toBe('__NULL__')
 
+    try {
+      tmux('kill-session', '-t', sessionName)
+    }
+    catch { /* fine */ }
+  }, 360_000)
+
+  // ─── /compact summarization ROUTES THROUGH ANTHROPIC_BASE_URL ───────────
+  // ─── and uses the existing messages[] + appended "summarize" user msg ──
+  //
+  // Two halves to this assumption (both load-bearing for the persistent
+  // fork story per ARCHITECTURE.md §6):
+  //   (a) /compact's summarization is a regular /v1/messages call to
+  //       ANTHROPIC_BASE_URL (not a side-channel endpoint). Our proxy
+  //       sees it.
+  //   (b) The shape of that call is the existing conversation `messages[]`
+  //       with a "summarize..." user-role message APPENDED to the tail.
+  //       Not a one-shot prompt built from scratch.
+  //
+  // (a) is what makes our branch_context_json override apply to the
+  // summarization call. (b) is what makes the splice algorithm produce
+  // the right thing — the appended user instruction becomes the new
+  // last-user message, the existing tail becomes everything-after-
+  // penultimate-user, and our branch_context replaces the conversation
+  // prefix that gets summarized. Together they're why post-compact
+  // claude's local view is aligned with our forked branch (see
+  // ARCHITECTURE.md §6).
+  //
+  // Empirically verified 2026-04-29: the compact request body had 5
+  // entries, the last being a 5.7KB user-role "CRITICAL: Respond with
+  // TEXT ONLY... create a detailed summary..." instruction.
+  it('compaction is messages[]+appended-user-summarize, NOT a side-channel call', async () => {
+    const sessionName = 'asmp-compact-shape'
+    try {
+      tmux('kill-session', '-t', sessionName)
+    }
+    catch { /* fine */ }
+    cleanAssumptionState()
+
+    tmux(
+      'new-session', '-d', '-s', sessionName, '-x', '200', '-y', '50',
+      `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --actor ${ASSUMPTION_ACTOR} --effort low`,
+    )
+    await waitFor(
+      () => /auto mode/.test(tmux('capture-pane', '-t', sessionName, '-p')),
+      20_000,
+      'claude UI render (compact-shape case)',
+    )
+    await waitFor(
+      () => parseInt(sql(`SELECT COUNT(*) FROM sessions WHERE actor='${ASSUMPTION_ACTOR}'`), 10) > 0,
+      20_000,
+      'session row (compact-shape case)',
+    )
+    const sid = sql(
+      `SELECT id FROM sessions WHERE actor='${ASSUMPTION_ACTOR}' ORDER BY created_at DESC LIMIT 1`,
+    )
+    const taskId = sql(`SELECT task_id FROM sessions WHERE id='${sid}'`)
+
+    // Two warmup turns to give the compactor something to work with.
+    const warmup = async (msg: string, count: number): Promise<void> => {
+      tmux('send-keys', '-t', sessionName, msg)
+      tmux('send-keys', '-t', sessionName, 'C-m')
+      await waitFor(
+        () => parseInt(sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10) >= count,
+        45_000,
+        `closed_forkable >= ${count}`,
+      )
+    }
+    await warmup('Say only the word ALPHA, nothing else.', 1)
+    await warmup('Say only the word BETA, nothing else.', 2)
+
+    // Snapshot the current request count so we can identify the compact call.
+    const beforeCount = parseInt(
+      sql(`SELECT COUNT(*) FROM events WHERE topic='proxy.request_received' AND session_id='${sid}'`),
+      10,
+    )
+
+    // Trigger /compact.
+    tmux('send-keys', '-t', sessionName, '/compact')
+    tmux('send-keys', '-t', sessionName, 'C-m')
+
+    // Half (a): wait for AT LEAST ONE additional /v1/messages event under
+    // this session. If claude starts using a side-channel endpoint, our
+    // event count won't grow and we'll time out here.
+    //
+    // We deliberately don't wait for `session.branch_context_cleared` —
+    // that event only fires when branch_context_json was non-NULL at
+    // hook time, and this test doesn't run a fork_back. The H1 (compact)
+    // test above covers the cleared-event side; this one isolates the
+    // summarization-shape assumption.
+    await waitFor(
+      () => parseInt(sql(
+        `SELECT COUNT(*) FROM events WHERE topic='proxy.request_received' AND session_id='${sid}'`,
+      ), 10) > beforeCount,
+      120_000,
+      'compact summarization /v1/messages routed through proxy',
+    )
+    // Give the body's blob row time to land (events.emit writes blob +
+    // event in one tx, so this is usually instant, but the projection
+    // dispatch sometimes follows a beat behind).
+    await sleep(500)
+
+    // Half (b): inspect the body of the compact request. Pull the LAST
+    // request_received event from this session (which is the compact call,
+    // since the warmups happened before our beforeCount snapshot). Its
+    // body_cid points at a top blob whose `messages[]` is an array of
+    // CID-typed link entries. The LAST link should resolve to a user-role
+    // message containing "summary" / "summarize" in the content.
+    //
+    // We use raw sqlite3 on the blobs table here — sniffing the dag-json
+    // shape via JSON-shaped substrings, since the test runs in a node
+    // process that doesn't have @ipld/dag-json transitively available.
+    const compactBodyCid = sql(
+      `SELECT json_extract(payload, '$.body_cid') FROM events `
+      + `WHERE topic='proxy.request_received' AND session_id='${sid}' `
+      + `ORDER BY event_id DESC LIMIT 1`,
+    )
+    expect(compactBodyCid).toBeTruthy()
+
+    // dag-json bytes are valid JSON at the text level — links are
+    // {"/":"cidstring"} objects which JSON.parse can read directly. Pull
+    // the top blob, parse, navigate to messages[], take the LAST entry's
+    // CID (that's the summarize instruction; everything before it is the
+    // existing conversation prefix).
+    const tmpTop = `/tmp/asmp-compact-top-${process.pid}.bin`
+    sql(`SELECT writefile('${tmpTop}', bytes) FROM blobs WHERE cid='${compactBodyCid}'`)
+    const topBytes = execFileSync('cat', [tmpTop], { encoding: 'utf8' })
+    const topParsed = JSON.parse(topBytes) as {
+      messages?: Array<{ '/'?: string }>
+    }
+    expect(Array.isArray(topParsed.messages)).toBe(true)
+    expect(topParsed.messages!.length).toBeGreaterThan(0)
+    const lastEntry = topParsed.messages![topParsed.messages!.length - 1]
+    const lastLeafCid = lastEntry['/']
+    expect(lastLeafCid).toBeTruthy()
+
+    const tmpLeaf = `/tmp/asmp-compact-leaf-${process.pid}.bin`
+    sql(`SELECT writefile('${tmpLeaf}', bytes) FROM blobs WHERE cid='${lastLeafCid}'`)
+    const leafBytes = execFileSync('cat', [tmpLeaf], { encoding: 'utf8' })
+
+    // The summarize instruction's text varies by claude version, so
+    // match LOOSELY: it's a user-role message and contains either
+    // "summarize" or "summary" or "<analysis>" markers.
+    expect(leafBytes).toMatch(/"role":"user"/)
+    expect(leafBytes).toMatch(/summar(y|ize|isation)|<analysis>/i)
+
+    try {
+      execFileSync('rm', ['-f', tmpTop, tmpLeaf])
+    }
+    catch { /* fine */ }
     try {
       tmux('kill-session', '-t', sessionName)
     }
