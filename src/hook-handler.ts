@@ -19,7 +19,7 @@
 import http from 'node:http'
 
 import type { BindingTable } from './binding-table.js'
-import { rebindSession } from './binding-table.js'
+import { ActorConflictError, rebindSession } from './binding-table.js'
 import type { DB } from './db.js'
 import type { EventProducer } from './events.js'
 import { SESSION_HEADER } from './proxy-handler.js'
@@ -90,7 +90,32 @@ export async function handleSessionStartHook(
     // new sessionId; the rebind transaction then migrates any events that
     // historically landed under transportId before the hook fired.
     ctx.bindingTable.set(transportId, sessionId)
-    rebindSession(ctx.db, transportId, sessionId)
+    try {
+      rebindSession(ctx.db, transportId, sessionId)
+    }
+    catch (err) {
+      if (err instanceof ActorConflictError) {
+        // Resume specified --actor that disagrees with the resumed session's
+        // existing actor. Emit an audit event, return 409 to claude. The
+        // hook is advisory so claude continues, but the new traffic stays
+        // attributed to transportId until the user reconciles.
+        ctx.producer.emit(
+          'session.actor_conflict',
+          {
+            binding_token: transportId,
+            session_id: sessionId,
+            existing_actor: err.existingActor,
+            requested_actor: err.requestedActor,
+            source: typeof payload.source === 'string' ? payload.source : null,
+          },
+          sessionId,
+        )
+        res.writeHead(409, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'actor_conflict', message: err.message }) + '\n')
+        return
+      }
+      throw err
+    }
     ctx.producer.emit(
       'session.rebound',
       { binding_token: transportId, session_id: sessionId, source: typeof payload.source === 'string' ? payload.source : null },

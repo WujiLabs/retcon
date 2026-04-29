@@ -41,12 +41,35 @@ export class BindingTable {
 }
 
 /**
+ * Thrown when a resumed session's existing actor disagrees with the actor
+ * the resuming `retcon` invocation registered. The hook handler catches
+ * this, emits a `session.actor_conflict` event for audit, and returns 4xx
+ * to claude. Resume binding fails; the new traffic stays orphaned under
+ * the binding token until the user reconciles.
+ */
+export class ActorConflictError extends Error {
+  constructor(
+    public readonly sessionId: string,
+    public readonly existingActor: string,
+    public readonly requestedActor: string,
+  ) {
+    super(
+      `session ${sessionId} has actor "${existingActor}" but resume specified `
+      + `"${requestedActor}". Drop --actor (to inherit) or use the original.`,
+    )
+    this.name = 'ActorConflictError'
+  }
+}
+
+/**
  * Atomically re-key any rows that landed under `oldId` to `newId`. Two cases:
  *
  *   PROMOTE (no row exists under newId):
  *     - sessions.id, tasks.session_id, events.session_id rename old → new
  *
  *   MERGE (row already exists under newId, e.g. resumed pre-existing session):
+ *     - Conflict-check actors: throw ActorConflictError if both are set and
+ *       differ. Otherwise upgrade NULL → known actor.
  *     - Find the tail of the existing session's DAG (last closed_forkable
  *       revision); link the first newly-arrived revision under oldId's task
  *       to it as parent, so fork_back can walk across the resume boundary.
@@ -54,24 +77,80 @@ export class BindingTable {
  *     - Delete the duplicate task + session row.
  *     - Re-key events.session_id old → new.
  *
- * No-op if oldId == newId or oldId has no rows yet (hook-fires-first path).
+ * Pending actor entries (from /actor/register) are migrated alongside:
+ * if one exists under oldId, it transfers to newId (or gets consumed
+ * inline when the merged session is updated).
+ *
+ * No-op if oldId == newId or oldId has no rows yet AND no pending actor
+ * was registered (hook-fires-first path).
  */
 export function rebindSession(db: DB, oldId: string, newId: string): void {
   if (oldId === newId) return
   const tx = db.transaction(() => {
     const oldSession = db
-      .prepare('SELECT id, task_id FROM sessions WHERE id=?')
-      .get(oldId) as { id: string, task_id: string } | undefined
+      .prepare('SELECT id, task_id, actor FROM sessions WHERE id=?')
+      .get(oldId) as { id: string, task_id: string, actor: string } | undefined
+
+    // Pending actor registered under oldId (transport id). May exist even when
+    // no session row yet — that's the hook-fires-before-first-event case.
+    const pending = db
+      .prepare('SELECT actor FROM pending_actors WHERE transport_id=?')
+      .get(oldId) as { actor: string } | undefined
+
     if (!oldSession) {
-      // Hook fired before any traffic landed. In-memory binding alone is enough.
+      // No traffic under oldId yet. If a pending actor was registered, move
+      // it over to newId so the projector picks it up when the first event
+      // for the merged session arrives. Conflict-check against existingNew
+      // if that session row already exists.
+      if (pending) {
+        const existingNew = db
+          .prepare('SELECT actor FROM sessions WHERE id=?')
+          .get(newId) as { actor: string } | undefined
+        if (existingNew) {
+          if (existingNew.actor !== 'default' && existingNew.actor !== pending.actor) {
+            throw new ActorConflictError(newId, existingNew.actor, pending.actor)
+          }
+          if (existingNew.actor === 'default' && pending.actor !== 'default') {
+            db.prepare('UPDATE sessions SET actor=? WHERE id=?').run(pending.actor, newId)
+          }
+          db.prepare('DELETE FROM pending_actors WHERE transport_id=?').run(oldId)
+        }
+        else {
+          // No session row yet; re-key the pending entry so future projector
+          // picks the right actor when newId's first event lands.
+          db.prepare('DELETE FROM pending_actors WHERE transport_id=?').run(oldId)
+          db.prepare(`
+            INSERT INTO pending_actors (transport_id, actor, registered_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(transport_id) DO UPDATE SET
+              actor = excluded.actor,
+              registered_at = excluded.registered_at
+          `).run(newId, pending.actor, Date.now())
+        }
+      }
       return
     }
 
     const existingNew = db
-      .prepare('SELECT id, task_id FROM sessions WHERE id=?')
-      .get(newId) as { id: string, task_id: string } | undefined
+      .prepare('SELECT id, task_id, actor FROM sessions WHERE id=?')
+      .get(newId) as { id: string, task_id: string, actor: string } | undefined
 
     if (existingNew) {
+      // Conflict-check actor before re-tasking. If both sides have a
+      // non-default explicit actor and they differ, refuse the merge.
+      const requestedActor = pending?.actor ?? oldSession.actor
+      if (
+        existingNew.actor !== 'default'
+        && requestedActor !== 'default'
+        && existingNew.actor !== requestedActor
+      ) {
+        throw new ActorConflictError(newId, existingNew.actor, requestedActor)
+      }
+      // Upgrade existingNew.actor from default → requested if applicable.
+      if (existingNew.actor === 'default' && requestedActor !== 'default') {
+        db.prepare('UPDATE sessions SET actor=? WHERE id=?').run(requestedActor, newId)
+      }
+
       const oldTaskId = oldSession.task_id
       const newTaskId = existingNew.task_id
       if (oldTaskId !== newTaskId) {
@@ -107,6 +186,9 @@ export function rebindSession(db: DB, oldId: string, newId: string): void {
     }
 
     db.prepare('UPDATE events SET session_id=? WHERE session_id=?').run(newId, oldId)
+    // pending_actors entry for oldId (if any) becomes meaningless after the
+    // merge — the actor was already accounted for above.
+    db.prepare('DELETE FROM pending_actors WHERE transport_id=?').run(oldId)
   })
   tx()
 }

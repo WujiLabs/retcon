@@ -47,14 +47,15 @@ export class SessionsV1Projector implements Projection {
   private onMcpInitialized(event: Event<McpSessionInitializedPayload>, tx: DB): void {
     if (!event.sessionId) return
     const taskId = this.getOrMintTaskId(event.sessionId, tx)
+    const actor = takePendingActor(event.sessionId, tx)
     // UPSERT so an existing orphan row (created by onOrphanFallback when a
     // /v1/* request arrived before mcp.session_initialized) gets upgraded to
     // the real harness + pid. Without this, the orphan harness sticks and
     // fork_back refuses to work on what is actually a proper MCP session.
     // Replay-safe: same event id projected twice sets the same values.
     tx.prepare(`
-      INSERT INTO sessions (id, task_id, pid, harness, created_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO sessions (id, task_id, pid, harness, actor, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         pid = COALESCE(excluded.pid, sessions.pid),
         harness = CASE
@@ -66,6 +67,7 @@ export class SessionsV1Projector implements Projection {
       taskId,
       event.payload.pid ?? null,
       event.payload.harness ?? 'unknown',
+      actor,
       event.createdAt,
     )
     tx.prepare(`
@@ -88,10 +90,11 @@ export class SessionsV1Projector implements Projection {
     // fork MCP tools use harness='orphan' to skip features that require an
     // MCP connection.
     const taskId = this.getOrMintTaskId(event.sessionId, tx)
+    const actor = takePendingActor(event.sessionId, tx)
     tx.prepare(`
-      INSERT OR IGNORE INTO sessions (id, task_id, harness, created_at)
-      VALUES (?, ?, 'orphan', ?)
-    `).run(event.sessionId, taskId, event.createdAt)
+      INSERT OR IGNORE INTO sessions (id, task_id, harness, actor, created_at)
+      VALUES (?, ?, 'orphan', ?, ?)
+    `).run(event.sessionId, taskId, actor, event.createdAt)
     tx.prepare(`
       INSERT OR IGNORE INTO tasks (id, session_id, created_at) VALUES (?, ?, ?)
     `).run(taskId, event.sessionId, event.createdAt)
@@ -113,4 +116,22 @@ export class SessionsV1Projector implements Projection {
     const hash = crypto.createHash('sha256').update(`task:${sessionId}`).digest('hex')
     return `t_${hash.slice(0, 32)}`
   }
+}
+
+/**
+ * Read and consume the pending actor for `transportId`, if one was registered
+ * via /actor/register before the first event landed. Returns 'default' if no
+ * pending entry exists (so every session has a non-NULL actor and cleanup
+ * semantics stay simple).
+ *
+ * Writes happen inside the projector's wrapping transaction, so the
+ * read-then-delete is atomic w.r.t. concurrent projector runs.
+ */
+function takePendingActor(transportId: string, tx: DB): string {
+  const row = tx
+    .prepare('SELECT actor FROM pending_actors WHERE transport_id = ?')
+    .get(transportId) as { actor: string } | undefined
+  if (!row) return 'default'
+  tx.prepare('DELETE FROM pending_actors WHERE transport_id = ?').run(transportId)
+  return row.actor
 }

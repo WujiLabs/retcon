@@ -17,6 +17,7 @@
 import fs from 'node:fs'
 import http from 'node:http'
 
+import { handleActorRegister } from './actor-register.js'
 import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
@@ -197,6 +198,16 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
         bindingTable,
         producer: options.producer,
       })
+      return
+    }
+
+    if (path === '/actor/register') {
+      if (!options.db) {
+        res.writeHead(503, { 'content-type': 'text/plain' })
+        res.end('actor registration unavailable: server started without a DB handle\n')
+        return
+      }
+      void handleActorRegister(req, res, options.db)
       return
     }
 

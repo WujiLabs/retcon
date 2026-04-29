@@ -77,6 +77,23 @@ const describeIfRunnable = SHOULD_RUN ? describe : describe.skip
 
 const RESUME_SESSION = `${SESSION}-resume`
 
+// Tag every session this test creates so cleanup is targeted. The same actor
+// label is used across both `it` blocks so the resume test can find the
+// session created by the new-session test.
+const TEST_ACTOR = 'itest'
+
+function cleanItestSessions(): void {
+  // The CLI's clean command opens proxy.db directly, so it works whether or
+  // not the daemon is running. Best-effort: ignore failures (e.g. proxy.db
+  // doesn't exist yet on a fresh dev box).
+  try {
+    execFileSync('retcon', ['clean', '--actor', TEST_ACTOR, '--yes'], { stdio: 'ignore' })
+  }
+  catch {
+    /* fine */
+  }
+}
+
 describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', () => {
   beforeAll(() => {
     try {
@@ -97,6 +114,9 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     catch {
       /* none */
     }
+    // Wipe any leftover itest data from a prior killed run so this run starts
+    // clean (no spurious counts that mask real assertion regressions).
+    cleanItestSessions()
   })
 
   afterAll(() => {
@@ -112,7 +132,15 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     catch {
       /* fine */
     }
-    // Leave the daemon running — caller may have an existing session.
+    // Stop the daemon so retcon clean can open the DB without contention,
+    // then wipe everything this test created.
+    try {
+      execFileSync('retcon', ['stop'], { stdio: 'ignore' })
+    }
+    catch {
+      /* fine */
+    }
+    cleanItestSessions()
   })
 
   it('claude through retcon → fork_back actually walks the revision DAG end-to-end', async () => {
@@ -122,7 +150,7 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     // target). Low effort still uses the same model but skips deep thinking.
     tmux(
       'new-session', '-d', '-s', SESSION, '-x', '200', '-y', '50',
-      `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --effort low`,
+      `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --actor ${TEST_ACTOR} --effort low`,
     )
 
     await waitFor(() => /auto mode/.test(pane()), 20000, 'claude UI render')
@@ -138,10 +166,13 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       'claude-code session row to exist',
     )
     const sessionId = sql(
-      `SELECT id FROM sessions WHERE harness='claude-code' ORDER BY created_at DESC LIMIT 1`,
+      `SELECT id FROM sessions WHERE harness='claude-code' AND actor='${TEST_ACTOR}' ORDER BY created_at DESC LIMIT 1`,
     )
     expect(sessionId).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/)
     const taskId = sql(`SELECT task_id FROM sessions WHERE id='${sessionId}'`)
+    // Verify --actor flowed through: the session row should be tagged.
+    const recordedActor = sql(`SELECT actor FROM sessions WHERE id='${sessionId}'`)
+    expect(recordedActor).toBe(TEST_ACTOR)
 
     // Two warmup turns produce closed_forkable revisions. We wait for the
     // revision count to grow (proves /v1/* traffic landed AND was correlated
@@ -261,6 +292,9 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     expect(sessionRows).toBe(1)
     const taskAfterRebind = sql(`SELECT task_id FROM sessions WHERE id='${originalSessionId}'`)
     expect(taskAfterRebind).toBe(originalTaskId)
+    // Resume without --actor must inherit the session's existing tag.
+    const actorAfterRebind = sql(`SELECT actor FROM sessions WHERE id='${originalSessionId}'`)
+    expect(actorAfterRebind).toBe(TEST_ACTOR)
 
     // Now ask claude to fork_back. The fork_point_revision_id MUST be a
     // revision from the original task (proves DAG reconnection worked: the

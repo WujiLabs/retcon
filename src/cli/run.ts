@@ -31,8 +31,10 @@
 // one claude session. Closing this CLI does NOT close the daemon.
 
 import { randomUUID } from 'node:crypto'
+import http from 'node:http'
 
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
+import { DEFAULT_ACTOR, extractActor } from './arg-parse.js'
 import { isRecord, loadJsonArg, readFlag, removeFlag, validateUserArgs } from './arg-validate.js'
 import { ensureDaemon, resolvedDefaultPort } from './daemon-control.js'
 import { findClaudeBinary } from './find-claude.js'
@@ -127,6 +129,12 @@ export function mergeCustomHeaders(
  * binding token rather than minting our own — it's what they expect to see
  * in the local jsonl filename, fork tools, etc.
  *
+ * If the user passes a malformed --session-id (not a valid UUID), throw
+ * loudly instead of silently substituting a fresh UUID. claude itself
+ * requires a valid UUID for --session-id; surfacing the failure here gives
+ * the user a clear message at retcon level rather than a downstream claude
+ * error.
+ *
  * Note: claude rejects --session-id together with --resume/--continue
  * (unless --fork-session is set), so we don't accept user-supplied ids
  * in resume mode either.
@@ -134,7 +142,16 @@ export function mergeCustomHeaders(
 export function pickTransportId(args: readonly string[], isResume: boolean): string {
   if (!isResume) {
     const userId = readFlag(args, '--session-id')
-    if (userId && UUID_RE.test(userId)) return userId
+    if (userId !== undefined) {
+      if (!UUID_RE.test(userId)) {
+        throw new Error(
+          `--session-id "${userId}" is not a valid UUID. `
+          + `Pass a 36-character UUID (e.g. \`uuidgen | tr A-Z a-z\`) or omit --session-id `
+          + `to let retcon mint one.`,
+        )
+      }
+      return userId
+    }
   }
   return randomUUID()
 }
@@ -210,10 +227,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   const upstream = resolveUpstream(process.env, retconBaseUrl)
   const isResume = detectResumeMode(opts.args)
 
-  // Step 0: validate user args against the things we're about to inject.
+  // Step 0a: extract retcon-only flags (--actor) before claude sees them.
+  // Throws on a malformed actor name; surface to the user.
+  let actorRequest: string | undefined
+  let argsWithoutActor: string[]
+  try {
+    const parsed = extractActor(opts.args)
+    actorRequest = parsed.actor
+    argsWithoutActor = parsed.remaining
+  }
+  catch (err) {
+    process.stderr.write(`[retcon] ${(err as Error).message}\n`)
+    return 2
+  }
+
+  // Step 0b: validate user args against the things we're about to inject.
   // Today the only unmergeable conflict is mcpServers.retcon in --mcp-config.
   try {
-    validateUserArgs(opts.args)
+    validateUserArgs(argsWithoutActor)
   }
   catch (err) {
     process.stderr.write(`[retcon] ${(err as Error).message}\n`)
@@ -241,11 +272,37 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   // it stays as a binding_token until the SessionStart hook posts back with
   // claude's actual session_id. If the user passed --session-id explicitly
   // and we're not in resume mode, adopt it instead of minting a fresh UUID
-  // so the id they expect to see is the id retcon uses.
-  const transportId = pickTransportId(opts.args, isResume)
+  // so the id they expect to see is the id retcon uses. Malformed UUIDs
+  // throw — see pickTransportId.
+  let transportId: string
+  try {
+    transportId = pickTransportId(argsWithoutActor, isResume)
+  }
+  catch (err) {
+    process.stderr.write(`[retcon] ${(err as Error).message}\n`)
+    return 2
+  }
   // Drop the user's --session-id from args so we can re-inject our own
   // (same value if they supplied a valid UUID; freshly-minted otherwise).
-  const argsWithoutSessionId = isResume ? [...opts.args] : removeFlag(opts.args, '--session-id')
+  const argsWithoutSessionId = isResume
+    ? [...argsWithoutActor]
+    : removeFlag(argsWithoutActor, '--session-id')
+
+  // Step 2b: tell the daemon what actor this transport id is launched under.
+  // For new sessions, always register (default = "default"). For resume
+  // without --actor, skip — the existing session keeps its recorded actor.
+  // For resume WITH --actor, register so the daemon can conflict-check against
+  // the existing session's actor at rebind time.
+  const actorToRegister = actorRequest ?? (isResume ? undefined : DEFAULT_ACTOR)
+  if (actorToRegister !== undefined) {
+    try {
+      await registerActor(host, port, transportId, actorToRegister)
+    }
+    catch (err) {
+      process.stderr.write(`[retcon] failed to register actor: ${(err as Error).message}\n`)
+      return 1
+    }
+  }
 
   // Step 3: build the per-invocation MCP config that claude will load via
   // --mcp-config. Inline JSON keeps our config out of ~/.claude.json so
@@ -338,4 +395,49 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
     process.stderr.write(`[retcon] ${result.spawnError}\n`)
   }
   return result.exitCode
+}
+
+/**
+ * POST `{transport_id, actor}` to the daemon's `/actor/register` endpoint
+ * before spawning claude. The daemon stores the binding in `pending_actors`
+ * so the sessions_v1 projector can stamp the correct actor on the session
+ * row when the first event arrives.
+ *
+ * Resolves on 2xx; rejects on any other status or transport error so the
+ * caller can decide whether to abort the launch.
+ */
+function registerActor(
+  host: string,
+  port: number,
+  transportId: string,
+  actor: string,
+): Promise<void> {
+  const body = JSON.stringify({ transport_id: transportId, actor })
+  return new Promise<void>((resolve, reject) => {
+    const req = http.request({
+      host,
+      port,
+      path: '/actor/register',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+      timeout: 2000,
+    }, (res) => {
+      res.resume()
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        resolve()
+      }
+      else {
+        reject(new Error(`/actor/register returned HTTP ${res.statusCode}`))
+      }
+    })
+    req.on('timeout', () => {
+      req.destroy()
+      reject(new Error('/actor/register timed out'))
+    })
+    req.on('error', reject)
+    req.end(body)
+  })
 }

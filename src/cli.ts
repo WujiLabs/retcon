@@ -19,6 +19,7 @@
 // Future agent flags (`--cursor`, `--aider`, etc.) are stubbed: today they
 // print "not yet supported" and exit 2.
 
+import { formatCleanResult, parseCleanArgs, runClean } from './cli/clean.js'
 import { runDaemon } from './cli/daemon.js'
 import { statusDaemon, stopDaemon } from './cli/daemon-control.js'
 import { runAgent } from './cli/run.js'
@@ -32,8 +33,12 @@ function usage(): void {
     + '  retcon --claude [args...]   explicit agent flag\n'
     + '  retcon stop                 stop the background daemon\n'
     + '  retcon status               show daemon status, uptime, disk usage\n'
+    + '  retcon clean --actor X      remove sessions tagged with actor X (dry-run by default; pass --yes to apply)\n'
     + '  retcon --version            print version\n'
     + '  retcon --help               print this message\n'
+    + '\n'
+    + 'Per-invocation flags (consumed by retcon, not forwarded to claude):\n'
+    + '  --actor <name>              tag this session with <name> for grouping / cleanup (default: "default")\n'
     + '\n'
     + 'Environment:\n'
     + '  RETCON_PORT                 listen port for the proxy (default: 4099)\n'
@@ -89,6 +94,19 @@ async function main(): Promise<number> {
       return 1
     }
     printStatus(r.snapshot, r.diskBytes)
+    return 0
+  }
+  if (args[0] === 'clean') {
+    let opts: ReturnType<typeof parseCleanArgs>
+    try {
+      opts = parseCleanArgs(args.slice(1))
+    }
+    catch (err) {
+      process.stderr.write(`[retcon] ${(err as Error).message}\n`)
+      return 2
+    }
+    const result = runClean(opts)
+    process.stdout.write(formatCleanResult(opts, result))
     return 0
   }
 

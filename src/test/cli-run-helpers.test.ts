@@ -31,10 +31,9 @@ describe('pickTransportId', () => {
     expect(pickTransportId([`--session-id=${VALID}`], false)).toBe(VALID)
   })
 
-  it('rejects malformed user --session-id and mints a fresh one instead', () => {
-    const id = pickTransportId(['--session-id', 'not-a-uuid'], false)
-    expect(id).not.toBe('not-a-uuid')
-    expect(id).toMatch(/^[a-f0-9]{8}-/)
+  it('throws on a malformed user --session-id (must be a valid UUID)', () => {
+    expect(() => pickTransportId(['--session-id', 'not-a-uuid'], false))
+      .toThrow(/not a valid UUID/)
   })
 
   it('ignores user --session-id in resume mode (claude rejects that combo anyway)', () => {
