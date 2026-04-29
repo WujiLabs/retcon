@@ -217,7 +217,7 @@ export interface BranchContextRewriteResult {
   overflow: boolean
 }
 
-function applyBranchContextRewrite(
+export function applyBranchContextRewrite(
   rawBody: Buffer,
   sessionId: string,
   db: DB,
