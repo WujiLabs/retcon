@@ -265,11 +265,7 @@ async function spawnAndWait(port: number, upstream: string): Promise<EnsureDaemo
     const child = spawn(process.execPath, [cliPath, '--daemon'], {
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: {
-        ...process.env,
-        RETCON_PORT: String(port),
-        RETCON_UPSTREAM: upstream,
-      },
+      env: buildDaemonEnv(process.env, { port, upstream }),
     })
     child.unref()
     // Don't await child.exit — we WANT it to outlive us.
@@ -286,6 +282,49 @@ async function spawnAndWait(port: number, upstream: string): Promise<EnsureDaemo
     )
   }
   return { port, spawnedNew: true, reusedSnapshot: null }
+}
+
+/**
+ * Build the env dict that the detached daemon inherits. The daemon is a
+ * long-lived background process that holds the SQLite DB and proxies HTTP;
+ * it does NOT need user provider credentials (ANTHROPIC_API_KEY,
+ * ANTHROPIC_AUTH_TOKEN, AWS_*, OPENAI_*, etc.) — claude attaches those
+ * per request and the proxy forwards request headers as-is.
+ *
+ * We use an allow-list rather than a deny-list because the spawning shell
+ * may have credentials we haven't enumerated (vendor-specific APIs, internal
+ * tooling, etc.) and a long-lived daemon shouldn't sit on top of them.
+ *
+ * Allowed:
+ *   - System basics:      HOME, USER, PATH, SHELL, TMPDIR/TMP/TEMP
+ *   - Locale / timezone:  LANG, LC_*, TZ
+ *   - Node runtime:       NODE_OPTIONS, NODE_DEBUG, NODE_NO_WARNINGS, NODE_ENV
+ *   - retcon's own:       RETCON_HOME, RETCON_CLI_ENTRY (for tests)
+ *   - Injected:           RETCON_PORT, RETCON_UPSTREAM
+ */
+export function buildDaemonEnv(
+  parentEnv: NodeJS.ProcessEnv,
+  opts: { port: number, upstream: string },
+): NodeJS.ProcessEnv {
+  const ALLOW = new Set([
+    'HOME', 'USER', 'LOGNAME', 'PATH', 'SHELL',
+    'TMPDIR', 'TMP', 'TEMP',
+    'LANG', 'TZ',
+    'NODE_OPTIONS', 'NODE_DEBUG', 'NODE_NO_WARNINGS', 'NODE_ENV',
+    'RETCON_HOME', 'RETCON_CLI_ENTRY',
+  ])
+  const ALLOW_PREFIX = ['LC_']  // LC_ALL, LC_CTYPE, LC_TIME, etc.
+
+  const env: NodeJS.ProcessEnv = {}
+  for (const [k, v] of Object.entries(parentEnv)) {
+    if (v === undefined) continue
+    if (ALLOW.has(k) || ALLOW_PREFIX.some(p => k.startsWith(p))) {
+      env[k] = v
+    }
+  }
+  env.RETCON_PORT = String(opts.port)
+  env.RETCON_UPSTREAM = opts.upstream
+  return env
 }
 
 async function waitForHealthMatch(port: number, timeoutMs: number): Promise<boolean> {

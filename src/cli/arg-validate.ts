@@ -1,27 +1,27 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 //
-// Validate user-supplied claude args for collisions with the things retcon
-// injects. Three retcon injections can collide with user input:
+// Validate user-supplied claude args for *unmergeable* collisions with the
+// things retcon injects. Two collision classes today:
 //
-//   --session-id <T>  : binding requires our id; user-supplied is incompatible.
-//                       ERROR if the user passes their own.
+//   --mcp-config with mcpServers.retcon
+//     claude unions mcpServers keys across multiple --mcp-config flags. Two
+//     entries under the same key (`retcon`) is ambiguous — claude doesn't
+//     know which to use, and the binding mechanism breaks if it picks the
+//     user's. ERROR.
 //
-//   --mcp-config      : claude allows multiple --mcp-config flags and unions
-//                       their `mcpServers` keys. Coexistence is fine UNLESS
-//                       the user defines `mcpServers.retcon`, which would
-//                       collide with our auto-registered server.
-//                       ERROR on collision; pass-through otherwise.
+// Mergeable cases (handled in run.ts, not here):
 //
-//   --settings        : claude merges multiple --settings. The conflict point
-//                       is `hooks.SessionStart` — retcon installs a binding
-//                       hook there, and a user-defined SessionStart hook
-//                       would either get overridden or break our binding.
-//                       ERROR if user has hooks.SessionStart; pass-through
-//                       otherwise.
+//   --session-id <T>  : if the user supplies one (only legal in non-resume
+//                       mode anyway), retcon adopts it as the binding token
+//                       instead of minting its own.
+//
+//   --settings + hooks.SessionStart : claude allows multiple SessionStart
+//                       hook entries; we inline-merge our hook into the
+//                       user's settings JSON.
 //
 // This file does not look at env vars — those are handled in run.ts where
-// merging (rather than rejecting) is the right move for ANTHROPIC_CUSTOM_HEADERS.
+// merging is the right move (e.g. ANTHROPIC_CUSTOM_HEADERS).
 
 import fs from 'node:fs'
 
@@ -30,7 +30,7 @@ import fs from 'node:fs'
  * Returns undefined if the flag isn't present. If the flag appears multiple
  * times, returns the last occurrence (matches claude's last-wins precedence).
  */
-function readFlag(args: readonly string[], flag: string): string | undefined {
+export function readFlag(args: readonly string[], flag: string): string | undefined {
   let last: string | undefined
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
@@ -45,12 +45,30 @@ function readFlag(args: readonly string[], flag: string): string | undefined {
 }
 
 /**
+ * Return `args` with all occurrences of `flag` (and the value following it)
+ * removed. Handles both `--flag value` and `--flag=value` forms. Used when
+ * retcon needs to replace a user-supplied flag with a merged version.
+ */
+export function removeFlag(args: readonly string[], flag: string): string[] {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) {
+      i++  // also consume the value
+      continue
+    }
+    if (args[i].startsWith(`${flag}=`)) continue
+    out.push(args[i])
+  }
+  return out
+}
+
+/**
  * Resolve a --mcp-config / --settings argument value to its parsed JSON.
  * Claude accepts either inline JSON or a file path; we try JSON first and
  * fall back to reading the file. Returns null if neither works (caller
  * decides whether to skip silently or surface).
  */
-function loadJsonArg(value: string): unknown | null {
+export function loadJsonArg(value: string): unknown | null {
   // Inline JSON: starts with '{' or '['
   const trimmed = value.trim()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
@@ -62,31 +80,12 @@ function loadJsonArg(value: string): unknown | null {
 }
 
 /**
- * Throw if user args collide with retcon's injected args. Run BEFORE we
- * append our own --session-id / --mcp-config / --settings — surfacing the
- * conflict to the user is more useful than letting claude error with a
- * cryptic message about duplicate flags.
- *
- * `isResume` flips the --session-id check off, since in resume mode we don't
- * inject one and the user can pass their own (subject to claude's own rule
- * that --session-id requires --fork-session when used with --resume).
+ * Throw if user args collide unmergeably with retcon's injected args. Today
+ * the only such case is `--mcp-config` defining its own `mcpServers.retcon`.
+ * Mergeable cases (--session-id, hooks.SessionStart) are handled in run.ts.
  */
-export function validateUserArgs(args: readonly string[], isResume: boolean): void {
-  if (!isResume) validateNoSessionId(args)
+export function validateUserArgs(args: readonly string[]): void {
   validateMcpConfigNoRetconKey(args)
-  validateSettingsNoSessionStart(args)
-}
-
-function validateNoSessionId(args: readonly string[]): void {
-  const value = readFlag(args, '--session-id')
-  if (value !== undefined) {
-    throw new Error(
-      `--session-id was passed to retcon. retcon manages claude's session id `
-      + `internally so the proxy can correlate /v1/* and MCP traffic for fork `
-      + `tracking — pass-through is unsupported. Drop the flag, or run claude `
-      + `directly without retcon if you need a specific session id.`,
-    )
-  }
 }
 
 function validateMcpConfigNoRetconKey(args: readonly string[]): void {
@@ -101,34 +100,12 @@ function validateMcpConfigNoRetconKey(args: readonly string[]): void {
     if (isRecord(servers) && 'retcon' in servers) {
       throw new Error(
         `Your --mcp-config defines mcpServers.retcon, which collides with the `
-        + `MCP server retcon auto-registers. Rename your entry, drop it, or `
-        + `point your config at retcon's own URL via the --mcp-config that `
-        + `retcon already injects.`,
+        + `MCP server retcon auto-registers. Rename your entry or drop it.`,
       )
     }
   }
 }
 
-function validateSettingsNoSessionStart(args: readonly string[]): void {
-  for (let i = 0; i < args.length; i++) {
-    let value: string | undefined
-    if (args[i] === '--settings' && i + 1 < args.length) value = args[i + 1]
-    else if (args[i].startsWith('--settings=')) value = args[i].slice('--settings='.length)
-    if (!value) continue
-    const parsed = loadJsonArg(value)
-    if (!isRecord(parsed)) continue
-    const hooks = parsed.hooks
-    if (isRecord(hooks) && hooks.SessionStart !== undefined) {
-      throw new Error(
-        `Your --settings declares hooks.SessionStart, which collides with `
-        + `retcon's binding hook (used to learn claude's session_id post-resume). `
-        + `Move your SessionStart logic into a different hook event, or remove `
-        + `it from --settings.`,
-      )
-    }
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

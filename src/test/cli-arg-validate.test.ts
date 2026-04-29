@@ -5,43 +5,23 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { validateUserArgs } from '../cli/arg-validate.js'
-
-describe('validateUserArgs — --session-id', () => {
-  it('errors when user passes --session-id and we are NOT in resume mode', () => {
-    expect(() => validateUserArgs(['--session-id', 'abc-123'], false))
-      .toThrow(/--session-id/)
-  })
-
-  it('errors on --session-id=value form', () => {
-    expect(() => validateUserArgs(['--session-id=abc-123'], false))
-      .toThrow(/--session-id/)
-  })
-
-  it('allows --session-id when in resume mode (claude does its own validation there)', () => {
-    expect(() => validateUserArgs(['--session-id', 'abc'], true)).not.toThrow()
-  })
-
-  it('passes when no --session-id is present', () => {
-    expect(() => validateUserArgs(['--effort', 'low'], false)).not.toThrow()
-  })
-})
+import { readFlag, removeFlag, validateUserArgs } from '../cli/arg-validate.js'
 
 describe('validateUserArgs — --mcp-config', () => {
   it('errors when user defines mcpServers.retcon (collides with our auto-registration)', () => {
     const cfg = JSON.stringify({ mcpServers: { retcon: { type: 'http', url: 'http://example' } } })
-    expect(() => validateUserArgs(['--mcp-config', cfg], false))
+    expect(() => validateUserArgs(['--mcp-config', cfg]))
       .toThrow(/mcpServers\.retcon/)
   })
 
-  it('passes when user defines other servers', () => {
+  it('passes when user defines other servers (claude unions across multiple --mcp-config flags)', () => {
     const cfg = JSON.stringify({ mcpServers: { fs: { type: 'stdio', command: 'mcp-fs' } } })
-    expect(() => validateUserArgs(['--mcp-config', cfg], false)).not.toThrow()
+    expect(() => validateUserArgs(['--mcp-config', cfg])).not.toThrow()
   })
 
   it('handles --mcp-config=value form', () => {
     const cfg = JSON.stringify({ mcpServers: { retcon: {} } })
-    expect(() => validateUserArgs([`--mcp-config=${cfg}`], false))
+    expect(() => validateUserArgs([`--mcp-config=${cfg}`]))
       .toThrow(/mcpServers\.retcon/)
   })
 
@@ -50,7 +30,7 @@ describe('validateUserArgs — --mcp-config', () => {
     try {
       const file = path.join(dir, 'cfg.json')
       writeFileSync(file, JSON.stringify({ mcpServers: { retcon: {} } }))
-      expect(() => validateUserArgs(['--mcp-config', file], false))
+      expect(() => validateUserArgs(['--mcp-config', file]))
         .toThrow(/mcpServers\.retcon/)
     }
     finally {
@@ -59,37 +39,42 @@ describe('validateUserArgs — --mcp-config', () => {
   })
 
   it('silently skips unparseable values (claude will surface its own error)', () => {
-    expect(() => validateUserArgs(['--mcp-config', 'not-json-and-not-a-file'], false)).not.toThrow()
+    expect(() => validateUserArgs(['--mcp-config', 'not-json-and-not-a-file'])).not.toThrow()
+  })
+
+  it('does NOT error on user --session-id (run.ts adopts it as the binding token)', () => {
+    expect(() => validateUserArgs(['--session-id', '11111111-2222-3333-4444-555555555555']))
+      .not.toThrow()
+  })
+
+  it('does NOT error on user hooks.SessionStart (run.ts inline-merges it)', () => {
+    const settings = JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo' }] }] },
+    })
+    expect(() => validateUserArgs(['--settings', settings])).not.toThrow()
   })
 })
 
-describe('validateUserArgs — --settings', () => {
-  it('errors when user defines hooks.SessionStart', () => {
-    const settings = JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo' }] }] } })
-    expect(() => validateUserArgs(['--settings', settings], false))
-      .toThrow(/SessionStart/)
+describe('readFlag', () => {
+  it('returns last value when flag appears multiple times', () => {
+    expect(readFlag(['--effort', 'low', '--effort', 'high'], '--effort')).toBe('high')
   })
-
-  it('passes when user defines other hooks', () => {
-    const settings = JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'echo' }] }] } })
-    expect(() => validateUserArgs(['--settings', settings], false)).not.toThrow()
+  it('parses --flag=value form', () => {
+    expect(readFlag(['--effort=high'], '--effort')).toBe('high')
   })
-
-  it('passes when settings have no hooks at all', () => {
-    const settings = JSON.stringify({ permissions: { allowedTools: ['Bash'] } })
-    expect(() => validateUserArgs(['--settings', settings], false)).not.toThrow()
+  it('returns undefined when flag absent', () => {
+    expect(readFlag(['--other', 'x'], '--effort')).toBeUndefined()
   })
+})
 
-  it('reads settings from a file path', () => {
-    const dir = mkdtempSync(path.join(tmpdir(), 'retcon-settings-'))
-    try {
-      const file = path.join(dir, 'settings.json')
-      writeFileSync(file, JSON.stringify({ hooks: { SessionStart: [{}] } }))
-      expect(() => validateUserArgs(['--settings', file], false))
-        .toThrow(/SessionStart/)
-    }
-    finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
+describe('removeFlag', () => {
+  it('removes flag and its value (space-separated)', () => {
+    expect(removeFlag(['--effort', 'low', '--keep'], '--effort')).toEqual(['--keep'])
+  })
+  it('removes --flag=value form', () => {
+    expect(removeFlag(['--effort=low', '--keep'], '--effort')).toEqual(['--keep'])
+  })
+  it('removes all occurrences', () => {
+    expect(removeFlag(['--x', '1', '--y', '--x', '2', '--z'], '--x')).toEqual(['--y', '--z'])
   })
 })

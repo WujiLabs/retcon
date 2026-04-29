@@ -32,10 +32,12 @@
 
 import { randomUUID } from 'node:crypto'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
-import { validateUserArgs } from './arg-validate.js'
+import { isRecord, loadJsonArg, readFlag, removeFlag, validateUserArgs } from './arg-validate.js'
 import { ensureDaemon, resolvedDefaultPort } from './daemon-control.js'
 import { findClaudeBinary } from './find-claude.js'
 import { spawnAgent } from './spawn-agent.js'
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export interface RunAgentOptions {
   agent: string
@@ -103,6 +105,84 @@ export function mergeCustomHeaders(
 }
 
 /**
+ * Pick the transport id retcon should bind under. If the user passed a valid
+ * --session-id (only legal in non-resume mode anyway), adopt it as the
+ * binding token rather than minting our own — it's what they expect to see
+ * in the local jsonl filename, fork tools, etc.
+ *
+ * Note: claude rejects --session-id together with --resume/--continue
+ * (unless --fork-session is set), so we don't accept user-supplied ids
+ * in resume mode either.
+ */
+export function pickTransportId(args: readonly string[], isResume: boolean): string {
+  if (!isResume) {
+    const userId = readFlag(args, '--session-id')
+    if (userId && UUID_RE.test(userId)) return userId
+  }
+  return randomUUID()
+}
+
+/**
+ * Build the --settings JSON that gets handed to claude. Always installs
+ * retcon's SessionStart command hook for binding-token rebind. If the user
+ * passed their own --settings (file path or inline JSON), we deep-merge:
+ * SessionStart hook entries are appended to the user's array; everything
+ * else under `hooks.*` and other top-level keys is preserved as-is.
+ *
+ * Returns the combined JSON string AND a copy of `args` with the user's
+ * `--settings <value>` removed (we replace it with our merged version so
+ * claude doesn't see two competing flags).
+ */
+export function buildSettingsAndArgs(
+  args: readonly string[],
+  ourHookCmd: string,
+): { settings: string, argsWithoutSettings: string[] } {
+  const ourHookEntry = {
+    hooks: [
+      {
+        type: 'command',
+        command: ourHookCmd,
+        timeout: 5,
+      },
+    ],
+  }
+
+  const userValue = readFlag(args, '--settings')
+  if (userValue === undefined) {
+    return {
+      settings: JSON.stringify({ hooks: { SessionStart: [ourHookEntry] } }),
+      argsWithoutSettings: [...args],
+    }
+  }
+
+  const parsed = loadJsonArg(userValue)
+  if (!isRecord(parsed)) {
+    // User passed something unparseable (or non-existent file). Drop their
+    // flag, install ours, and let claude surface their bad input via its
+    // own settings-loader if there's still something to load.
+    return {
+      settings: JSON.stringify({ hooks: { SessionStart: [ourHookEntry] } }),
+      argsWithoutSettings: removeFlag(args, '--settings'),
+    }
+  }
+
+  // Deep-merge: clone, ensure hooks.SessionStart array exists, append ours.
+  const merged: Record<string, unknown> = { ...parsed }
+  const hooksRaw = isRecord(parsed.hooks) ? { ...parsed.hooks } : {}
+  const sessionStartRaw = hooksRaw.SessionStart
+  const sessionStartArr = Array.isArray(sessionStartRaw)
+    ? [...sessionStartRaw, ourHookEntry]
+    : [ourHookEntry]
+  hooksRaw.SessionStart = sessionStartArr
+  merged.hooks = hooksRaw
+
+  return {
+    settings: JSON.stringify(merged),
+    argsWithoutSettings: removeFlag(args, '--settings'),
+  }
+}
+
+/**
  * Run the agent (typically claude) under the retcon proxy. Returns the
  * agent's exit code (or 127 if the agent binary isn't on PATH).
  */
@@ -114,10 +194,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   const isResume = detectResumeMode(opts.args)
 
   // Step 0: validate user args against the things we're about to inject.
-  // Surfacing a conflict here gives the user a clear message; letting it
-  // through would either silently mis-bind or produce a cryptic claude error.
+  // Today the only unmergeable conflict is mcpServers.retcon in --mcp-config.
   try {
-    validateUserArgs(opts.args, isResume)
+    validateUserArgs(opts.args)
   }
   catch (err) {
     process.stderr.write(`[retcon] ${(err as Error).message}\n`)
@@ -140,11 +219,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
     process.stderr.write(`[retcon] daemon started on ${retconBaseUrl} → ${upstream}\n`)
   }
 
-  // Step 2: mint one transport id to bind /v1/* and /mcp under one identity.
-  // For new sessions this becomes claude's session_id (--session-id T).
-  // For --resume/--continue we cannot pass --session-id, so this stays as a
-  // binding_token until the SessionStart hook arrives with claude's real id.
-  const transportId = randomUUID()
+  // Step 2: pick the transport id retcon binds under. For a new session this
+  // becomes claude's --session-id (and the local jsonl filename); for resume
+  // it stays as a binding_token until the SessionStart hook posts back with
+  // claude's actual session_id. If the user passed --session-id explicitly
+  // and we're not in resume mode, adopt it instead of minting a fresh UUID
+  // so the id they expect to see is the id retcon uses.
+  const transportId = pickTransportId(opts.args, isResume)
+  // Drop the user's --session-id from args so we can re-inject our own
+  // (same value if they supplied a valid UUID; freshly-minted otherwise).
+  const argsWithoutSessionId = isResume ? [...opts.args] : removeFlag(opts.args, '--session-id')
 
   // Step 3: build the per-invocation MCP config that claude will load via
   // --mcp-config. Inline JSON keeps our config out of ~/.claude.json so
@@ -180,26 +264,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
     = `curl -sS -X POST -H 'content-type: application/json' `
     + `-H "x-playtiss-session: $RETCON_BINDING" `
     + `--data-binary @- http://${host}:${port}/hooks/session-start >/dev/null`
-  const settings = JSON.stringify({
-    hooks: {
-      SessionStart: [
-        {
-          hooks: [
-            {
-              type: 'command',
-              command: hookCmd,
-              timeout: 5,
-            },
-          ],
-        },
-      ],
-    },
-  })
+  // Build merged settings JSON. If the user passed --settings, our hook is
+  // appended to their hooks.SessionStart array (rather than colliding); we
+  // also drop their --settings flag so claude doesn't see two competing.
+  const { settings, argsWithoutSettings } = buildSettingsAndArgs(argsWithoutSessionId, hookCmd)
 
-  // Step 4: spawn claude. Args we inject are PREPENDED (so user-supplied
-  // args still win on conflict — but conflicts on --session-id /
-  // --mcp-config from the user are unusual and would defeat the binding,
-  // so we don't try to be clever about deduping).
+  // Step 4: spawn claude. Args we inject are PREPENDED so the user-supplied
+  // args we kept come last (claude's last-wins precedence). User --session-id
+  // and --settings have been removed from `argsWithoutSettings`; user
+  // --mcp-config is preserved verbatim (claude unions servers across
+  // multiple --mcp-config flags, validateUserArgs already rejected the only
+  // conflict — mcpServers.retcon).
   //
   // For resume mode, omit --session-id (claude rejects --session-id together
   // with --resume/--continue unless --fork-session is also set).
@@ -218,7 +293,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
 
   const result = await spawnAgent({
     agent: resolvedAgent,
-    args: [...injectedArgs, ...opts.args],
+    args: [...injectedArgs, ...argsWithoutSettings],
     baseUrl: `http://${host}:${port}`,
     envOverrides: {
       // Anthropic SDK reads this on every /v1/* request. Format is newline-
