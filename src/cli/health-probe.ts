@@ -35,6 +35,8 @@ export interface HealthSnapshotShape {
   uptime_s?: number
   sessions?: number
   db_size_bytes?: number
+  /** Upstream the daemon proxies to (e.g. https://api.anthropic.com). */
+  upstream?: string
 }
 
 const DEFAULT_TIMEOUT_MS = 1000

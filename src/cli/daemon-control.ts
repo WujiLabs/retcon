@@ -37,6 +37,7 @@
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { DEFAULT_PORT } from '../server.js'
 import { VERSION } from '../version.js'
 import { probeHealth, type HealthSnapshotShape } from './health-probe.js'
@@ -53,13 +54,28 @@ export interface EnsureDaemonResult {
   reusedSnapshot: HealthSnapshotShape | null
 }
 
+export interface EnsureDaemonOptions {
+  /** Upstream to proxy /v1/* to. Defaults to api.anthropic.com. */
+  upstream?: string
+}
+
 /**
  * Make sure a retcon daemon is running on `port`. Returns once /health
- * confirms a matching version is up. Throws if the port is held by a
- * foreign process or the daemon refused to come up.
+ * confirms a matching version + upstream is up. Throws if the port is held
+ * by a foreign process, the daemon refused to come up, or an existing daemon
+ * is configured for a different upstream than `opts.upstream`.
+ *
+ * Upstream mismatch is treated like a version mismatch from the user's POV:
+ * one daemon owns the port, and proxying traffic to a different provider
+ * silently would route credentials to the wrong place. Caller is asked to
+ * `retcon stop` or pick a different `RETCON_PORT`.
  */
-export async function ensureDaemon(port: number = resolvedDefaultPort()): Promise<EnsureDaemonResult> {
+export async function ensureDaemon(
+  port: number = resolvedDefaultPort(),
+  opts: EnsureDaemonOptions = {},
+): Promise<EnsureDaemonResult> {
   ensureRetconDirs()
+  const wantUpstream = normalizeUpstream(opts.upstream ?? ANTHROPIC_UPSTREAM)
 
   // Stale PID file? Clean up first so the probe path is the only signal.
   const stalePid = readPidIfStale()
@@ -70,13 +86,24 @@ export async function ensureDaemon(port: number = resolvedDefaultPort()): Promis
   const probe = await probeHealth(port, VERSION)
 
   if (probe.kind === 'match') {
+    // Version matches; verify upstream too. A daemon proxying to
+    // api.anthropic.com cannot be silently reused by a user pointing at
+    // OpenRouter — credentials would land at the wrong provider.
+    const haveUpstream = normalizeUpstream(probe.snapshot.upstream ?? ANTHROPIC_UPSTREAM)
+    if (haveUpstream !== wantUpstream) {
+      throw new Error(
+        `retcon daemon on port ${port} is configured for upstream ${haveUpstream}, `
+        + `but this invocation wants ${wantUpstream}. `
+        + `Run \`retcon stop\` to restart it, or set RETCON_PORT=<other> to use a different port.`,
+      )
+    }
     return { port, spawnedNew: false, reusedSnapshot: probe.snapshot }
   }
 
   if (probe.kind === 'mismatch') {
     // A retcon daemon at a different version is on the port. Replace it.
     await stopExistingDaemon('mismatched-version')
-    return spawnAndWait(port)
+    return spawnAndWait(port, wantUpstream)
   }
 
   if (probe.kind === 'foreign') {
@@ -87,7 +114,28 @@ export async function ensureDaemon(port: number = resolvedDefaultPort()): Promis
   }
 
   // free → spawn
-  return spawnAndWait(port)
+  return spawnAndWait(port, wantUpstream)
+}
+
+/**
+ * Normalize an upstream URL for equality comparison. Strips trailing slashes
+ * and lowercases the host. Path is preserved (case-sensitive — providers may
+ * mount their API at /api or /api/v1).
+ */
+export function normalizeUpstream(url: string): string {
+  try {
+    const u = new URL(url)
+    u.hostname = u.hostname.toLowerCase()
+    let pathname = u.pathname
+    // Drop a trailing `/` so `host` and `host/` normalize to the same thing.
+    // For root paths this collapses to the empty string ("https://host"),
+    // which matches what a user typically types in ANTHROPIC_BASE_URL.
+    if (pathname.endsWith('/')) pathname = pathname.slice(0, -1)
+    return `${u.protocol}//${u.host}${pathname}${u.search}`
+  }
+  catch {
+    return url.replace(/\/+$/, '')
+  }
 }
 
 export interface StopResult {
@@ -206,7 +254,7 @@ async function stopExistingDaemon(reason: string): Promise<void> {
   cleanupPidFile()
 }
 
-async function spawnAndWait(port: number): Promise<EnsureDaemonResult> {
+async function spawnAndWait(port: number, upstream: string): Promise<EnsureDaemonResult> {
   const logFd = fs.openSync(retconLogFile(), 'a')
   try {
     // Spawn the same node binary, re-invoking this CLI with --daemon. We
@@ -217,7 +265,11 @@ async function spawnAndWait(port: number): Promise<EnsureDaemonResult> {
     const child = spawn(process.execPath, [cliPath, '--daemon'], {
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: { ...process.env, RETCON_PORT: String(port) },
+      env: {
+        ...process.env,
+        RETCON_PORT: String(port),
+        RETCON_UPSTREAM: upstream,
+      },
     })
     child.unref()
     // Don't await child.exit — we WANT it to outlive us.

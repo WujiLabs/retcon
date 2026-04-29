@@ -35,6 +35,21 @@ import { computeRevisionAsset } from './revisions-v1.js'
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
 
+/**
+ * Combine an upstream base (e.g. `https://api.anthropic.com` or
+ * `https://openrouter.ai/api`) with a request path (e.g. `/v1/messages`).
+ *
+ * Plain `new URL(path, base)` REPLACES base.pathname when path starts with `/`,
+ * so `new URL('/v1/messages', 'https://openrouter.ai/api')` returns
+ * `https://openrouter.ai/v1/messages` — wrong, drops `/api`. We concatenate
+ * strings directly so a non-empty upstream path is preserved verbatim.
+ */
+export function buildUpstreamUrl(upstream: string, path: string): URL {
+  const base = upstream.endsWith('/') ? upstream.slice(0, -1) : upstream
+  const p = path.startsWith('/') ? path : `/${path}`
+  return new URL(base + p)
+}
+
 // Hop-by-hop headers per RFC 7230 plus ones Node's http client will set itself.
 const SKIP_REQUEST_HEADERS = new Set([
   'host',
@@ -255,7 +270,7 @@ async function dispatch(
     res.end('retcon: absolute URLs not allowed; send path only\n')
     return
   }
-  const target = new URL(rawPath, ctx.upstream)
+  const target = buildUpstreamUrl(ctx.upstream, rawPath)
   const forwardHeaders: Record<string, string | string[]> = {}
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue

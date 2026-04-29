@@ -65,6 +65,8 @@ export interface HealthSnapshot {
   uptime_s: number
   sessions: number
   db_size_bytes: number
+  /** Upstream the daemon proxies /v1/* traffic to. */
+  upstream: string
 }
 
 export interface ServerOptions {
@@ -158,6 +160,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
       uptime_s: Math.floor((Date.now() - startedAt) / 1000),
       sessions,
       db_size_bytes: dbSize,
+      upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
     }
   }
 

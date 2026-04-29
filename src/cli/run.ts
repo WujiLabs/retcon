@@ -31,6 +31,7 @@
 // one claude session. Closing this CLI does NOT close the daemon.
 
 import { randomUUID } from 'node:crypto'
+import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { ensureDaemon, resolvedDefaultPort } from './daemon-control.js'
 import { spawnAgent } from './spawn-agent.js'
 
@@ -41,6 +42,31 @@ export interface RunAgentOptions {
   port?: number
   /** Override host; defaults to 127.0.0.1. */
   host?: string
+}
+
+/**
+ * Resolve the upstream provider that the daemon should proxy to.
+ *
+ * Users running claude through a non-Anthropic provider (OpenRouter, Bedrock-
+ * proxy, Vertex shim, etc.) configure that via `ANTHROPIC_BASE_URL` in their
+ * shell. retcon sits in the middle, so we capture that value before
+ * overriding the env for the spawned claude (which we point at the local
+ * daemon). Auth headers (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) are left
+ * on the child claude unchanged — claude attaches them per request and the
+ * daemon forwards them as-is to the upstream provider.
+ *
+ * If the user already has ANTHROPIC_BASE_URL pointing at retcon's local URL
+ * (e.g., they exported it in a previous shell session), don't recurse —
+ * fall back to the default upstream.
+ */
+export function resolveUpstream(env: NodeJS.ProcessEnv, retconBaseUrl: string): string {
+  const userBase = env.ANTHROPIC_BASE_URL
+  if (!userBase || userBase === retconBaseUrl) return ANTHROPIC_UPSTREAM
+  // Common loopback variants the user might set.
+  if (userBase.startsWith('http://127.0.0.1:') || userBase.startsWith('http://localhost:')) {
+    return ANTHROPIC_UPSTREAM
+  }
+  return userBase
 }
 
 /**
@@ -65,19 +91,23 @@ export function detectResumeMode(args: readonly string[]): boolean {
 export async function runAgent(opts: RunAgentOptions): Promise<number> {
   const port = opts.port ?? resolvedDefaultPort()
   const host = opts.host ?? '127.0.0.1'
+  const retconBaseUrl = `http://${host}:${port}`
+  const upstream = resolveUpstream(process.env, retconBaseUrl)
 
-  // Step 1: ensure the daemon is running. Throws if a foreign process owns
-  // the port; bubble that to the user.
+  // Step 1: ensure the daemon is running with the right upstream. Throws if
+  // a foreign process owns the port OR if a retcon daemon is up but
+  // configured for a different upstream (treated like version mismatch — see
+  // ensureDaemon).
   let daemon: Awaited<ReturnType<typeof ensureDaemon>>
   try {
-    daemon = await ensureDaemon(port)
+    daemon = await ensureDaemon(port, { upstream })
   }
   catch (err) {
     process.stderr.write(`[retcon] ${(err as Error).message}\n`)
     return 1
   }
   if (daemon.spawnedNew) {
-    process.stderr.write(`[retcon] daemon started on http://${host}:${port}\n`)
+    process.stderr.write(`[retcon] daemon started on ${retconBaseUrl} → ${upstream}\n`)
   }
 
   // Step 2: mint one transport id to bind /v1/* and /mcp under one identity.

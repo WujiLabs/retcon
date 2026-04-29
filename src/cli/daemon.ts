@@ -34,6 +34,7 @@
 import fs from 'node:fs'
 import { closeDb, migrate, openDb } from '../db.js'
 import { createForkTools } from '../mcp-tools.js'
+import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { createDefaultProducer, type ServerHandle, startServer, DEFAULT_PORT } from '../server.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
@@ -47,9 +48,12 @@ const SHUTDOWN_DEADLINE_MS = 2000
  * Test mode: pass {writePidFile: false} to skip filesystem PID management
  * (lets unit tests run multiple daemons in :memory: without collision).
  */
-export async function runDaemon(opts: { port?: number, writePidFile?: boolean } = {}): Promise<number> {
+export async function runDaemon(opts: { port?: number, writePidFile?: boolean, upstream?: string } = {}): Promise<number> {
   const port = opts.port ?? (Number(process.env.RETCON_PORT) || DEFAULT_PORT)
   const writePid = opts.writePidFile ?? true
+  // RETCON_UPSTREAM lets the spawning CLI tell the daemon which provider to
+  // proxy to. Defaults to api.anthropic.com when unset (the common case).
+  const upstream = opts.upstream ?? process.env.RETCON_UPSTREAM ?? ANTHROPIC_UPSTREAM
 
   ensureRetconDirs()
   const db = openDb({ path: retconDbPath() })
@@ -61,6 +65,7 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean } 
 
   const handle = await startServer({
     port,
+    upstream,
     producer,
     tobeStore,
     mcpTools,
@@ -74,7 +79,9 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean } 
 
   // Log startup so daemon.log shows the daemon came up. With stdio:'ignore'
   // and our log fd redirect, this lands in ~/.retcon/daemon.log.
-  process.stdout.write(`[retcon] daemon up on http://127.0.0.1:${handle.port} (pid ${process.pid})\n`)
+  process.stdout.write(
+    `[retcon] daemon up on http://127.0.0.1:${handle.port} → ${upstream} (pid ${process.pid})\n`,
+  )
 
   return new Promise<number>((resolve) => {
     let shuttingDown = false
