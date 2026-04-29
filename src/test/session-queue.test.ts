@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { describe, expect, it } from 'vitest'
+
 import { SessionQueue } from '../session-queue.js'
 
 function defer<T>(): { promise: Promise<T>, resolve: (v: T) => void, reject: (e: unknown) => void } {

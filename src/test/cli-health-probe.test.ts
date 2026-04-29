@@ -4,7 +4,9 @@
 // Unit tests for the port + identity probe used by retcon's daemon-control.
 
 import http from 'node:http'
+
 import { afterEach, describe, expect, it } from 'vitest'
+
 import { probeHealth } from '../cli/health-probe.js'
 
 interface StubServer {

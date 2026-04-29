@@ -3,7 +3,9 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
 import { migrate, openDb } from '../db.js'
 import { createEventConsumer, type EventProducer } from '../events.js'
 import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'
@@ -13,7 +15,7 @@ import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'
 function tool(handler: McpTool['handler'], description = 'test tool'): McpTool {
   return { handler, description, inputSchema: { type: 'object' } }
 }
-import { createDefaultProducer, startServer, type ServerHandle } from '../server.js'
+import { createDefaultProducer, type ServerHandle, startServer } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 function fixture() {
@@ -41,7 +43,9 @@ async function postJsonRpc(port: number, body: unknown, extraHeaders: Record<str
     body: JSON.stringify(body),
   })
   const headers: Record<string, string> = {}
-  res.headers.forEach((v, k) => { headers[k] = v })
+  res.headers.forEach((v, k) => {
+    headers[k] = v
+  })
   const text = await res.text()
   const json = text ? JSON.parse(text) as unknown : null
   return { status: res.status, headers, json }
@@ -51,9 +55,14 @@ describe('MCP /mcp route', () => {
   let fx: ReturnType<typeof fixture>
   let handle: ServerHandle | undefined
 
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
   afterEach(async () => {
-    if (handle) { await handle.close(); handle = undefined }
+    if (handle) {
+      await handle.close()
+      handle = undefined
+    }
     fx.cleanup()
   })
 

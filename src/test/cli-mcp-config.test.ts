@@ -8,9 +8,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 interface ExecCall { args: readonly string[] }
-type ExecResponse =
-  | { kind: 'ok', stdout: string, stderr?: string }
-  | { kind: 'fail', code: string | number, stdout?: string, stderr?: string }
+type ExecResponse
+  = | { kind: 'ok', stdout: string, stderr?: string }
+    | { kind: 'fail', code: string | number, stdout?: string, stderr?: string }
 
 let calls: ExecCall[] = []
 let responder: (args: readonly string[]) => ExecResponse = () => ({ kind: 'ok', stdout: '' })

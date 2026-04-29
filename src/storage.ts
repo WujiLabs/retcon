@@ -8,6 +8,7 @@
 // v1 (v1.1+ GC would wire it up via a separate table).
 
 import type { AssetId, AssetReferences, StorageProvider } from '@playtiss/core'
+
 import type { DB } from './db.js'
 
 export class SqliteStorageProvider implements StorageProvider {

@@ -7,8 +7,9 @@
 // We wrap `@playtiss/core`'s `computeTopBlock` so the proxy never hashes
 // anything by itself — the CID scheme is core's responsibility.
 
-import { cidToAssetId, computeTopBlock } from '@playtiss/core'
 import type { AssetId } from '@playtiss/core'
+import { cidToAssetId, computeTopBlock } from '@playtiss/core'
+
 import type { BlobRef } from './events.js'
 
 /**

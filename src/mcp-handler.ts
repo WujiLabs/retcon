@@ -19,7 +19,9 @@
 // dispatch, session lifecycle events, and a placeholder `tools/list`.
 
 import http from 'node:http'
+
 import { generateTraceId } from '@playtiss/core'
+
 import type { BindingTable } from './binding-table.js'
 import type { EventProducer } from './events.js'
 import type { SessionQueue } from './session-queue.js'

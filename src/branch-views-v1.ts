@@ -104,8 +104,8 @@ export class BranchViewsV1Projector implements Projection {
     const rev = tx.prepare(
       `SELECT id, task_id, parent_revision_id FROM revisions WHERE id = ?`,
     ).get(event.payload.request_event_id) as
-      | { id: string, task_id: string, parent_revision_id: string | null }
-      | undefined
+    | { id: string, task_id: string, parent_revision_id: string | null }
+    | undefined
     if (!rev || !rev.parent_revision_id) return
     tx.prepare(`
       UPDATE branch_views

@@ -61,8 +61,12 @@ export function spawnAgent(opts: SpawnAgentOptions): Promise<SpawnAgentResult> {
     // group too; this is a belt-and-suspenders for the case where retcon got
     // a programmatic signal that wasn't from the terminal.
     const forward = (sig: NodeJS.Signals): void => {
-      try { child.kill(sig) }
-      catch { /* child may already be exiting */ }
+      try {
+        child.kill(sig)
+      }
+      catch {
+        /* child may already be exiting */
+      }
     }
     process.on('SIGINT', forward)
     process.on('SIGTERM', forward)

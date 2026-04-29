@@ -5,6 +5,7 @@
 // buildSettingsAndArgs, mergeCustomHeaders, detectResumeMode, resolveUpstream.
 
 import { describe, expect, it } from 'vitest'
+
 import {
   buildSettingsAndArgs,
   detectResumeMode,
@@ -132,14 +133,22 @@ describe('mergeCustomHeaders', () => {
 })
 
 describe('detectResumeMode', () => {
-  it('detects --resume', () => { expect(detectResumeMode(['--resume'])).toBe(true) })
-  it('detects --continue', () => { expect(detectResumeMode(['--continue'])).toBe(true) })
+  it('detects --resume', () => {
+    expect(detectResumeMode(['--resume'])).toBe(true)
+  })
+  it('detects --continue', () => {
+    expect(detectResumeMode(['--continue'])).toBe(true)
+  })
   it('detects -r / -c short forms', () => {
     expect(detectResumeMode(['-r'])).toBe(true)
     expect(detectResumeMode(['-c'])).toBe(true)
   })
-  it('detects --resume=value form', () => { expect(detectResumeMode(['--resume=abc'])).toBe(true) })
-  it('returns false otherwise', () => { expect(detectResumeMode(['--effort', 'low'])).toBe(false) })
+  it('detects --resume=value form', () => {
+    expect(detectResumeMode(['--resume=abc'])).toBe(true)
+  })
+  it('returns false otherwise', () => {
+    expect(detectResumeMode(['--effort', 'low'])).toBe(false)
+  })
 })
 
 describe('resolveUpstream', () => {

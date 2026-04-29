@@ -33,6 +33,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const integrationEnabled = process.env.RETCON_TEST_INTEGRATION === '1'
@@ -78,14 +79,39 @@ const RESUME_SESSION = `${SESSION}-resume`
 
 describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', () => {
   beforeAll(() => {
-    try { execFileSync('retcon', ['stop'], { stdio: 'ignore' }) } catch { /* not running */ }
-    try { tmux('kill-session', '-t', SESSION) } catch { /* none */ }
-    try { tmux('kill-session', '-t', RESUME_SESSION) } catch { /* none */ }
+    try {
+      execFileSync('retcon', ['stop'], { stdio: 'ignore' })
+    }
+    catch {
+      /* not running */
+    }
+    try {
+      tmux('kill-session', '-t', SESSION)
+    }
+    catch {
+      /* none */
+    }
+    try {
+      tmux('kill-session', '-t', RESUME_SESSION)
+    }
+    catch {
+      /* none */
+    }
   })
 
   afterAll(() => {
-    try { tmux('kill-session', '-t', SESSION) } catch { /* fine */ }
-    try { tmux('kill-session', '-t', RESUME_SESSION) } catch { /* fine */ }
+    try {
+      tmux('kill-session', '-t', SESSION)
+    }
+    catch {
+      /* fine */
+    }
+    try {
+      tmux('kill-session', '-t', RESUME_SESSION)
+    }
+    catch {
+      /* fine */
+    }
     // Leave the daemon running — caller may have an existing session.
   })
 

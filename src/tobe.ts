@@ -79,14 +79,20 @@ export function createTobeStore(dir: string): TobeStore {
     catch {
       // Malformed file — delete so it doesn't pin the session. Fork intent
       // is lost, but the user can re-issue fork_back.
-      try { fs.unlinkSync(p) }
-      catch { /* ignore */ }
+      try {
+        fs.unlinkSync(p)
+      }
+      catch {
+        /* ignore */
+      }
       return null
     }
   }
 
   function commit(sessionId: string): void {
-    try { fs.unlinkSync(fileFor(sessionId)) }
+    try {
+      fs.unlinkSync(fileFor(sessionId))
+    }
     catch (err) {
       const e = err as NodeJS.ErrnoException
       if (e.code !== 'ENOENT') throw err

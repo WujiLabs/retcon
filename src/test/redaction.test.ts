@@ -1,17 +1,18 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { describe, expect, it } from 'vitest'
+
 import {
   DEFAULT_REDACTED_HEADERS,
-  redactHeaders,
   REDACTED_VALUE,
+  redactHeaders,
   resolveRedactedHeaderSet,
 } from '../redaction.js'
 
 describe('redactHeaders', () => {
   it('replaces default-redacted headers with REDACTED', () => {
     const out = redactHeaders({
-      authorization: 'Bearer sk-ant-actualsecret',
+      'authorization': 'Bearer sk-ant-actualsecret',
       'x-api-key': 'sk-xxx',
       'user-agent': 'claude-code/1.0',
     })
@@ -31,7 +32,7 @@ describe('redactHeaders', () => {
   })
 
   it('drops undefined values', () => {
-    const out = redactHeaders({ authorization: undefined, 'x-api-key': 'x' })
+    const out = redactHeaders({ 'authorization': undefined, 'x-api-key': 'x' })
     expect('authorization' in out).toBe(false)
     expect(out['x-api-key']).toBe(REDACTED_VALUE)
   })
@@ -39,7 +40,7 @@ describe('redactHeaders', () => {
   it('respects a custom redact set', () => {
     const custom = new Set<string>(['x-custom-key'])
     const out = redactHeaders(
-      { authorization: 'keep-me', 'x-custom-key': 'hide-me' },
+      { 'authorization': 'keep-me', 'x-custom-key': 'hide-me' },
       custom,
     )
     expect(out.authorization).toBe('keep-me')

@@ -31,6 +31,7 @@
 // one claude session. Closing this CLI does NOT close the daemon.
 
 import { randomUUID } from 'node:crypto'
+
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { isRecord, loadJsonArg, readFlag, removeFlag, validateUserArgs } from './arg-validate.js'
 import { ensureDaemon, resolvedDefaultPort } from './daemon-control.js'
@@ -287,11 +288,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   // for resumed sessions it's how we learn claude's session_id post-picker.
   const hookScript
     = `let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{`
-    + `const r=require('http').request({hostname:'${host}',port:${port},`
-    + `path:'/hooks/session-start',method:'POST',`
-    + `headers:{'content-type':'application/json',`
-    + `'x-playtiss-session':process.env.RETCON_BINDING}},res=>res.resume());`
-    + `r.on('error',()=>{});r.end(d)})`
+      + `const r=require('http').request({hostname:'${host}',port:${port},`
+      + `path:'/hooks/session-start',method:'POST',`
+      + `headers:{'content-type':'application/json',`
+      + `'x-playtiss-session':process.env.RETCON_BINDING}},res=>res.resume());`
+      + `r.on('error',()=>{});r.end(d)})`
   const hookCmd = `node -e "${hookScript}"`
   // Build merged settings JSON. If the user passed --settings, our hook is
   // appended to their hooks.SessionStart array (rather than colliding); we

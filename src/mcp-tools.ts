@@ -16,9 +16,9 @@
 // yet for this session.
 
 import { generateTraceId } from '@playtiss/core'
+
 import { blobRefFromBytes } from './body-blob.js'
 import type { DB } from './db.js'
-import type { EventProducer } from './events.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
 import type { TobeStore } from './tobe.js'
@@ -28,7 +28,7 @@ import type { TobeStore } from './tobe.js'
  * legit prompts stay well under this. Also applies to the whole serialized
  * inputs object (n + message).
  */
-export const MAX_FORK_BACK_MESSAGE_BYTES = 1024 * 1024  // 1 MiB
+export const MAX_FORK_BACK_MESSAGE_BYTES = 1024 * 1024 // 1 MiB
 
 /**
  * Safety cap on fork_show walk-back depth. Prevents unbounded CPU from a
@@ -143,39 +143,39 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-    const parsed = args as { limit?: number, offset?: number } | undefined
-    const limit = Math.min(Math.max(parsed?.limit ?? 20, 1), 200)
-    const offset = Math.max(parsed?.offset ?? 0, 0)
+      const parsed = args as { limit?: number, offset?: number } | undefined
+      const limit = Math.min(Math.max(parsed?.limit ?? 20, 1), 200)
+      const offset = Math.max(parsed?.offset ?? 0, 0)
 
-    const sess = loadSession(deps.db, ctx.sessionId)
-    if (!sess) return { error: 'session not found', session_id: ctx.sessionId }
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found', session_id: ctx.sessionId }
 
-    const rows = deps.db.prepare(`
+      const rows = deps.db.prepare(`
       SELECT id, stop_reason, sealed_at, created_at
         FROM revisions
        WHERE task_id = ? AND classification = 'closed_forkable'
        ORDER BY sealed_at DESC
        LIMIT ? OFFSET ?
     `).all(sess.task_id, limit, offset) as Array<{
-      id: string
-      stop_reason: string | null
-      sealed_at: number | null
-      created_at: number
-    }>
+        id: string
+        stop_reason: string | null
+        sealed_at: number | null
+        created_at: number
+      }>
 
-    const total = (deps.db.prepare(`
+      const total = (deps.db.prepare(`
       SELECT COUNT(*) AS n FROM revisions
        WHERE task_id = ? AND classification = 'closed_forkable'
     `).get(sess.task_id) as { n: number }).n
 
-    return {
-      total,
-      revisions: rows.map(r => ({
-        revision_id: r.id,
-        sealed_at: r.sealed_at,
-        stop_reason: r.stop_reason,
-      })),
-    }
+      return {
+        total,
+        revisions: rows.map(r => ({
+          revision_id: r.id,
+          sealed_at: r.sealed_at,
+          stop_reason: r.stop_reason,
+        })),
+      }
     },
   })
 
@@ -193,44 +193,44 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-    const parsed = args as { revision_id?: string } | undefined
-    if (!parsed?.revision_id) return { error: 'revision_id is required' }
+      const parsed = args as { revision_id?: string } | undefined
+      if (!parsed?.revision_id) return { error: 'revision_id is required' }
 
-    const sess = loadSession(deps.db, ctx.sessionId)
-    if (!sess) return { error: 'session not found' }
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
 
-    const rev = loadRevision(deps.db, parsed.revision_id)
-    if (!rev || rev.task_id !== sess.task_id) {
-      return { error: 'revision not found in this session' }
-    }
+      const rev = loadRevision(deps.db, parsed.revision_id)
+      if (!rev || rev.task_id !== sess.task_id) {
+        return { error: 'revision not found in this session' }
+      }
 
-    // Walk backward to find the chain of open Revisions preceding this one,
-    // up to (but not including) the previous closed_forkable. Capped in depth
-    // and by visited-set to survive corrupt or cyclic parent chains.
-    const preceding: string[] = []
-    const visited = new Set<string>([rev.id])
-    let cursor: string | null = rev.parent_revision_id
-    for (let i = 0; cursor && i < FORK_SHOW_MAX_DEPTH; i++) {
-      if (visited.has(cursor)) break  // cycle — stop
-      visited.add(cursor)
-      const parent = loadRevision(deps.db, cursor)
-      if (!parent || parent.classification === 'closed_forkable') break
-      preceding.push(parent.id)
-      cursor = parent.parent_revision_id
-    }
+      // Walk backward to find the chain of open Revisions preceding this one,
+      // up to (but not including) the previous closed_forkable. Capped in depth
+      // and by visited-set to survive corrupt or cyclic parent chains.
+      const preceding: string[] = []
+      const visited = new Set<string>([rev.id])
+      let cursor: string | null = rev.parent_revision_id
+      for (let i = 0; cursor && i < FORK_SHOW_MAX_DEPTH; i++) {
+        if (visited.has(cursor)) break // cycle — stop
+        visited.add(cursor)
+        const parent = loadRevision(deps.db, cursor)
+        if (!parent || parent.classification === 'closed_forkable') break
+        preceding.push(parent.id)
+        cursor = parent.parent_revision_id
+      }
 
-    return {
-      revision: {
-        id: rev.id,
-        classification: rev.classification,
-        stop_reason: rev.stop_reason,
-        parent_revision_id: rev.parent_revision_id,
-        asset_cid: rev.asset_cid,
-        sealed_at: rev.sealed_at,
-        created_at: rev.created_at,
-      },
-      preceding_open_revisions: preceding,
-    }
+      return {
+        revision: {
+          id: rev.id,
+          classification: rev.classification,
+          stop_reason: rev.stop_reason,
+          parent_revision_id: rev.parent_revision_id,
+          asset_cid: rev.asset_cid,
+          sealed_at: rev.sealed_at,
+          created_at: rev.created_at,
+        },
+        preceding_open_revisions: preceding,
+      }
     },
   })
 
@@ -247,32 +247,32 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-    const parsed = args as { label?: string } | undefined
+      const parsed = args as { label?: string } | undefined
 
-    const sess = loadSession(deps.db, ctx.sessionId)
-    if (!sess) return { error: 'session not found' }
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
 
-    // G10: reject if no closed_forkable exists yet.
-    const head = mostRecentForkableRevision(deps.db, sess.task_id)
-    if (!head) {
-      return {
-        error: 'no forkable turn yet — wait for the current turn to close before bookmarking',
+      // G10: reject if no closed_forkable exists yet.
+      const head = mostRecentForkableRevision(deps.db, sess.task_id)
+      if (!head) {
+        return {
+          error: 'no forkable turn yet — wait for the current turn to close before bookmarking',
+        }
       }
-    }
 
-    const viewId = generateTraceId()
-    ctx.producer.emit(
-      'fork.bookmark_created',
-      {
-        view_id: viewId,
-        task_id: sess.task_id,
-        head_revision_id: head.id,
-        label: parsed?.label ?? null,
-        auto_label: `bookmark@${new Date().toISOString()}`,
-      },
-      ctx.sessionId,
-    )
-    return { view_id: viewId, head_revision_id: head.id, label: parsed?.label ?? null }
+      const viewId = generateTraceId()
+      ctx.producer.emit(
+        'fork.bookmark_created',
+        {
+          view_id: viewId,
+          task_id: sess.task_id,
+          head_revision_id: head.id,
+          label: parsed?.label ?? null,
+          auto_label: `bookmark@${new Date().toISOString()}`,
+        },
+        ctx.sessionId,
+      )
+      return { view_id: viewId, head_revision_id: head.id, label: parsed?.label ?? null }
     },
   })
 
@@ -293,120 +293,120 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-    const parsed = args as { n?: number, message?: string } | undefined
-    const n = typeof parsed?.n === 'number' ? Math.floor(parsed.n) : NaN
-    const message = typeof parsed?.message === 'string' ? parsed.message : null
-    if (!Number.isInteger(n) || n < 1) return { error: '`n` must be an integer ≥ 1' }
-    if (!message) return { error: '`message` is required' }
-    if (Buffer.byteLength(message, 'utf8') > MAX_FORK_BACK_MESSAGE_BYTES) {
-      return { error: `message exceeds ${MAX_FORK_BACK_MESSAGE_BYTES} bytes; trim your prompt` }
-    }
+      const parsed = args as { n?: number, message?: string } | undefined
+      const n = typeof parsed?.n === 'number' ? Math.floor(parsed.n) : NaN
+      const message = typeof parsed?.message === 'string' ? parsed.message : null
+      if (!Number.isInteger(n) || n < 1) return { error: '`n` must be an integer ≥ 1' }
+      if (!message) return { error: '`message` is required' }
+      if (Buffer.byteLength(message, 'utf8') > MAX_FORK_BACK_MESSAGE_BYTES) {
+        return { error: `message exceeds ${MAX_FORK_BACK_MESSAGE_BYTES} bytes; trim your prompt` }
+      }
 
-    // F7 feature gate.
-    if (deps.forkBackEnabled === false) {
-      const bodyBytes = Buffer.from(JSON.stringify({ n, message }), 'utf8')
-      const inputsBlob = await blobRefFromBytes(bodyBytes)
-      ctx.producer.emit(
-        'fork.back_disabled_rejected',
-        { inputs_cid: inputsBlob.cid },
-        ctx.sessionId,
-        [inputsBlob.ref],
+      // F7 feature gate.
+      if (deps.forkBackEnabled === false) {
+        const bodyBytes = Buffer.from(JSON.stringify({ n, message }), 'utf8')
+        const inputsBlob = await blobRefFromBytes(bodyBytes)
+        ctx.producer.emit(
+          'fork.back_disabled_rejected',
+          { inputs_cid: inputsBlob.cid },
+          ctx.sessionId,
+          [inputsBlob.ref],
+        )
+        return {
+          error: 'fork_back disabled; proxy running in recording-only mode. Set PLAYTISS_PROXY_FORK_BACK_ENABLED=1 to enable.',
+        }
+      }
+
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
+      if (sess.harness === 'orphan') {
+        return { error: 'fork_back requires an MCP-initialized session (orphan sessions cannot fork)' }
+      }
+
+      // F4: reject if the current head is open (mid-tool-use) or in_flight.
+      const currentHead = mostRecentRevision(deps.db, sess.task_id)
+      if (!currentHead) {
+        return { error: 'no turns yet — nothing to fork from' }
+      }
+      if (currentHead.classification === 'open' || currentHead.classification === 'in_flight') {
+        return {
+          error: `cannot fork while current turn is ${currentHead.classification}; wait for it to close`,
+          current_classification: currentHead.classification,
+        }
+      }
+
+      // Walk back `n` closed_forkable Revisions. We always start walking from
+      // the current head's parent (the current head itself is "where we are";
+      // n=1 means go to the nearest parent forkable, n=2 means two back, etc).
+      let target: RevisionRow | undefined
+      let walked = 0
+      let cursor: string | null = currentHead.parent_revision_id
+      while (walked < n) {
+        if (!cursor) break
+        const rev: RevisionRow | undefined = loadRevision(deps.db, cursor)
+        if (!rev) break
+        if (rev.classification === 'closed_forkable') {
+          target = rev
+          walked++
+          if (walked >= n) break
+        }
+        cursor = rev.parent_revision_id
+      }
+      if (!target || walked < n) {
+        return {
+          error: `only ${walked} forkable turns available; cannot go back ${n}`,
+        }
+      }
+
+      // Reconstruct messages[] at the fork point. Prefer a child's request
+      // body (which already includes target's assistant response); fall back
+      // to the target's own request body if no child exists OR the child's
+      // body is malformed. This maximises the chance of a successful fork
+      // reconstruction on imperfect data.
+      const baseMessages = reconstructForkMessages(deps.db, target)
+      if (!baseMessages) {
+        return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
+      }
+      baseMessages.push({ role: 'user', content: message })
+
+      // Compute a real CID for the new message so downstream consumers can
+      // resolve new_message_cid via the blobs table.
+      const newMessageBlob = await blobRefFromBytes(
+        Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
       )
-      return {
-        error: 'fork_back disabled; proxy running in recording-only mode. Set PLAYTISS_PROXY_FORK_BACK_ENABLED=1 to enable.',
-      }
-    }
 
-    const sess = loadSession(deps.db, ctx.sessionId)
-    if (!sess) return { error: 'session not found' }
-    if (sess.harness === 'orphan') {
-      return { error: 'fork_back requires an MCP-initialized session (orphan sessions cannot fork)' }
-    }
+      // Report the prior fork's outcome (A-R8 "return outcome on next call"):
+      // if the previous TOBE-applied request ended in failure, the LLM sees
+      // that in this call's result along with the new fork scheduling.
+      const prior = lastForkOutcome(deps.db, ctx.sessionId)
 
-    // F4: reject if the current head is open (mid-tool-use) or in_flight.
-    const currentHead = mostRecentRevision(deps.db, sess.task_id)
-    if (!currentHead) {
-      return { error: 'no turns yet — nothing to fork from' }
-    }
-    if (currentHead.classification === 'open' || currentHead.classification === 'in_flight') {
-      return {
-        error: `cannot fork while current turn is ${currentHead.classification}; wait for it to close`,
-        current_classification: currentHead.classification,
-      }
-    }
-
-    // Walk back `n` closed_forkable Revisions. We always start walking from
-    // the current head's parent (the current head itself is "where we are";
-    // n=1 means go to the nearest parent forkable, n=2 means two back, etc).
-    let target: RevisionRow | undefined
-    let walked = 0
-    let cursor: string | null = currentHead.parent_revision_id
-    while (walked < n) {
-      if (!cursor) break
-      const rev: RevisionRow | undefined = loadRevision(deps.db, cursor)
-      if (!rev) break
-      if (rev.classification === 'closed_forkable') {
-        target = rev
-        walked++
-        if (walked >= n) break
-      }
-      cursor = rev.parent_revision_id
-    }
-    if (!target || walked < n) {
-      return {
-        error: `only ${walked} forkable turns available; cannot go back ${n}`,
-      }
-    }
-
-    // Reconstruct messages[] at the fork point. Prefer a child's request
-    // body (which already includes target's assistant response); fall back
-    // to the target's own request body if no child exists OR the child's
-    // body is malformed. This maximises the chance of a successful fork
-    // reconstruction on imperfect data.
-    const baseMessages = reconstructForkMessages(deps.db, target)
-    if (!baseMessages) {
-      return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
-    }
-    baseMessages.push({ role: 'user', content: message })
-
-    // Compute a real CID for the new message so downstream consumers can
-    // resolve new_message_cid via the blobs table.
-    const newMessageBlob = await blobRefFromBytes(
-      Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
-    )
-
-    // Report the prior fork's outcome (A-R8 "return outcome on next call"):
-    // if the previous TOBE-applied request ended in failure, the LLM sees
-    // that in this call's result along with the new fork scheduling.
-    const prior = lastForkOutcome(deps.db, ctx.sessionId)
-
-    const targetViewId = generateTraceId()
-    deps.tobeStore.write(ctx.sessionId, {
-      messages: baseMessages,
-      fork_point_revision_id: target.id,
-      source_view_id: ctx.sessionId,  // placeholder until explicit source view passed in
-    })
-
-    ctx.producer.emit(
-      'fork.back_requested',
-      {
-        source_view_id: ctx.sessionId,
+      const targetViewId = generateTraceId()
+      deps.tobeStore.write(ctx.sessionId, {
+        messages: baseMessages,
         fork_point_revision_id: target.id,
-        new_message_cid: newMessageBlob.cid,
-        target_view_id: targetViewId,
-        task_id: sess.task_id,
-      },
-      ctx.sessionId,
-      [newMessageBlob.ref],
-    )
+        source_view_id: ctx.sessionId, // placeholder until explicit source view passed in
+      })
 
-    return {
-      status: 'scheduled',
-      fork_point: target.id,
-      target_view_id: targetViewId,
-      pending_path: deps.tobeStore.fileFor(ctx.sessionId),
-      prior_outcome: prior,
-    }
+      ctx.producer.emit(
+        'fork.back_requested',
+        {
+          source_view_id: ctx.sessionId,
+          fork_point_revision_id: target.id,
+          new_message_cid: newMessageBlob.cid,
+          target_view_id: targetViewId,
+          task_id: sess.task_id,
+        },
+        ctx.sessionId,
+        [newMessageBlob.ref],
+      )
+
+      return {
+        status: 'scheduled',
+        fork_point: target.id,
+        target_view_id: targetViewId,
+        pending_path: deps.tobeStore.fileFor(ctx.sessionId),
+        prior_outcome: prior,
+      }
     },
   })
 

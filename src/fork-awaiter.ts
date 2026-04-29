@@ -16,14 +16,14 @@
 
 import type { DB } from './db.js'
 
-export type ForkOutcomeStatus =
-  | 'completed'        // proxy.response_completed with status < 500
-  | 'http_error'       // proxy.response_completed with status >= 500
-  | 'aborted'          // proxy.response_aborted (client disconnect, upstream stream error)
-  | 'upstream_error'   // proxy.upstream_error (couldn't connect)
-  | 'in_flight'        // request emitted, no terminal event yet (lastForkOutcome only)
-  | 'timeout'          // awaiter timed out before any terminal event fired
-  | 'superseded'       // another fork_back replaced this waiter
+export type ForkOutcomeStatus
+  = | 'completed' // proxy.response_completed with status < 500
+    | 'http_error' // proxy.response_completed with status >= 500
+    | 'aborted' // proxy.response_aborted (client disconnect, upstream stream error)
+    | 'upstream_error' // proxy.upstream_error (couldn't connect)
+    | 'in_flight' // request emitted, no terminal event yet (lastForkOutcome only)
+    | 'timeout' // awaiter timed out before any terminal event fired
+    | 'superseded' // another fork_back replaced this waiter
 
 export interface ForkOutcome {
   status: ForkOutcomeStatus
@@ -129,8 +129,8 @@ export function lastForkOutcome(db: DB, sessionId: string): ForkOutcome | null {
        ORDER BY event_id DESC LIMIT 1`,
     )
     .get(sessionId, `%"request_event_id":"${reqRow.event_id}"%`) as
-      | { topic: string, payload: string }
-      | undefined
+    | { topic: string, payload: string }
+    | undefined
 
   if (!termRow) {
     // Request emitted but no terminal yet — still in-flight. Callers can

@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { beforeEach, describe, expect, it } from 'vitest'
-import { closeDb, CURRENT_SCHEMA_VERSION, migrate, openDb, type DB } from '../db.js'
+
+import { closeDb, CURRENT_SCHEMA_VERSION, type DB, migrate, openDb } from '../db.js'
 
 describe('db migrations', () => {
   let db: DB

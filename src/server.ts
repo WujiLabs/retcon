@@ -16,6 +16,7 @@
 
 import fs from 'node:fs'
 import http from 'node:http'
+
 import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
 import type { DB } from './db.js'
@@ -131,7 +132,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const mcpCtx: McpContext = {
     producer: options.producer,
     tools: options.mcpTools ?? new Map(),
-    sessionQueue,  // shared with the /v1/* proxy so tools/call serializes with /v1/messages
+    sessionQueue, // shared with the /v1/* proxy so tools/call serializes with /v1/messages
     bindingTable,
   }
 
@@ -144,12 +145,18 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
       try {
         sessions = (options.db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n
       }
-      catch { /* DB closed or migration mid-flight: report 0 */ }
+      catch {
+        /* DB closed or migration mid-flight: report 0 */
+      }
     }
     let dbSize = 0
     if (options.dbPath) {
-      try { dbSize = fs.statSync(options.dbPath).size }
-      catch { /* file may not exist yet on first boot */ }
+      try {
+        dbSize = fs.statSync(options.dbPath).size
+      }
+      catch {
+        /* file may not exist yet on first boot */
+      }
     }
     return {
       name: SERVER_NAME,

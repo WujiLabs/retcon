@@ -7,10 +7,12 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
-import { type EventProducer, type Event } from '../events.js'
+import { type Event, type EventProducer } from '../events.js'
 import { createEventProducer } from '../events.js'
 import { createForkTools } from '../mcp-tools.js'
 import { defaultProjectors } from '../server.js'
@@ -87,12 +89,14 @@ async function call(fx: TestFixture, name: string, args: unknown, forkBackEnable
 
 describe('fork_list', () => {
   let fx: TestFixture
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
   afterEach(() => fx.cleanup())
 
   it('lists closed_forkable Versions in recency order', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])  // open, should NOT appear
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // open, should NOT appear
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
     const res = await call(fx, 'fork_list', {}) as {
       total: number
@@ -103,7 +107,7 @@ describe('fork_list', () => {
   })
 
   it('returns empty list when no closed_forkable turns exist', async () => {
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])  // open only
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
     const res = await call(fx, 'fork_list', {}) as { total: number, versions: unknown[] }
     expect(res.total).toBe(0)
     expect(res.revisions).toEqual([])
@@ -114,13 +118,15 @@ describe('fork_list', () => {
     const r1 = await call(fx, 'fork_list', { limit: 2 }) as { versions: unknown[] }
     expect(r1.revisions.length).toBe(2)
     const r2 = await call(fx, 'fork_list', { limit: 10, offset: 3 }) as { versions: unknown[] }
-    expect(r2.revisions.length).toBe(2)  // 5 total, offset 3 → 2 remaining
+    expect(r2.revisions.length).toBe(2) // 5 total, offset 3 → 2 remaining
   })
 })
 
 describe('fork_show', () => {
   let fx: TestFixture
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
   afterEach(() => fx.cleanup())
 
   it('returns version details with preceding open chain', async () => {
@@ -144,7 +150,9 @@ describe('fork_show', () => {
 
 describe('fork_bookmark', () => {
   let fx: TestFixture
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
   afterEach(() => fx.cleanup())
 
   it('creates a branch_view pointing at the latest closed_forkable Version', async () => {
@@ -162,7 +170,7 @@ describe('fork_bookmark', () => {
   })
 
   it('G10: rejects when no closed_forkable Version exists yet', async () => {
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])  // open only
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
     const res = await call(fx, 'fork_bookmark', { label: 'x' }) as { error: string }
     expect(res.error).toMatch(/no forkable turn yet/)
   })
@@ -170,12 +178,14 @@ describe('fork_bookmark', () => {
 
 describe('fork_back', () => {
   let fx: TestFixture
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
   afterEach(() => fx.cleanup())
 
   it('F4: rejects when current head classification is open', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])  // leaves head=open
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // leaves head=open
     const res = await call(fx, 'fork_back', { n: 1, message: 'alt' }) as { error: string }
     expect(res.error).toMatch(/mid-tool-use|open/)
   })
@@ -277,7 +287,7 @@ describe('fork_back', () => {
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
     ])
-    const huge = 'x'.repeat(2 * 1024 * 1024)  // 2 MiB — above the 1 MiB cap
+    const huge = 'x'.repeat(2 * 1024 * 1024) // 2 MiB — above the 1 MiB cap
     const res = await call(fx, 'fork_back', { n: 1, message: huge }) as { error: string }
     expect(res.error).toMatch(/exceeds/)
   })
@@ -347,7 +357,7 @@ describe('fork_back', () => {
       preceding_open_revisions: string[]
     }
     const elapsed = Date.now() - start
-    expect(elapsed).toBeLessThan(1000)  // didn't hang
+    expect(elapsed).toBeLessThan(1000) // didn't hang
     // `version` itself is closed_forkable so the walk terminates immediately —
     // the key assertion is "did not hang" which we just verified.
     expect(Array.isArray(res.preceding_open_revisions)).toBe(true)

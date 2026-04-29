@@ -7,17 +7,19 @@
 // api.anthropic.com, then starts the proxy pointed at that mock. We inspect
 // the `events` table to assert what was recorded.
 
-import http from 'node:http'
 import { mkdtempSync, rmSync } from 'node:fs'
+import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { migrate, openDb, type DB } from '../db.js'
+
+import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer, createEventProducer, type EventProducer } from '../events.js'
-import { defaultProjectors } from '../server.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
-import { startServer, type ServerHandle } from '../server.js'
+import { defaultProjectors } from '../server.js'
+import { type ServerHandle, startServer } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 type MockHandler = (
@@ -170,7 +172,7 @@ describe('proxy pass-through + event emission', () => {
       body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }], stream: true }),
     })
     expect(res.status).toBe(200)
-    await res.text()  // drain
+    await res.text() // drain
 
     const responsePayload = await waitForEvent(fx.db, 'proxy.response_completed') as {
       stop_reason: string | null
@@ -283,7 +285,7 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       producer: fx.producer,
       tobeStore: fx.tobeStore,
-      upstream: 'http://127.0.0.1:1',  // port 1 is reserved / unreachable
+      upstream: 'http://127.0.0.1:1', // port 1 is reserved / unreachable
     })
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
@@ -308,7 +310,7 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       producer: fx.producer,
       tobeStore: fx.tobeStore,
-      upstream: 'http://127.0.0.1:1',  // unreachable; any forwarded request fails
+      upstream: 'http://127.0.0.1:1', // unreachable; any forwarded request fails
     })
 
     // Craft an absolute-form request line by hand. `fetch` normalizes paths,
@@ -488,7 +490,7 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       producer: fx.producer,
       tobeStore: fx.tobeStore,
-      upstream: 'http://127.0.0.1:1',  // unreachable
+      upstream: 'http://127.0.0.1:1', // unreachable
     })
     const sessionId = 'sess-await-err'
     fx.tobeStore.write(sessionId, {

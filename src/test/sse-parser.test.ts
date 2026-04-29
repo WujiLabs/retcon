@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { describe, expect, it } from 'vitest'
+
 import { extractStopReasonFromJsonBody, SseStopReasonParser } from '../sse-parser.js'
 
 function frame(event: string, data: object): string {

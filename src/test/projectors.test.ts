@@ -5,12 +5,13 @@
 // producer's projector chain. Fast, deterministic, no HTTP.
 
 import type { TraceId } from '@playtiss/core'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
+
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
-import { SessionsV1Projector } from '../sessions-v1.js'
 import { RevisionsV1Projector } from '../revisions-v1.js'
+import { SessionsV1Projector } from '../sessions-v1.js'
 
 interface RevisionRow {
   id: string

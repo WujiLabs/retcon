@@ -32,10 +32,11 @@
 //          stale and is cleaned up on next ensureDaemon() invocation.
 
 import fs from 'node:fs'
+
 import { closeDb, migrate, openDb } from '../db.js'
 import { createForkTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
-import { createDefaultProducer, type ServerHandle, startServer, DEFAULT_PORT } from '../server.js'
+import { createDefaultProducer, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
 
@@ -112,8 +113,12 @@ async function gracefulShutdown(handle: ServerHandle, db: ReturnType<typeof open
   // Node http.Server.close() waits for keep-alive connections to drain. With
   // claude's MCP SSE channel held open, that wait is unbounded. Drop those
   // connections forcibly first.
-  try { handle.closeAllConnections() }
-  catch { /* best effort */ }
+  try {
+    handle.closeAllConnections()
+  }
+  catch {
+    /* best effort */
+  }
 
   // Race close() against a hard deadline. If a connection refuses to close
   // we still proceed to closeDb so the WAL checkpoints cleanly.
@@ -122,11 +127,19 @@ async function gracefulShutdown(handle: ServerHandle, db: ReturnType<typeof open
     new Promise<void>(r => setTimeout(r, SHUTDOWN_DEADLINE_MS)),
   ])
 
-  try { closeDb(db) }
-  catch { /* best effort */ }
+  try {
+    closeDb(db)
+  }
+  catch {
+    /* best effort */
+  }
 }
 
 function cleanupPidFile(): void {
-  try { fs.unlinkSync(retconPidFile()) }
-  catch { /* may already be gone */ }
+  try {
+    fs.unlinkSync(retconPidFile())
+  }
+  catch {
+    /* may already be gone */
+  }
 }

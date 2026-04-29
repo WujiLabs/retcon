@@ -53,7 +53,7 @@ export function removeFlag(args: readonly string[], flag: string): string[] {
   const out: string[] = []
   for (let i = 0; i < args.length; i++) {
     if (args[i] === flag) {
-      i++  // also consume the value
+      i++ // also consume the value
       continue
     }
     if (args[i].startsWith(`${flag}=`)) continue
@@ -75,15 +75,21 @@ export function loadJsonArg(value: string): unknown | null {
   // Inline JSON: starts with '{' or '['
   const trimmed = value.trim()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try { return JSON.parse(trimmed) }
-    catch { /* fall through to file attempt */ }
+    try {
+      return JSON.parse(trimmed)
+    }
+    catch {
+      /* fall through to file attempt */
+    }
   }
   try {
     const stat = fs.statSync(value)
     if (!stat.isFile() || stat.size > JSON_ARG_FILE_MAX_BYTES) return null
     return JSON.parse(fs.readFileSync(value, 'utf8'))
   }
-  catch { return null }
+  catch {
+    return null
+  }
 }
 
 /**
@@ -102,7 +108,7 @@ function validateMcpConfigNoRetconKey(args: readonly string[]): void {
     else if (args[i].startsWith('--mcp-config=')) value = args[i].slice('--mcp-config='.length)
     if (!value) continue
     const parsed = loadJsonArg(value)
-    if (!isRecord(parsed)) continue  // unparseable → let claude surface its own error
+    if (!isRecord(parsed)) continue // unparseable → let claude surface its own error
     const servers = parsed.mcpServers
     if (isRecord(servers) && 'retcon' in servers) {
       throw new Error(

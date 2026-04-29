@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { beforeEach, describe, expect, it } from 'vitest'
+
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import {

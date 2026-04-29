@@ -9,11 +9,11 @@
 // with a console warning (not an error). Matches the plan's "never fail
 // pass-through because of recording logic" invariant.
 
-export type Classification =
-  | 'closed_forkable'      // legal fork anchor — end_turn, stop_sequence
-  | 'open'                 // chain continues — tool_use, pause_turn
-  | 'dangling_unforkable'  // terminal but not forkable — max_tokens, refusal, null, unknown
-  | 'in_flight'            // transient projector state: request_received but no terminal yet
+export type Classification
+  = | 'closed_forkable' // legal fork anchor — end_turn, stop_sequence
+    | 'open' // chain continues — tool_use, pause_turn
+    | 'dangling_unforkable' // terminal but not forkable — max_tokens, refusal, null, unknown
+    | 'in_flight' // transient projector state: request_received but no terminal yet
 
 const KNOWN_CLOSED_FORKABLE: ReadonlySet<string> = new Set(['end_turn', 'stop_sequence'])
 const KNOWN_OPEN: ReadonlySet<string> = new Set(['tool_use', 'pause_turn'])
@@ -35,7 +35,7 @@ const warned = new Set<string>()
 function warnUnknownOnce(stopReason: string): void {
   if (warned.has(stopReason)) return
   warned.add(stopReason)
-  // eslint-disable-next-line no-console
+
   console.warn(`[retcon] unknown stop_reason="${stopReason}" — classified as dangling_unforkable`)
 }
 

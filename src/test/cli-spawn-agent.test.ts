@@ -5,6 +5,7 @@
 // need a real claude binary in the test environment.
 
 import { describe, expect, it } from 'vitest'
+
 import { spawnAgent } from '../cli/spawn-agent.js'
 
 describe('spawnAgent', () => {

@@ -22,15 +22,16 @@ import http from 'node:http'
 import https from 'node:https'
 import { URL } from 'node:url'
 import zlib from 'node:zlib'
+
 import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes } from './body-blob.js'
 import type { EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
+import { computeRevisionAsset } from './revisions-v1.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
-import { computeRevisionAsset } from './revisions-v1.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
@@ -54,7 +55,7 @@ export function buildUpstreamUrl(upstream: string, path: string): URL {
 const SKIP_REQUEST_HEADERS = new Set([
   'host',
   'connection',
-  'content-length',   // recomputed after potential TOBE swap
+  'content-length', // recomputed after potential TOBE swap
   'transfer-encoding',
   'keep-alive',
   'proxy-authorization',
@@ -62,7 +63,7 @@ const SKIP_REQUEST_HEADERS = new Set([
   'te',
   'trailer',
   'upgrade',
-  'expect',           // Expect: 100-continue would stall upstream
+  'expect', // Expect: 100-continue would stall upstream
 ])
 
 // Same list for the RESPONSE direction: Node re-chunks and re-frames the

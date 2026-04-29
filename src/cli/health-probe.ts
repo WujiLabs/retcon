@@ -19,11 +19,11 @@
 import http from 'node:http'
 import net from 'node:net'
 
-export type HealthProbeResult =
-  | { kind: 'free' }
-  | { kind: 'match', port: number, snapshot: HealthSnapshotShape }
-  | { kind: 'mismatch', port: number, snapshot: HealthSnapshotShape }
-  | { kind: 'foreign', port: number, reason: string }
+export type HealthProbeResult
+  = | { kind: 'free' }
+    | { kind: 'match', port: number, snapshot: HealthSnapshotShape }
+    | { kind: 'mismatch', port: number, snapshot: HealthSnapshotShape }
+    | { kind: 'foreign', port: number, reason: string }
 
 /** Subset of the /health JSON we care about. */
 export interface HealthSnapshotShape {
@@ -101,9 +101,9 @@ function tcpProbe(host: string, port: number, timeoutMs: number): Promise<TcpRes
   })
 }
 
-type HttpProbeResult =
-  | { kind: 'ok', snapshot: HealthSnapshotShape }
-  | { kind: 'error', reason: string }
+type HttpProbeResult
+  = | { kind: 'ok', snapshot: HealthSnapshotShape }
+    | { kind: 'error', reason: string }
 
 function httpProbe(host: string, port: number, timeoutMs: number): Promise<HttpProbeResult> {
   return new Promise<HttpProbeResult>((resolve) => {
@@ -115,7 +115,7 @@ function httpProbe(host: string, port: number, timeoutMs: number): Promise<HttpP
     }
     const req = http.get({ host, port, path: '/health', timeout: timeoutMs }, (res) => {
       if (res.statusCode !== 200) {
-        res.resume()  // drain
+        res.resume() // drain
         finish({ kind: 'error', reason: `/health returned ${res.statusCode}` })
         return
       }

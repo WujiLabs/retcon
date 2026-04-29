@@ -3,10 +3,12 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { migrate, openDb, type DB } from '../db.js'
+
+import { type DB, migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
-import { startServer, type ServerHandle } from '../server.js'
+import { type ServerHandle, startServer } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 function fixture(): {

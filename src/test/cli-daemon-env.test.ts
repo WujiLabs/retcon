@@ -6,6 +6,7 @@
 // while preserving everything the daemon actually needs.
 
 import { describe, expect, it } from 'vitest'
+
 import { buildDaemonEnv } from '../cli/daemon-control.js'
 
 describe('buildDaemonEnv', () => {

@@ -4,7 +4,9 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { describe, expect, it } from 'vitest'
+
 import { readFlag, removeFlag, validateUserArgs } from '../cli/arg-validate.js'
 
 describe('validateUserArgs — --mcp-config', () => {

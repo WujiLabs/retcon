@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 import type { AssetId } from '@playtiss/core'
 import { beforeEach, describe, expect, it } from 'vitest'
+
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { SqliteStorageProvider } from '../storage.js'

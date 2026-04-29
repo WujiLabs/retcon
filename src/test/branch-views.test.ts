@@ -1,12 +1,13 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { beforeEach, describe, expect, it } from 'vitest'
+
 import { BranchViewsV1Projector } from '../branch-views-v1.js'
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
-import { SessionsV1Projector } from '../sessions-v1.js'
 import { RevisionsV1Projector } from '../revisions-v1.js'
+import { SessionsV1Projector } from '../sessions-v1.js'
 
 interface BranchViewRow {
   id: string
@@ -38,7 +39,9 @@ function loadView(db: DB, id: string): BranchViewRow | undefined {
 describe('branch_views_v1', () => {
   let fx: ReturnType<typeof fixture>
 
-  beforeEach(() => { fx = fixture() })
+  beforeEach(() => {
+    fx = fixture()
+  })
 
   it('creates a bookmark view with explicit label', () => {
     fx.producer.emit(
@@ -74,7 +77,7 @@ describe('branch_views_v1', () => {
     expect(row.head_revision_id).toBe('rev-fp-abcdef1234567890')
     expect(row.label).toBeNull()
     expect(row.auto_label).toMatch(/^fork@/)
-    expect(row.auto_label).toContain('rev-fp-a')  // first 8 chars of fork point
+    expect(row.auto_label).toContain('rev-fp-a') // first 8 chars of fork point
   })
 
   it('updates label on fork.label_updated', () => {
@@ -152,6 +155,6 @@ describe('branch_views_v1', () => {
       fx.sessionId,
     )
     const row = loadView(fx.db, 'view-stable')!
-    expect(row.head_revision_id).toBe('other-revision')  // not advanced
+    expect(row.head_revision_id).toBe('other-revision') // not advanced
   })
 })

@@ -17,6 +17,7 @@
 // transport id already equals session_id (the new-session case).
 
 import http from 'node:http'
+
 import type { BindingTable } from './binding-table.js'
 import { rebindSession } from './binding-table.js'
 import type { DB } from './db.js'

@@ -19,9 +19,9 @@
 // because hashing is async and the projector is sync — no async hashing
 // inside the single-tx event-emit invariant.
 
+import { classify } from './classifier.js'
 import type { DB } from './db.js'
 import type { Event, Projection } from './events.js'
-import { classify } from './classifier.js'
 
 interface RequestReceivedPayload {
   method: string
@@ -141,8 +141,8 @@ export class RevisionsV1Projector implements Projection {
     const rev = tx
       .prepare('SELECT task_id, parent_revision_id, created_at FROM revisions WHERE id = ?')
       .get(requestEventId) as
-        | { task_id: string, parent_revision_id: string | null, created_at: number }
-        | undefined
+      | { task_id: string, parent_revision_id: string | null, created_at: number }
+      | undefined
     if (!rev) return
     const parentId = rev.parent_revision_id ?? this.resolveParentAtSealTime(tx, rev.task_id, rev.created_at)
     tx.prepare(`

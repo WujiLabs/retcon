@@ -44,12 +44,12 @@ function execFileP(file: string, args: readonly string[], opts: ExecFileOptions)
 
 export const MCP_SERVER_NAME = 'retcon'
 
-export type EnsureMcpResult =
-  | { kind: 'skipped', reason: 'claude_not_installed' }
-  | { kind: 'noop', reason: 'already_correct' }
-  | { kind: 'added' }
-  | { kind: 'replaced' }
-  | { kind: 'failed', reason: string }
+export type EnsureMcpResult
+  = | { kind: 'skipped', reason: 'claude_not_installed' }
+    | { kind: 'noop', reason: 'already_correct' }
+    | { kind: 'added' }
+    | { kind: 'replaced' }
+    | { kind: 'failed', reason: string }
 
 /**
  * Ensure the retcon MCP entry is registered at user scope and points at the
@@ -89,11 +89,11 @@ export async function ensureMcpEntry(port: number, host = '127.0.0.1'): Promise<
   return { kind: 'added' }
 }
 
-type GetResult =
-  | { kind: 'claude_not_installed' }
-  | { kind: 'not_found' }
-  | { kind: 'found', url: string | null }
-  | { kind: 'error', reason: string }
+type GetResult
+  = | { kind: 'claude_not_installed' }
+    | { kind: 'not_found' }
+    | { kind: 'found', url: string | null }
+    | { kind: 'error', reason: string }
 
 async function tryClaudeMcpGet(name: string): Promise<GetResult> {
   try {

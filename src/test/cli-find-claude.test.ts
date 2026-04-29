@@ -1,10 +1,12 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
 import { findClaudeBinary } from '../cli/find-claude.js'
 
 describe('findClaudeBinary', () => {
@@ -34,8 +36,8 @@ describe('findClaudeBinary', () => {
 
     const wrapperDir = path.join(dir, 'wrapper')
     const realDir = path.join(dir, 'real')
-    require('node:fs').mkdirSync(wrapperDir)
-    require('node:fs').mkdirSync(realDir)
+    mkdirSync(wrapperDir)
+    mkdirSync(realDir)
 
     // wrapper/claude is a symlink to retcon
     symlinkSync(realRetcon, path.join(wrapperDir, 'claude'))
@@ -55,8 +57,8 @@ describe('findClaudeBinary', () => {
   it('skips a small shebang script that mentions retcon', () => {
     const wrapperDir = path.join(dir, 'wrapper')
     const realDir = path.join(dir, 'real')
-    require('node:fs').mkdirSync(wrapperDir)
-    require('node:fs').mkdirSync(realDir)
+    mkdirSync(wrapperDir)
+    mkdirSync(realDir)
 
     // Wrapper script — small, shebang, contains "retcon"
     const wrapperClaude = path.join(wrapperDir, 'claude')
@@ -78,8 +80,8 @@ describe('findClaudeBinary', () => {
   it('takes the first candidate when no wrapper signal is present', () => {
     const a = path.join(dir, 'a')
     const b = path.join(dir, 'b')
-    require('node:fs').mkdirSync(a)
-    require('node:fs').mkdirSync(b)
+    mkdirSync(a)
+    mkdirSync(b)
     const aClaude = path.join(a, 'claude')
     const bClaude = path.join(b, 'claude')
     writeFileSync(aClaude, 'x'.repeat(200_000))
@@ -96,7 +98,7 @@ describe('findClaudeBinary', () => {
 
   it('does NOT treat a real (large) claude install as a wrapper, even if "retcon" appears somewhere', () => {
     const dirA = path.join(dir, 'a')
-    require('node:fs').mkdirSync(dirA)
+    mkdirSync(dirA)
     const claudeBin = path.join(dirA, 'claude')
     // 100KB+: above WRAPPER_MAX_SIZE_BYTES, so the heuristic skips reading.
     writeFileSync(claudeBin, `${'x'.repeat(100_000)}retcon${'y'.repeat(100_000)}`)

@@ -12,7 +12,8 @@
 // Kafka-style EventLog/ProjectionOffsets design, but no source is imported
 // from the unsanitized playtiss graphql-server.
 
-import { generateOperationId, TraceIdGenerator, type TraceId } from '@playtiss/core'
+import { generateOperationId, type TraceId, TraceIdGenerator } from '@playtiss/core'
+
 import type { DB } from './db.js'
 
 export interface Event<Payload = unknown> {

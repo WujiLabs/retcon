@@ -10,7 +10,9 @@ import fs from 'node:fs'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
 import { ensureDaemon, statusDaemon, stopDaemon } from '../cli/daemon-control.js'
 import { retconPidFile } from '../cli/paths.js'
 
@@ -34,8 +36,12 @@ beforeEach(() => {
 
 afterEach(async () => {
   // Best-effort: stop any daemon left running from a failed test.
-  try { await stopDaemon() }
-  catch { /* ignore */ }
+  try {
+    await stopDaemon()
+  }
+  catch {
+    /* ignore */
+  }
   if (savedHome === undefined) delete process.env.RETCON_HOME
   else process.env.RETCON_HOME = savedHome
   if (savedPort === undefined) delete process.env.RETCON_PORT

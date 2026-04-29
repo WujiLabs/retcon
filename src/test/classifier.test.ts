@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
 import { _resetClassifierWarnings, classify } from '../classifier.js'
 
 describe('classify', () => {

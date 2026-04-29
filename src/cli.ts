@@ -20,7 +20,7 @@
 // print "not yet supported" and exit 2.
 
 import { runDaemon } from './cli/daemon.js'
-import { stopDaemon, statusDaemon } from './cli/daemon-control.js'
+import { statusDaemon, stopDaemon } from './cli/daemon-control.js'
 import { runAgent } from './cli/run.js'
 import { VERSION } from './version.js'
 
@@ -95,7 +95,7 @@ async function main(): Promise<number> {
   // Agent invocation. First arg may be a known agent flag; everything after
   // is forwarded.
   let agentArgs = args
-  let agent = 'claude'
+  const agent = 'claude'
   if (args[0] === '--claude') {
     agentArgs = args.slice(1)
   }

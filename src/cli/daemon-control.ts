@@ -37,10 +37,11 @@
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { DEFAULT_PORT } from '../server.js'
 import { VERSION } from '../version.js'
-import { probeHealth, type HealthSnapshotShape } from './health-probe.js'
+import { type HealthSnapshotShape, probeHealth } from './health-probe.js'
 import { ensureRetconDirs, retconHome, retconLogFile, retconPidFile } from './paths.js'
 
 const SPAWN_READY_TIMEOUT_MS = 5000
@@ -151,8 +152,12 @@ export async function stopDaemon(): Promise<StopResult> {
     cleanupPidFile()
     return { kind: 'cleaned_stale', pid }
   }
-  try { process.kill(pid, 'SIGTERM') }
-  catch { /* race: died between alive check and signal */ }
+  try {
+    process.kill(pid, 'SIGTERM')
+  }
+  catch {
+    /* race: died between alive check and signal */
+  }
 
   // Poll for exit up to STOP_SIGTERM_GRACE_MS, then SIGKILL.
   const deadline = Date.now() + STOP_SIGTERM_GRACE_MS
@@ -163,16 +168,20 @@ export async function stopDaemon(): Promise<StopResult> {
     }
     await sleep(100)
   }
-  try { process.kill(pid, 'SIGKILL') }
-  catch { /* race */ }
+  try {
+    process.kill(pid, 'SIGKILL')
+  }
+  catch {
+    /* race */
+  }
   cleanupPidFile()
   return { kind: 'stopped', pid }
 }
 
-export type StatusResult =
-  | { kind: 'not_running' }
-  | { kind: 'running', snapshot: HealthSnapshotShape, diskBytes: number }
-  | { kind: 'degraded', pid: number, reason: string }
+export type StatusResult
+  = | { kind: 'not_running' }
+    | { kind: 'running', snapshot: HealthSnapshotShape, diskBytes: number }
+    | { kind: 'degraded', pid: number, reason: string }
 
 /**
  * Inspect the running daemon. Returns running status + health snapshot +
@@ -209,7 +218,9 @@ function readPidFile(): number | null {
     const pid = Number.parseInt(raw, 10)
     return Number.isInteger(pid) && pid > 0 ? pid : null
   }
-  catch { return null }
+  catch {
+    return null
+  }
 }
 
 /** Read the PID file IF it exists AND the PID is dead. Otherwise null. */
@@ -220,7 +231,10 @@ function readPidIfStale(): number | null {
 }
 
 function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true }
+  try {
+    process.kill(pid, 0)
+    return true
+  }
   catch (err) {
     const e = err as NodeJS.ErrnoException
     // EPERM means the process exists but we can't signal it. Still "alive."
@@ -229,8 +243,12 @@ function isAlive(pid: number): boolean {
 }
 
 function cleanupPidFile(): void {
-  try { fs.unlinkSync(retconPidFile()) }
-  catch { /* not there */ }
+  try {
+    fs.unlinkSync(retconPidFile())
+  }
+  catch {
+    /* not there */
+  }
 }
 
 async function stopExistingDaemon(reason: string): Promise<void> {
@@ -241,15 +259,23 @@ async function stopExistingDaemon(reason: string): Promise<void> {
     cleanupPidFile()
     return
   }
-  try { process.kill(pid, 'SIGTERM') }
-  catch { /* race */ }
+  try {
+    process.kill(pid, 'SIGTERM')
+  }
+  catch {
+    /* race */
+  }
   const deadline = Date.now() + STOP_SIGTERM_GRACE_MS
   while (Date.now() < deadline && isAlive(pid)) {
     await sleep(100)
   }
   if (isAlive(pid)) {
-    try { process.kill(pid, 'SIGKILL') }
-    catch { /* race */ }
+    try {
+      process.kill(pid, 'SIGKILL')
+    }
+    catch {
+      /* race */
+    }
     // Give SIGKILL a moment to take effect (kernel needs to reap). If the
     // process really refuses to die (zombie parent, uninterruptible sleep,
     // permission flap), keep the PID file around so the next ensureDaemon
@@ -336,7 +362,7 @@ export function buildDaemonEnv(
     'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
     'RETCON_HOME', 'RETCON_CLI_ENTRY',
   ])
-  const ALLOW_PREFIX = ['LC_']  // LC_ALL, LC_CTYPE, LC_TIME, etc.
+  const ALLOW_PREFIX = ['LC_'] // LC_ALL, LC_CTYPE, LC_TIME, etc.
 
   const env: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(parentEnv)) {
@@ -372,8 +398,12 @@ function sleep(ms: number): Promise<void> {
 async function dirSize(dir: string): Promise<number> {
   let total = 0
   let entries: fs.Dirent[]
-  try { entries = await fs.promises.readdir(dir, { withFileTypes: true }) }
-  catch { return 0 }
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true })
+  }
+  catch {
+    return 0
+  }
   for (const e of entries) {
     const full = `${dir}/${e.name}`
     if (e.isDirectory()) {
@@ -384,7 +414,9 @@ async function dirSize(dir: string): Promise<number> {
         const st = await fs.promises.stat(full)
         total += st.size
       }
-      catch { /* file vanished mid-walk; skip */ }
+      catch {
+        /* file vanished mid-walk; skip */
+      }
     }
   }
   return total

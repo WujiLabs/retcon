@@ -5,9 +5,10 @@
 // non-Anthropic providers (OpenRouter, Bedrock-proxy, Vertex shim).
 
 import { describe, expect, it } from 'vitest'
+
 import { normalizeUpstream } from '../cli/daemon-control.js'
 import { resolveUpstream } from '../cli/run.js'
-import { buildUpstreamUrl, ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
+import { ANTHROPIC_UPSTREAM, buildUpstreamUrl } from '../proxy-handler.js'
 
 describe('buildUpstreamUrl', () => {
   it('preserves a non-empty upstream pathname when joining with /v1/messages', () => {
@@ -61,7 +62,7 @@ describe('resolveUpstream', () => {
     expect(resolveUpstream({}, RETCON_BASE)).toBe(ANTHROPIC_UPSTREAM)
   })
 
-  it("returns the user's ANTHROPIC_BASE_URL when set to a different provider", () => {
+  it('returns the user\'s ANTHROPIC_BASE_URL when set to a different provider', () => {
     expect(resolveUpstream({ ANTHROPIC_BASE_URL: 'https://openrouter.ai/api' }, RETCON_BASE))
       .toBe('https://openrouter.ai/api')
   })

@@ -72,13 +72,21 @@ export function findClaudeBinary(opts: FindClaudeOptions = {}): string {
 }
 
 function safeRealPath(p: string): string | null {
-  try { return fs.realpathSync(p) }
-  catch { return null }
+  try {
+    return fs.realpathSync(p)
+  }
+  catch {
+    return null
+  }
 }
 
 function isRegularFile(p: string): boolean {
-  try { return fs.statSync(p).isFile() }
-  catch { return false }
+  try {
+    return fs.statSync(p).isFile()
+  }
+  catch {
+    return false
+  }
 }
 
 /**
@@ -90,13 +98,21 @@ function isRegularFile(p: string): boolean {
  */
 function looksLikeRetconWrapper(file: string): boolean {
   let stat: fs.Stats
-  try { stat = fs.statSync(file) }
-  catch { return false }
+  try {
+    stat = fs.statSync(file)
+  }
+  catch {
+    return false
+  }
   if (!stat.isFile()) return false
   if (stat.size === 0 || stat.size > WRAPPER_MAX_SIZE_BYTES) return false
   let head: string
-  try { head = fs.readFileSync(file, 'utf8') }
-  catch { return false }
+  try {
+    head = fs.readFileSync(file, 'utf8')
+  }
+  catch {
+    return false
+  }
   if (!head.startsWith('#!')) return false
   return /\bretcon\b/.test(head)
 }

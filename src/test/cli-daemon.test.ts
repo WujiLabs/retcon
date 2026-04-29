@@ -9,7 +9,9 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
 import { runDaemon } from '../cli/daemon.js'
 
 interface HealthResponse {
@@ -31,7 +33,9 @@ async function fetchHealth(port: number): Promise<HealthResponse> {
         try {
           resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as HealthResponse)
         }
-        catch (err) { reject(err) }
+        catch (err) {
+          reject(err)
+        }
       })
     }).on('error', reject)
   })
@@ -72,8 +76,13 @@ describe('runDaemon', () => {
     let snap: HealthResponse | undefined
     const deadline = Date.now() + 3000
     while (Date.now() < deadline) {
-      try { snap = await fetchHealth(port); break }
-      catch { await new Promise(r => setTimeout(r, 50)) }
+      try {
+        snap = await fetchHealth(port)
+        break
+      }
+      catch {
+        await new Promise(r => setTimeout(r, 50))
+      }
     }
     expect(snap).toBeDefined()
     expect(snap!.name).toBe('retcon')
