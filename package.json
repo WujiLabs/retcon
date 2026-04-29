@@ -49,10 +49,8 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@ipld/dag-json": "catalog:",
     "@playtiss/core": "workspace:*",
-    "better-sqlite3": "catalog:",
-    "multiformats": "catalog:"
+    "better-sqlite3": "catalog:"
   },
   "devDependencies": {
     "@eslint/js": "catalog:",

@@ -16,12 +16,14 @@ import { type Event, type EventProducer } from '../events.js'
 import { createEventProducer } from '../events.js'
 import { createForkTools } from '../mcp-tools.js'
 import { defaultProjectors } from '../server.js'
+import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 interface TestFixture {
   db: DB
   producer: EventProducer
   tobeStore: TobeStore
+  storageProvider: SqliteStorageProvider
   tmp: string
   sessionId: string
   taskId: string
@@ -46,7 +48,8 @@ function fixture(opts: { orphan?: boolean } = {}): TestFixture {
     producer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
   }
   const taskId = (db.prepare('SELECT task_id FROM sessions WHERE id = ?').get(sessionId) as { task_id: string }).task_id
-  return { db, producer, tobeStore, tmp, sessionId, taskId, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
+  const storageProvider = new SqliteStorageProvider(db)
+  return { db, producer, tobeStore, storageProvider, tmp, sessionId, taskId, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
 }
 
 /** Helper: emit request_received with an inline body blob so fork_back can reconstruct messages. */
@@ -81,7 +84,12 @@ function emitTurn(
 }
 
 async function call(fx: TestFixture, name: string, args: unknown, forkBackEnabled = true): Promise<unknown> {
-  const tools = createForkTools({ db: fx.db, tobeStore: fx.tobeStore, forkBackEnabled })
+  const tools = createForkTools({
+    db: fx.db,
+    tobeStore: fx.tobeStore,
+    storageProvider: fx.storageProvider,
+    forkBackEnabled,
+  })
   const tool = tools.get(name)
   if (!tool) throw new Error(`no such tool: ${name}`)
   return tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer })
@@ -273,7 +281,11 @@ describe('fork_back', () => {
     const orphan = fixture({ orphan: true })
     try {
       emitTurn(orphan, 'end_turn', [{ role: 'user', content: 'q' }])
-      const tools = createForkTools({ db: orphan.db, tobeStore: orphan.tobeStore })
+      const tools = createForkTools({
+        db: orphan.db,
+        tobeStore: orphan.tobeStore,
+        storageProvider: orphan.storageProvider,
+      })
       const tool = tools.get('fork_back')!
       const res = await tool.handler(
         { n: 1, message: 'alt' },

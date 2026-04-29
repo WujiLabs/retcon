@@ -3,67 +3,64 @@
 //
 // Helpers for turning request/response bodies into CIDs + BlobRefs.
 //
+// All content-addressing goes through `@playtiss/core`'s primitives so the
+// proxy can never drift from core's CID convention silently. No direct
+// `@ipld/dag-json` or `multiformats` imports live in this file (or
+// anywhere in this package post-Phase-2 of the asset-store migration).
+//
 // Two storage modes:
 //
-// 1. blobRefFromBytes(bytes): single raw blob. Used for response bodies,
-//    redacted header blobs, and other opaque byte streams. CID is core's raw
-//    codec (sha256).
+// 1. blobRefFromBytes(bytes): single raw-codec blob. Used for response
+//    bodies, redacted header blobs, and other opaque byte streams.
 //
-// 2. blobRefFromMessagesBody(body): content-addressed split of an Anthropic
-//    /v1/messages request body. Each entry in `messages[]` and `tools[]` is
-//    encoded as its own dag-json blob. The top body is then re-encoded with
-//    those entries replaced by CID links. Same logical message across
-//    different turns produces the same CID so storage scales linearly with
-//    NEW content rather than O(N²) with conversation length.
+// 2. blobRefFromMessagesBody(body): content-addressed split of an
+//    Anthropic /v1/messages request body. Each entry in `messages[]`
+//    and `tools[]` is encoded as its own dag-json blob (via core's
+//    `computeStorageBlock`); the top body is then re-encoded with those
+//    entries replaced by CID links. Same logical message across turns
+//    produces the same CID (Merkle hash + canonical key ordering), so
+//    storage scales linearly with NEW content rather than O(N²) with
+//    conversation length.
 //
-// Reading: `loadHydratedMessagesBody(db, topCid)` walks the link references
-// in the top blob and reassembles a fully-expanded body (messages + tools
-// inline). Falls back to a flat JSON parse for legacy / non-split blobs.
+// Reading: `loadHydratedMessagesBody(provider, topCid)` calls core's
+// `load()` to fetch the top blob (returning AssetValue with AssetLinks
+// inline), then `resolve()` for each `messages[]` and `tools[]` entry to
+// materialize them. Comparison-only callers can compare CIDs directly
+// without resolving — equivalence is the CID itself.
+//
+// CID format note: per-message CIDs use core's Merkle hash via
+// computeStorageBlock. Pre-Phase-2 retcon used a flat-hash variant. The
+// two are NOT interchangeable for nested objects (every Anthropic
+// message has a nested `content` array). Existing v0.2/v0.3 alpha DBs
+// continue to read fine — old leaf CIDs still resolve via the blobs
+// table — but new writes use the new CID values. Per the alpha
+// nuke-and-reinit policy, this isn't a migration; old + new can coexist.
 
-import * as dagJSON from '@ipld/dag-json'
-import type { AssetId } from '@playtiss/core'
-import { cidToAssetId, computeTopBlock } from '@playtiss/core'
-import * as Block from 'multiformats/block'
-import { CID } from 'multiformats/cid'
-import { sha256 } from 'multiformats/hashes/sha2'
+import {
+  type AssetId,
+  type AssetValue,
+  CID,
+  computeStorageBlock,
+  load,
+  resolve,
+  type StorageProvider,
+} from '@playtiss/core'
 
-import type { DB } from './db.js'
 import type { BlobRef } from './events.js'
 
 /**
  * Compute the CID of a raw byte buffer and return a BlobRef ready for emit.
- * The CID is derived using core's raw codec (sha256) so it matches the
- * convention of `@playtiss/core` storage consumers.
+ * For Uint8Array input, computeStorageBlock uses core's raw codec (sha256),
+ * matching the @playtiss/core storage convention.
  */
 export async function blobRefFromBytes(bytes: Uint8Array): Promise<{
   cid: AssetId
   ref: BlobRef
 }> {
-  const { cid, bytes: storedBytes } = await computeTopBlock(bytes)
-  const assetId = cidToAssetId(cid)
+  const { cid, bytes: storedBytes } = await computeStorageBlock(bytes)
   return {
-    cid: assetId,
-    ref: { cid: assetId, bytes: storedBytes },
-  }
-}
-
-/**
- * Encode a single value as a dag-json block. Returns the CID + bytes ready
- * to write to the blobs table. Unlike `computeTopBlock`, this does NOT
- * recurse into nested structures — the value is encoded as a single dag-json
- * payload. Use this for message and tool entries: same logical message
- * always produces the same CID (dag-json sorts keys canonically) so two
- * turns that re-include the same prior message dedupe perfectly.
- */
-async function encodeDagJsonBlock(value: unknown): Promise<{ cid: AssetId, bytes: Uint8Array }> {
-  const block = await Block.encode({
-    value: value as never,
-    codec: dagJSON,
-    hasher: sha256,
-  })
-  return {
-    cid: cidToAssetId(block.cid as unknown as CID),
-    bytes: block.bytes,
+    cid,
+    ref: { cid, bytes: storedBytes },
   }
 }
 
@@ -113,7 +110,7 @@ export async function blobRefFromMessagesBody(body: Uint8Array): Promise<Message
   if (Array.isArray(parsed.messages)) {
     const messageLinks: CID[] = []
     for (const msg of parsed.messages) {
-      const block = await encodeDagJsonBlock(msg)
+      const block = await computeStorageBlock(msg as AssetValue)
       refs.push({ cid: block.cid, bytes: block.bytes })
       messageLinks.push(CID.parse(block.cid))
     }
@@ -123,7 +120,7 @@ export async function blobRefFromMessagesBody(body: Uint8Array): Promise<Message
   if (Array.isArray(parsed.tools)) {
     const toolLinks: CID[] = []
     for (const tool of parsed.tools) {
-      const block = await encodeDagJsonBlock(tool)
+      const block = await computeStorageBlock(tool as AssetValue)
       refs.push({ cid: block.cid, bytes: block.bytes })
       toolLinks.push(CID.parse(block.cid))
     }
@@ -131,80 +128,75 @@ export async function blobRefFromMessagesBody(body: Uint8Array): Promise<Message
   }
 
   // Encode the top body with messages/tools replaced by CID links.
-  const top = await encodeDagJsonBlock(linkified)
+  const top = await computeStorageBlock(linkified as AssetValue)
   refs.push({ cid: top.cid, bytes: top.bytes })
 
   return { topCid: top.cid, refs }
 }
 
 /**
- * Hydrate a messages-body blob: load the top blob, follow `messages[]` and
- * `tools[]` links, return a fully-expanded JS object suitable for callers
- * that need to read the original request body (e.g. fork_back's reconstruction).
+ * Hydrate a messages-body blob: load the top blob via the StorageProvider,
+ * resolve each `messages[]` and `tools[]` link, return a fully-expanded JS
+ * object suitable for callers that need the original request body (e.g.
+ * fork_back's reconstruction).
  *
  * Returns null if:
- *   - the top CID isn't in the blobs table
- *   - the top blob isn't dag-json (likely a legacy raw blob — caller should
- *     fall back to the legacy path)
+ *   - the top CID isn't in the provider (fetchBuffer threw)
+ *   - the top blob's decoded value isn't an object (raw codec / array /
+ *     primitive — caller should fall back to the legacy raw-JSON path)
  *
- * Tolerates partially-missing leaves: if a single message blob is gone for
- * some reason, that entry is dropped from the result rather than aborting
- * the whole hydration. The reconstruction is "best effort" by design.
+ * Tolerates partially-missing leaves: if a single message blob is gone
+ * for some reason, that entry is dropped from the result rather than
+ * aborting the whole hydration. The reconstruction is "best effort" by
+ * design.
  *
- * Format-detection is sniff-based: any dag-json blob whose `messages[]` is
- * an array of CID-typed entries gets the link-walk path; anything else
- * falls through. That works as long as nuke-and-reinit is the schema-bump
- * policy (a future format change can't accidentally collide because the
- * old DB is gone). When real migrations land (Phase 2), revisit by adding
- * a magic version field to the linkified top blob, e.g.
- * `{__retcon_split: 1, messages: [...links...], tools: [...]}`.
+ * Format detection is sniff-based: any top blob whose decoded value is
+ * an object with `messages: CID[]` (and/or `tools: CID[]`) is treated as
+ * the link-walk format. That works as long as nuke-and-reinit is the
+ * schema-bump policy. When real migrations land, add a magic version
+ * field, e.g. `{__retcon_split: 1, messages: [...], tools: [...]}`.
  */
-export function loadHydratedMessagesBody(
-  db: DB,
+export async function loadHydratedMessagesBody(
+  provider: StorageProvider,
   topCid: AssetId,
-): Record<string, unknown> | null {
-  const topRow = db
-    .prepare('SELECT bytes FROM blobs WHERE cid = ?')
-    .get(topCid) as { bytes: Uint8Array } | undefined
-  if (!topRow) return null
-
-  let decoded: unknown
+): Promise<Record<string, unknown> | null> {
+  let topValue: AssetValue
   try {
-    decoded = dagJSON.decode(topRow.bytes)
+    topValue = await load(topCid, provider)
   }
   catch {
-    // Not a dag-json blob — caller can choose to retry as raw JSON.
     return null
   }
-  if (typeof decoded !== 'object' || decoded === null) return null
+  if (topValue instanceof Uint8Array) return null
+  if (topValue === null || typeof topValue !== 'object' || Array.isArray(topValue)) {
+    return null
+  }
 
-  const top = decoded as Record<string, unknown>
+  const top = topValue as Record<string, AssetValue>
   const result: Record<string, unknown> = { ...top }
 
   if (Array.isArray(top.messages)) {
-    result.messages = top.messages
-      .map(entry => resolveLink(db, entry))
-      .filter((m): m is unknown => m !== undefined)
+    result.messages = await materializeEntries(top.messages, provider)
   }
   if (Array.isArray(top.tools)) {
-    result.tools = top.tools
-      .map(entry => resolveLink(db, entry))
-      .filter((t): t is unknown => t !== undefined)
+    result.tools = await materializeEntries(top.tools, provider)
   }
   return result
 }
 
-function resolveLink(db: DB, entry: unknown): unknown | undefined {
-  const cid = CID.asCID(entry)
-  if (!cid) return entry // already inline (legacy / non-link entry)
-  const row = db
-    .prepare('SELECT bytes FROM blobs WHERE cid = ?')
-    .get(cid.toString()) as { bytes: Uint8Array } | undefined
-  if (!row) return undefined // missing leaf — skip
-  try {
-    return dagJSON.decode(row.bytes)
-  }
-  catch {
-    return undefined
-  }
+async function materializeEntries(
+  entries: unknown[],
+  provider: StorageProvider,
+): Promise<unknown[]> {
+  const materialized = await Promise.all(
+    entries.map(async (entry) => {
+      try {
+        return await resolve(entry as AssetValue, provider)
+      }
+      catch {
+        return undefined
+      }
+    }),
+  )
+  return materialized.filter((m): m is AssetValue => m !== undefined)
 }

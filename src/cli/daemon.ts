@@ -37,6 +37,7 @@ import { closeDb, migrate, openDb } from '../db.js'
 import { createForkTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { createDefaultProducer, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
+import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
 
@@ -70,7 +71,8 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
 
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())
-  const mcpTools = createForkTools({ db, tobeStore, forkBackEnabled: true })
+  const storageProvider = new SqliteStorageProvider(db)
+  const mcpTools = createForkTools({ db, tobeStore, storageProvider, forkBackEnabled: true })
 
   const handle = await startServer({
     port,

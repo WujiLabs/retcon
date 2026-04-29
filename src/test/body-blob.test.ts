@@ -13,6 +13,7 @@ import {
   loadHydratedMessagesBody,
 } from '../body-blob.js'
 import { type DB, migrate, openDb } from '../db.js'
+import { SqliteStorageProvider } from '../storage.js'
 
 function buildBody(messages: unknown[], tools?: unknown[]): Uint8Array {
   const body: Record<string, unknown> = { model: 'claude-test', messages }
@@ -103,15 +104,20 @@ describe('loadHydratedMessagesBody', () => {
     ]
     const split = await blobRefFromMessagesBody(buildBody(messages))
     writeBlobs(db, split.refs)
-    const hydrated = loadHydratedMessagesBody(db, split.topCid)
+    const provider = new SqliteStorageProvider(db)
+    const hydrated = await loadHydratedMessagesBody(provider, split.topCid)
     expect(hydrated).not.toBeNull()
     expect(hydrated!.messages).toEqual(messages)
     db.close()
   })
 
-  it('returns null when the top blob is missing', () => {
+  it('returns null when the top blob is missing', async () => {
     const db = freshDb()
-    const result = loadHydratedMessagesBody(db, 'bafyMISSING')
+    const provider = new SqliteStorageProvider(db)
+    // CID.parse needs a syntactically-valid CID string; use a real CID
+    // for a value we never persisted so fetchBuffer throws "Blob not found".
+    const orphan = await blobRefFromBytes(new TextEncoder().encode('orphan'))
+    const result = await loadHydratedMessagesBody(provider, orphan.cid)
     expect(result).toBeNull()
     db.close()
   })
@@ -126,7 +132,8 @@ describe('loadHydratedMessagesBody', () => {
     const split = await blobRefFromMessagesBody(buildBody(messages))
     // Write everything except the SECOND leaf.
     writeBlobs(db, [split.refs[0], split.refs[2], split.refs[3]])
-    const hydrated = loadHydratedMessagesBody(db, split.topCid)
+    const provider = new SqliteStorageProvider(db)
+    const hydrated = await loadHydratedMessagesBody(provider, split.topCid)
     expect(hydrated).not.toBeNull()
     expect(hydrated!.messages).toHaveLength(2)
     db.close()
@@ -136,9 +143,10 @@ describe('loadHydratedMessagesBody', () => {
     const db = freshDb()
     const blob = await blobRefFromBytes(new TextEncoder().encode('not-dag-json'))
     writeBlobs(db, [blob.ref])
-    // loadHydratedMessagesBody should refuse a non-dag-json blob; caller
+    const provider = new SqliteStorageProvider(db)
+    // loadHydratedMessagesBody should refuse a raw-codec blob; caller
     // handles the legacy path elsewhere.
-    const result = loadHydratedMessagesBody(db, blob.cid)
+    const result = await loadHydratedMessagesBody(provider, blob.cid)
     expect(result).toBeNull()
     db.close()
   })

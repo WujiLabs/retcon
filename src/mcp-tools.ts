@@ -15,7 +15,7 @@
 // fork_bookmark's G10 guard: reject when no closed_forkable Revision exists
 // yet for this session.
 
-import type { AssetId } from '@playtiss/core'
+import type { AssetId, StorageProvider } from '@playtiss/core'
 import { generateTraceId } from '@playtiss/core'
 
 import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
@@ -40,6 +40,10 @@ export const FORK_SHOW_MAX_DEPTH = 1000
 interface ForkToolDeps {
   db: DB
   tobeStore: TobeStore
+  /** Same DB, but accessed via the @playtiss/core StorageProvider
+   *  contract. body-blob's hydrate path goes through here instead of
+   *  raw `SELECT bytes FROM blobs WHERE cid = ?`. */
+  storageProvider: StorageProvider
   /** When false, fork_back returns an error + emits fork.back_disabled_rejected. */
   forkBackEnabled?: boolean
 }
@@ -85,12 +89,6 @@ function mostRecentForkableRevision(db: DB, taskId: string): RevisionRow | undef
      WHERE task_id = ? AND classification = 'closed_forkable' AND sealed_at IS NOT NULL
      ORDER BY sealed_at DESC, id DESC LIMIT 1
   `).get(taskId) as RevisionRow | undefined
-}
-
-function loadBlob(db: DB, cid: string): Uint8Array | undefined {
-  const row = db.prepare('SELECT bytes FROM blobs WHERE cid = ?').get(cid) as
-    | { bytes: Uint8Array } | undefined
-  return row?.bytes
 }
 
 /**
@@ -385,7 +383,7 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
       // to the target's own request body if no child exists OR the child's
       // body is malformed. This maximises the chance of a successful fork
       // reconstruction on imperfect data.
-      const baseMessages = reconstructForkMessages(deps.db, target)
+      const baseMessages = await reconstructForkMessages(deps, target)
       if (!baseMessages) {
         return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
       }
@@ -473,35 +471,47 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
  * via loadHydratedMessagesBody so the messages[] array we return is
  * fully expanded inline, not link refs.
  */
-export function reconstructForkMessages(db: DB, target: RevisionRow): unknown[] | null {
-  const child = firstChild(db, target.id)
+export async function reconstructForkMessages(
+  deps: { db: DB, storageProvider: StorageProvider },
+  target: RevisionRow,
+): Promise<unknown[] | null> {
+  const child = firstChild(deps.db, target.id)
   if (child) {
-    const childCid = requestBodyCidFor(db, child.id)
+    const childCid = requestBodyCidFor(deps.db, child.id)
     if (childCid) {
-      const messages = hydrateMessages(db, childCid as AssetId)
+      const messages = await hydrateMessages(deps, childCid as AssetId)
       if (messages && messages.length > 0) {
         // Drop child_user_input. Result ends at target's assistant response.
         return messages.slice(0, -1)
       }
     }
   }
-  const targetCid = requestBodyCidFor(db, target.id)
+  const targetCid = requestBodyCidFor(deps.db, target.id)
   if (targetCid) {
-    const messages = hydrateMessages(db, targetCid as AssetId)
+    const messages = await hydrateMessages(deps, targetCid as AssetId)
     if (messages) return [...messages]
   }
   return null
 }
 
-function hydrateMessages(db: DB, cid: AssetId): unknown[] | null {
+async function hydrateMessages(
+  deps: { storageProvider: StorageProvider },
+  cid: AssetId,
+): Promise<unknown[] | null> {
   // Try the content-addressed (link-ified) layout first.
-  const hydrated = loadHydratedMessagesBody(db, cid)
+  const hydrated = await loadHydratedMessagesBody(deps.storageProvider, cid)
   if (hydrated && Array.isArray(hydrated.messages)) {
     return hydrated.messages
   }
-  // Legacy fallback: a single raw blob containing JSON for the whole body.
-  const bytes = loadBlob(db, cid)
-  if (!bytes) return null
+  // Legacy fallback: a single raw-codec blob containing JSON for the
+  // whole body. fetchBuffer throws on missing; treat that as null.
+  let bytes: Uint8Array
+  try {
+    bytes = await deps.storageProvider.fetchBuffer(cid)
+  }
+  catch {
+    return null
+  }
   try {
     const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
     if (Array.isArray(parsed.messages)) return parsed.messages
