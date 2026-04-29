@@ -2,6 +2,11 @@
 
 Deferred from v1 launch. Source-of-truth alignment docs: `~/filo/collaboration-protocol/v1/`.
 
+## P1 — fork persistence follow-ups
+
+- [ ] **Validate persistent fork under `/compact`** — Claude's `/compact` summarizes the EARLIEST messages in claude's local jsonl. The proxy's `branch_context_json` is the source of truth for what the model sees, so a compacted claude body should not corrupt the forked branch (the suffix-after-penultimate-user algo only reads the tail of claude's body). Worth a tmux test that explicitly triggers `/compact` mid-fork and asserts the model still answers from the forked context. Defer to v1.1.
+- [ ] **Content-addressed message storage in blobs table** — currently every `/v1/messages` request body is stored as one whole blob. Storage scales O(N²) as the conversation grows, since each turn re-includes all prior messages. Refactor so each message in the `messages` array is serialized + hashed individually (DAG-JSON via `@playtiss/core`'s `computeTopBlock`), stored as its own blob, and replaced with a CID link in the parent body. Same for `tools[]` entries (they rarely change across turns and should dedupe perfectly). Keep `sessions.branch_context_json` as fully-expanded JSON for hot-path performance — only the projector blob storage needs to be link-ified. Reader (`reconstructForkMessages` in `mcp-tools.ts`) needs a "follow-links and hydrate" step to assemble full messages from a link-ified body. ~250 LOC + tests; defer to v1.1.
+
 ## P1 — protocol architecture (ready for `/plan-eng-review` against alignment docs)
 
 - [ ] **Channel interface adoption** — wrap retcon SQLite + blob store as a `@playtiss/core` Channel impl. (playtiss-proxy-alignment.md §7.2)

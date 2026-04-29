@@ -31,12 +31,7 @@ import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
 import type { SessionQueue } from './session-queue.js'
-import {
-  extractAssistantMessageFromJsonBody,
-  extractAssistantMessageFromSseBody,
-  extractStopReasonFromJsonBody,
-  extractStopReasonFromSseBody,
-} from './sse-parser.js'
+import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
@@ -168,23 +163,39 @@ function applyTobe(
 
 /**
  * Persistent fork-context rewrite. If the session has a `branch_context_json`
- * stored (set by `fork_back` and updated after each successful response),
- * splice it into claude's outgoing /v1/messages request body.
+ * stored (set by `fork_back`), splice it into claude's outgoing /v1/messages
+ * request body and persist the extended branch_context for next time.
  *
- * Build rule:
- *   - If branch_context's tail is `role: assistant` (= the previous turn in
- *     this branch is settled), append claude's last `role: user` text input
- *     and send `[branch_context, claude_last_user]`.
- *   - If branch_context's tail is `role: user` (= just after fork_back, no
- *     response yet), send branch_context as-is.
+ * Algorithm: claude's body always carries the model's view of the
+ * conversation, ending with the new user input. We extract the suffix
+ * AFTER the penultimate user message — that suffix is exactly "what claude
+ * added since our last upstream call": the previous turn's assistant
+ * message (which claude assembled from the SSE stream itself), plus any
+ * tool_use / tool_result rounds, plus the fresh user input. Append that
+ * suffix to branch_context_json.
  *
- * Skips the rewrite (returns null) when:
+ * Why penultimate user (and not "anything after last assistant"): tool
+ * round-trips have multiple alternating user/assistant entries within a
+ * single turn from the user's POV (asst tool_use → user tool_result →
+ * asst final_text). The last user message is always the one we're about
+ * to ask the model about. The penultimate user message is the one we
+ * already sent upstream last time. Everything between those two indices
+ * is the model's intermediate output that claude already assembled for
+ * us — no need to parse the SSE response ourselves.
+ *
+ * Special case: the FIRST /v1/messages after fork_back is handled by TOBE
+ * (existing flow). branch_context_json is set to [..., fork_user] at that
+ * point. After TOBE commits, this function takes over for subsequent
+ * turns. The penultimate-user algorithm naturally aligns: claude's body
+ * by then contains [..., user_that_triggered_fork_back, asst_response,
+ * new_user_input], and the suffix after `user_that_triggered_fork_back`
+ * picks up exactly the assistant + new user input we want to fold in.
+ *
+ * Returns null (pass-through) when:
  *   - branch_context_json is unset
  *   - claude's body isn't parseable JSON
- *   - claude's last message isn't a plain user message (e.g., mid-tool-use
- *     with role:user content blocks containing tool_result — preserving the
- *     tool round-trip is more important than persisting the fork in that
- *     edge case)
+ *   - claude has fewer than 2 user messages (shouldn't happen post-fork
+ *     since the fork always followed at least 2 user turns)
  */
 function applyBranchContextRewrite(
   rawBody: Buffer,
@@ -218,35 +229,43 @@ function applyBranchContextRewrite(
     return null
   }
 
-  const lastBranch = branchContext[branchContext.length - 1] as { role?: string }
-  let messagesToSend: unknown[]
-
-  if (lastBranch?.role === 'user') {
-    // Just after fork_back: branch_context already contains the new user msg.
-    messagesToSend = [...branchContext]
+  // Find the penultimate user-role message in claude's body. Everything
+  // after it is what claude has added since our last upstream send.
+  const userIndices: number[] = []
+  for (let i = 0; i < parsedBody.messages.length; i++) {
+    const m = parsedBody.messages[i] as { role?: string }
+    if (m?.role === 'user') userIndices.push(i)
   }
-  else {
-    // Branch tail is an assistant turn; we need claude's new user message.
-    const lastClaude = parsedBody.messages[parsedBody.messages.length - 1] as {
-      role?: string
-      content?: unknown
-    }
-    if (lastClaude?.role !== 'user') return null
-    // Skip rewrite when claude is mid-tool-roundtrip (last "user" msg has a
-    // tool_result block). Letting claude's body pass through preserves the
-    // tool result; subsequent /v1/messages will pick rewriting back up.
-    if (Array.isArray(lastClaude.content)) {
-      const hasToolResult = (lastClaude.content as unknown[]).some(
-        (c): boolean =>
-          typeof c === 'object'
-          && c !== null
-          && (c as { type?: string }).type === 'tool_result',
-      )
-      if (hasToolResult) return null
-    }
-    messagesToSend = [...branchContext, lastClaude]
+  if (userIndices.length < 2) {
+    // Claude's body only has one user message — nothing has happened since
+    // fork_back from claude's POV. Send branch_context as-is (this is the
+    // hook-fires-first race; uncommon but defensible).
+    const messagesToSend = [...branchContext]
+    return finalizeRewrite(parsedBody, messagesToSend, db, sessionId, branchContext)
   }
+  const penultimateIdx = userIndices[userIndices.length - 2]
+  const claudeSuffix = parsedBody.messages.slice(penultimateIdx + 1)
 
+  const messagesToSend = [...branchContext, ...claudeSuffix]
+  return finalizeRewrite(parsedBody, messagesToSend, db, sessionId, branchContext)
+}
+
+/**
+ * Helper: serialize the rewritten body, persist the extended branch_context
+ * (only when it actually grew so daemon-restart-then-replay stays idempotent),
+ * and return.
+ */
+function finalizeRewrite(
+  parsedBody: { messages?: unknown[] },
+  messagesToSend: unknown[],
+  db: DB,
+  sessionId: string,
+  prevBranchContext: unknown[],
+): { body: Buffer, sentMessages: unknown[] } {
+  if (messagesToSend.length > prevBranchContext.length) {
+    db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
+      .run(JSON.stringify(messagesToSend), sessionId)
+  }
   const rewrittenBody = Buffer.from(
     JSON.stringify({ ...parsedBody, messages: messagesToSend }),
     'utf8',
@@ -324,14 +343,9 @@ async function dispatch(
     source_view_id: string
     original_body_cid: string
   } | undefined
-  // Track the messages we actually send upstream so we can persist the
-  // assistant turn into branch_context_json after a successful response.
-  // Empty array means "this request didn't apply any fork-context rewrite."
-  let sentMessages: unknown[] = []
   if (pending) {
     const { rewritten, originalBody } = applyTobe(rawBody, pending)
     bodyToForward = rewritten
-    sentMessages = pending.messages
     const originalCid = (await blobRefFromBytes(originalBody)).cid
     tobeAppliedFrom = {
       fork_point_revision_id: pending.fork_point_revision_id,
@@ -351,7 +365,6 @@ async function dispatch(
     const rewriteOutcome = applyBranchContextRewrite(rawBody, sessionId, ctx.db)
     if (rewriteOutcome) {
       bodyToForward = rewriteOutcome.body
-      sentMessages = rewriteOutcome.sentMessages
     }
   }
 
@@ -563,42 +576,23 @@ async function dispatch(
           const respBodyBlob = await blobRefFromBytes(rawResponse)
 
           let stopReason: string | null = null
-          let assistantMessage: { role: 'assistant', content: unknown[] } | null = null
           try {
             const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
             const text = decompressed.toString('utf8')
-            if (isSse) {
-              stopReason = extractStopReasonFromSseBody(text)
-              assistantMessage = extractAssistantMessageFromSseBody(text)
-            }
-            else {
-              stopReason = extractStopReasonFromJsonBody(text)
-              assistantMessage = extractAssistantMessageFromJsonBody(text)
-            }
+            stopReason = isSse
+              ? extractStopReasonFromSseBody(text)
+              : extractStopReasonFromJsonBody(text)
           }
           catch {
             stopReason = null
           }
-
-          // Persist forked-branch progression: if this request applied either
-          // TOBE or branch_context_rewrite, append the assistant turn to
-          // sessions.branch_context_json so the next /v1/messages from claude
-          // continues building on the same branch instead of reverting to
-          // claude's local jsonl history.
-          //
-          // Only advance on closed_forkable responses (end_turn / stop_sequence).
-          // Tool_use / open / dangling responses don't make a coherent branch
-          // tail to extend from.
-          if (
-            sentMessages.length > 0
-            && assistantMessage
-            && (stopReason === 'end_turn' || stopReason === 'stop_sequence')
-            && ctx.db
-          ) {
-            const newContext = [...sentMessages, assistantMessage]
-            ctx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
-              .run(JSON.stringify(newContext), sessionId)
-          }
+          // We intentionally don't parse the upstream response to harvest the
+          // assistant message for branch_context_json. Instead, the next
+          // /v1/messages from claude will arrive with the assistant turn
+          // already folded into claude's body — applyBranchContextRewrite
+          // walks claude's body to find the suffix-after-penultimate-user
+          // and appends it. Letting claude do its own SSE assembly keeps us
+          // out of the response-format business.
 
           if (clientAborted) {
             emitTerminal(
