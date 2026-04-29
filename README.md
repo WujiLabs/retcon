@@ -18,14 +18,31 @@ npm install -g @playtiss/retcon
 
 ```bash
 retcon                              # spawn claude under retcon (default)
+retcon --actor alice                # tag this session as belonging to "alice"
 retcon --resume                     # resume a previous claude session
 retcon --resume <session-id>        # resume a specific session
 retcon --continue                   # resume the most recent session
 retcon stop                         # stop the background daemon
 retcon status                       # daemon state, uptime, disk usage
+retcon clean --actor X              # wipe every session tagged with X (dry-run)
+retcon clean --actor X --yes        # apply the wipe
 ```
 
 `retcon` runs claude as a child process. The detached daemon listens on `127.0.0.1:4099` (override with `RETCON_PORT`) and outlives any single claude invocation, so your fork history persists across sessions. Closing claude does NOT close the daemon.
+
+## Persistent fork branches
+
+Once you run `fork_back`, retcon doesn't just rewrite one /v1/messages call — it keeps the forked branch alive across every subsequent turn until you start a new session, run `/clear`, or run `/compact` inside claude. Each new turn from claude is spliced onto the fork's history at the penultimate-user message, so the upstream Anthropic API sees a coherent conversation that picks up from your edit instead of from claude's local jsonl.
+
+The branch survives daemon restarts, `claude --resume`, and `claude --continue`. Run a fresh `fork_back` to switch branches. Run `/clear` or `/compact` inside claude to release the fork and let claude's local view drive future turns.
+
+## Actors and cleanup
+
+Every session is tagged with an actor name. The default actor is `default`; pass `--actor <name>` to scope a session under your own tag (1–64 characters, `[A-Za-z0-9_-]`).
+
+`retcon clean --actor <name>` wipes every row associated with that actor: events, branch_views, revisions, tasks, sessions, pending registrations, and the per-session TOBE pending files on disk. Defaults to dry-run; pass `--yes` to apply. Refuses to run while the daemon is up unless you pass `--force`.
+
+This is destructive of the event log (the source-of-truth append-only history) for that actor. The intended use is cleaning up integration-test runs and unwanted exploration. Other actors' data is untouched.
 
 ## Fork tools
 
@@ -67,6 +84,7 @@ retcon injects `--session-id`, `--mcp-config`, `--settings`, `ANTHROPIC_BASE_URL
 
 | You provide | retcon's behavior |
 |---|---|
+| `--actor <name>` | consumed by retcon (not forwarded to claude); tags this session for grouping / cleanup |
 | `--session-id <uuid>` (new session) | adopted as the binding token |
 | `--mcp-config` with other servers | passes through (claude unions across multiple flags) |
 | `--mcp-config` with `mcpServers.retcon` | error: rename your entry |
@@ -106,7 +124,8 @@ Provider credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, `OPE
 - `GET /health` → `{name, version, port, pid, started_at, uptime_s, sessions, db_size_bytes, upstream}`
 - `POST /v1/*` → transparent proxy to the configured upstream
 - `POST /mcp` / `GET /mcp` / `DELETE /mcp` → MCP Streamable HTTP transport
-- `POST /hooks/session-start` → SessionStart hook receiver (binding-token rebind)
+- `POST /hooks/session-start` → SessionStart hook receiver (binding-token rebind, `/clear` and `/compact` invalidation)
+- `POST /actor/register` → records `{transport_id, actor}` so the projector stamps the right actor on the session row when its first event lands
 
 ## License
 

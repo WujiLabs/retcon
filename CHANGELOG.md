@@ -2,6 +2,39 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.3.0-alpha.0] - 2026-04-29
+
+The release where retcon's forks stop being one-shot. After `fork_back` you can keep going. Plus actor tagging + cleanup, content-addressed message storage that scales linearly with conversation length, and graceful handling of `/clear` and `/compact` inside claude.
+
+### Added
+
+- **Persistent fork branches.** Once you run `fork_back`, the forked branch stays alive for every subsequent /v1/messages turn until you start a new session, run `/clear`, or run `/compact`. Each new turn from claude gets spliced onto the fork's history at the penultimate-user message, so Anthropic sees a coherent conversation that picks up from your edit instead of from claude's local jsonl. Survives daemon restarts, `claude --resume`, and `claude --continue`. Run another `fork_back` to switch branches.
+- **`--actor <name>` flag.** Tag a session under your own actor name for grouping and selective cleanup. 1–64 chars, `[A-Za-z0-9_-]`. Default actor is `default`. retcon also records the actor via a new `/actor/register` endpoint so the projector stamps it on the session row when the first event lands, even across daemon restarts between CLI launch and claude's first request.
+- **`retcon clean --actor X` subcommand.** Wipe every row associated with sessions tagged under X: events, branch_views, revisions, tasks, sessions, pending registrations, and per-session TOBE pending files on disk. Defaults to dry-run; pass `--yes` to apply. Pass `--force` to override the daemon-running guard. Intended for cleaning up integration-test runs.
+- **Content-addressed `/v1/messages` request bodies.** Each message and tool entry is hashed individually and stored as its own blob; the top body is encoded with CID links to those leaves. Identical messages across turns dedup perfectly, so storage no longer scales O(N²) with conversation length. The `system-reminder` user turn that claude replays on every request now costs one blob instead of N copies of the same bytes.
+- **Graceful `/clear` and `/compact` handling.** When you run `/clear` or `/compact` inside claude, the SessionStart hook fires with the matching source. retcon drops the persistent fork override (which would otherwise re-inflate the body claude just wiped or compacted) and lets claude's local view drive future upstream calls. Each clear/compact emits a `session.branch_context_cleared` audit event.
+- **`session.branch_context_overflow` audit event.** Hard cap at 8 MiB on the JSON-encoded fork branch context. Past that the column is NULL'd, the event fires, and the next request forwards claude's body unchanged. Hitting the cap means something went wrong (runaway tool loop, adversarial driver) — well past any model's actual context window.
+- **`/actor/register` endpoint.** retcon CLI hits this at launch with the (transport_id, actor) pair so the projector can stamp the right actor on the session row. Persistent (vs in-memory) so a daemon restart between CLI register-time and the first event landing doesn't lose the actor. Stale entries (over an hour old) are garbage-collected on daemon startup.
+- **Fork persistence assumption test suite.** `cli-tmux-assumptions.test.ts` codifies the Claude Code behaviors retcon depends on (SessionStart firing on clear / compact / resume, --session-id UUID validation, --session-id+--resume conflict, fork_back stop_reason classification, MCP inputSchema requirement). Gated behind `RETCON_TEST_ASSUMPTIONS=1` so it runs on a release-checklist cadence, not every PR. Failure = a claude update changed an assumption and we need to adjust.
+
+### Changed
+
+- **Schema bumped to v5.** Phase 2 (below) shifted per-message CIDs from a flat hash to a Merkle hash; bumping the schema forces nuke-and-reinit on upgrade per the alpha policy so dedup stays consistent. Existing `~/.retcon/proxy.db` from 0.2.x will be wiped on first launch.
+- **`branch_context_json` column on sessions.** New TEXT column holding the persistent fork's full message history. NULL when the session is on its main branch.
+- **`pending_actors` table.** Maps `transport_id → actor` for the brief window between `/actor/register` and the first `/v1/*` event.
+- **`actor` column on sessions.** Default `'default'`; set from the pending registration on first event.
+- **SessionStart hook now classifies four sources.** `startup`, `resume`, `clear`, `compact` — each handled distinctly. `clear` and `compact` invalidate `branch_context_json`; `resume` performs the binding-token rebind; `startup` is the no-op for the new-session path.
+
+### For contributors
+
+- **`store / load / resolve` moved from the SDK (`playtiss/asset-store`) to `@playtiss/core`.** The proxy's body-blob.ts now consumes those primitives directly, dropped its private dag-json helper and `@ipld/dag-json` + `multiformats` direct deps. Same on-disk shape for inline encodings; per-message CIDs use a Merkle hash now (hence the schema bump). See `@playtiss/core` 0.2.0-alpha.0.
+- **New utility modules.** `src/util/actor-name.ts` (single source of truth for `ACTOR_RE`, `DEFAULT_ACTOR`, `validateActor`); `src/util/http-body.ts` (shared `readBoundedBody` helper used by both `/hooks/session-start` and `/actor/register`).
+- **`SqliteStorageProvider` threaded through `ForkToolDeps` to mcp-tools.** Hydrate path now goes through `@playtiss/core`'s `load` + `resolve` rather than raw SQL on the blobs table.
+- **Test count: 294 unit + 9 skipped + 2 gated tmux integration.** ~85 new tests across the release covering: `applyBranchContextRewrite` (7 cases including the 8 MiB overflow), `ActorConflictError` paths in `rebindSession` (6 cases), `handleActorRegister` HTTP boundary (8 cases + GC sweep), `handleSessionStartHook` over real `node:http` (11 cases), `readBoundedBody` (7 cases including slow-loris guard), branch-context-overflow integration through the proxy server, `detectLiveDaemon` (4 PID states), body-blob non-object guard + tools[] round-trip, binding-table bare-pending rebind, fork_back no-source-blob fallback, retcon-clean orphan-pending-actors paths, parseCleanArgs --force + missing-value-for-actor errors.
+- **DRY cleanups.** Extracted `ACTOR_RE` (3 sites) and bounded-body reader (2 sites) to shared utils. `'default'` literal (5 sites in binding-table.ts + 1 in sessions-v1.ts) replaced with the `DEFAULT_ACTOR` constant. `schema_version` DDL deduplicated (3 sites in db.ts). `--actor` end-of-args silently passed through to claude; now throws `missing value for --actor`. Body-blob non-object JSON inputs (top-level array, null, primitive) used to silently spread index keys into the linkified top blob; now fall back to the single-raw-blob path. `applyBranchContextRewrite` return type dropped its dead `sentMessages` field.
+- **Comments fixed.** F4 guard top-of-file comment was stale (claimed it rejects `open` / `in_flight`; actually walks past them to the nearest settled ancestor). `actor-register.ts` SQL comment said "INSERT OR REPLACE" but the SQL is `ON CONFLICT DO UPDATE` (and the comment now explains why we picked it). `applyBranchContextRewrite` JSDoc was orphaned by an adjacent const declaration; reordered.
+- **`bindingTable.unset` on `ActorConflictError`.** Hook-handler now rolls back the speculative `bindingTable.set()` when `rebindSession` throws, so in-memory routing matches the rolled-back DB state. Previously a 409 left the in-memory binding active, causing split-brain.
+
 ## [0.2.1-alpha.0] - 2026-04-28
 
 Hardening pass on top of 0.2.0. No new user-facing features, but fewer surprises across the realistic shapes of a real user's environment.
