@@ -166,3 +166,119 @@ export function extractStopReasonFromSseBody(body: string): string | null {
   parser.end()
   return parser.snapshot().stopReason
 }
+
+/**
+ * Walk a buffered (already-decompressed) Anthropic SSE response body and
+ * assemble the assistant message it represents. Used by proxy-handler to
+ * persist completed assistant turns into a session's branch_context_json
+ * so multi-turn forks can keep accumulating context across requests.
+ *
+ * Returns an `{ role: 'assistant', content }` message, or null if the body
+ * doesn't decode as a parseable Anthropic SSE stream. Content is built from
+ * `content_block_start` + `content_block_delta` events, indexed by
+ * `content_block_index`. Currently handles `text` and `tool_use` blocks
+ * (the only two Anthropic emits today).
+ */
+export function extractAssistantMessageFromSseBody(
+  body: string,
+): { role: 'assistant', content: unknown[] } | null {
+  // Per-content-block accumulators keyed by index.
+  const blocks = new Map<number, AssemblingBlock>()
+  // Normalize line endings, then iterate frames separated by blank lines.
+  const normalized = body.replace(/\r\n/g, '\n')
+  const frames = normalized.split('\n\n')
+  for (const frame of frames) {
+    let dataText = ''
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data:')) continue
+      let val = line.slice(5)
+      if (val.startsWith(' ')) val = val.slice(1)
+      dataText += dataText.length > 0 ? `\n${val}` : val
+    }
+    if (!dataText) continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(dataText)
+    }
+    catch {
+      continue
+    }
+    if (typeof parsed !== 'object' || parsed === null) continue
+    const ev = parsed as Record<string, unknown>
+    const type = ev.type
+    if (type === 'content_block_start') {
+      const idx = ev.index as number | undefined
+      const block = ev.content_block as Record<string, unknown> | undefined
+      if (typeof idx !== 'number' || !block) continue
+      const blockType = block.type as string | undefined
+      if (blockType === 'text') {
+        blocks.set(idx, { kind: 'text', text: typeof block.text === 'string' ? block.text : '' })
+      }
+      else if (blockType === 'tool_use') {
+        blocks.set(idx, {
+          kind: 'tool_use',
+          id: typeof block.id === 'string' ? block.id : '',
+          name: typeof block.name === 'string' ? block.name : '',
+          inputJson: '',
+        })
+      }
+    }
+    else if (type === 'content_block_delta') {
+      const idx = ev.index as number | undefined
+      const delta = ev.delta as Record<string, unknown> | undefined
+      if (typeof idx !== 'number' || !delta) continue
+      const cur = blocks.get(idx)
+      if (!cur) continue
+      if (delta.type === 'text_delta' && cur.kind === 'text') {
+        if (typeof delta.text === 'string') cur.text += delta.text
+      }
+      else if (delta.type === 'input_json_delta' && cur.kind === 'tool_use') {
+        if (typeof delta.partial_json === 'string') cur.inputJson += delta.partial_json
+      }
+    }
+  }
+
+  if (blocks.size === 0) return null
+  const sortedIndices = Array.from(blocks.keys()).sort((a, b) => a - b)
+  const content: unknown[] = []
+  for (const i of sortedIndices) {
+    const b = blocks.get(i)
+    if (!b) continue
+    if (b.kind === 'text') {
+      content.push({ type: 'text', text: b.text })
+    }
+    else {
+      let input: unknown = {}
+      try {
+        input = b.inputJson ? JSON.parse(b.inputJson) : {}
+      }
+      catch {
+        input = {}
+      }
+      content.push({ type: 'tool_use', id: b.id, name: b.name, input })
+    }
+  }
+  return { role: 'assistant', content }
+}
+
+type AssemblingBlock
+  = | { kind: 'text', text: string }
+    | { kind: 'tool_use', id: string, name: string, inputJson: string }
+
+/**
+ * Extract the assistant message from a non-streaming JSON Anthropic response.
+ * Returns null if the body isn't parseable JSON or lacks role+content.
+ */
+export function extractAssistantMessageFromJsonBody(
+  body: string,
+): { role: 'assistant', content: unknown[] } | null {
+  try {
+    const parsed = JSON.parse(body) as { role?: unknown, content?: unknown }
+    if (parsed.role !== 'assistant') return null
+    if (!Array.isArray(parsed.content)) return null
+    return { role: 'assistant', content: [...parsed.content] }
+  }
+  catch {
+    return null
+  }
+}

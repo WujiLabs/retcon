@@ -323,24 +323,45 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
         return { error: 'fork_back requires an MCP-initialized session (orphan sessions cannot fork)' }
       }
 
-      // F4: reject if the current head is open (mid-tool-use) or in_flight.
-      const currentHead = mostRecentRevision(deps.db, sess.task_id)
-      if (!currentHead) {
+      // F4: locate the effective head we'll walk back from.
+      //
+      // The most-recent revision overall might be `open` (mid-tool-use) or
+      // `in_flight` (request_received, no response yet). Both states are the
+      // expected case when claude calls fork_back from inside a tool-use
+      // round-trip — the /v1/messages that triggered the tool is itself
+      // mid-flight. Treating that as a hard error would make fork_back
+      // unusable from inside claude. Instead, walk past open/in_flight
+      // revisions (only those in-flight states) to the nearest non-in-flight
+      // ancestor, which becomes the effective head we walk back from.
+      //
+      // A `dangling_unforkable` head is NOT walked past — that's a terminal
+      // failure state (max_tokens, refusal, upstream_error) and a valid
+      // anchor to fork backward from.
+      let effectiveHead: RevisionRow | undefined = mostRecentRevision(deps.db, sess.task_id)
+      if (!effectiveHead) {
         return { error: 'no turns yet — nothing to fork from' }
       }
-      if (currentHead.classification === 'open' || currentHead.classification === 'in_flight') {
+      while (effectiveHead
+        && (effectiveHead.classification === 'open'
+          || effectiveHead.classification === 'in_flight')) {
+        if (!effectiveHead.parent_revision_id) {
+          effectiveHead = undefined
+          break
+        }
+        effectiveHead = loadRevision(deps.db, effectiveHead.parent_revision_id)
+      }
+      if (!effectiveHead) {
         return {
-          error: `cannot fork while current turn is ${currentHead.classification}; wait for it to close`,
-          current_classification: currentHead.classification,
+          error: 'cannot fork: no settled (non-in-flight) revision available',
         }
       }
 
-      // Walk back `n` closed_forkable Revisions. We always start walking from
-      // the current head's parent (the current head itself is "where we are";
-      // n=1 means go to the nearest parent forkable, n=2 means two back, etc).
+      // Walk back `n` closed_forkable Revisions from the effective head's
+      // parent. The effective head itself is "where we are"; we don't count
+      // it.
       let target: RevisionRow | undefined
       let walked = 0
-      let cursor: string | null = currentHead.parent_revision_id
+      let cursor: string | null = effectiveHead.parent_revision_id
       while (walked < n) {
         if (!cursor) break
         const rev: RevisionRow | undefined = loadRevision(deps.db, cursor)
@@ -387,6 +408,20 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
         source_view_id: ctx.sessionId, // placeholder until explicit source view passed in
       })
 
+      // Persistent fork branch context: write the full forked messages array
+      // (history up to the fork point + the new user input from `message`) to
+      // sessions.branch_context_json. Subsequent /v1/messages from claude get
+      // their messages array rewritten to this context (plus claude's new user
+      // input when the branch's tail is an assistant message). After each
+      // successful upstream response, the daemon appends the assistant turn
+      // to branch_context_json so the conversation persistently continues on
+      // the forked branch instead of reverting to claude's local jsonl.
+      //
+      // baseMessages already ends with the fork's new user message — that's
+      // what we want as the first thing upstream responds to.
+      deps.db.prepare(`UPDATE sessions SET branch_context_json = ? WHERE id = ?`)
+        .run(JSON.stringify(baseMessages), ctx.sessionId)
+
       ctx.producer.emit(
         'fork.back_requested',
         {
@@ -414,32 +449,52 @@ export function createForkTools(deps: ForkToolDeps): Map<string, McpTool> {
 }
 
 /**
- * Reconstruct the messages[] array at a fork point. Tries the earliest
- * child's request body first (contains target's assistant response); if that
- * fails (no child / missing blob / malformed JSON), falls back to the
- * target's OWN request body (won't include target's assistant response but
- * is a valid conversation prefix).
+ * Reconstruct the messages[] array AT (i.e. up to and including) a fork
+ * point's assistant response. Two source preferences:
  *
- * Returns null only if NEITHER source yields a valid messages array.
+ * 1. Earliest child's request body, with the LAST entry sliced off. The
+ *    child's body has the form `[...history, target_assistant_response,
+ *    child_user_input]`; we want the prefix up through the assistant
+ *    response, so dropping the last entry (the to-be-rolled-back user
+ *    message) gives exactly that.
+ *
+ * 2. Fallback: target's OWN request body. Doesn't contain target's
+ *    assistant response but is a valid conversation prefix. Used only
+ *    when no child exists or its body is unavailable.
+ *
+ * Returns null only if neither source yields a valid messages array.
+ *
+ * Without the slice in case 1, the rolled-back user input would land
+ * back in the upstream request — defeating the fork.
  */
-function reconstructForkMessages(db: DB, target: RevisionRow): unknown[] | null {
-  const attempts: string[] = []
+export function reconstructForkMessages(db: DB, target: RevisionRow): unknown[] | null {
   const child = firstChild(db, target.id)
   if (child) {
     const childCid = requestBodyCidFor(db, child.id)
-    if (childCid) attempts.push(childCid)
+    if (childCid) {
+      const bytes = loadBlob(db, childCid)
+      if (bytes) {
+        try {
+          const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
+          if (Array.isArray(parsed.messages) && parsed.messages.length > 0) {
+            // Drop child_user_input. Result ends at target's assistant response.
+            return parsed.messages.slice(0, -1)
+          }
+        }
+        catch { /* fall through to target's own body */ }
+      }
+    }
   }
   const targetCid = requestBodyCidFor(db, target.id)
-  if (targetCid) attempts.push(targetCid)
-
-  for (const cid of attempts) {
-    const bytes = loadBlob(db, cid)
-    if (!bytes) continue
-    try {
-      const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
-      if (Array.isArray(parsed.messages)) return [...parsed.messages]
+  if (targetCid) {
+    const bytes = loadBlob(db, targetCid)
+    if (bytes) {
+      try {
+        const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { messages?: unknown[] }
+        if (Array.isArray(parsed.messages)) return [...parsed.messages]
+      }
+      catch { /* nothing else to try */ }
     }
-    catch { /* try next */ }
   }
   return null
 }

@@ -183,22 +183,46 @@ describe('fork_back', () => {
   })
   afterEach(() => fx.cleanup())
 
-  it('F4: rejects when current head classification is open', async () => {
+  it('F4: walks past an open head to the nearest closed_forkable ancestor', async () => {
+    // Scenario: q1 closed, then q2 issued tool_use (head = open). Claude calls
+    // fork_back from inside that tool-use round-trip. The expected behavior
+    // is to skip past the open revision (the tool-call turn we're literally
+    // inside of) and treat q1 as the effective head. Since q1 has no parent,
+    // n=1 still errors — but with "no available turns" not "head is open."
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // leaves head=open
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // head=open
     const res = await call(fx, 'fork_back', { n: 1, message: 'alt' }) as { error: string }
-    expect(res.error).toMatch(/mid-tool-use|open/)
+    expect(res.error).toMatch(/forkable turns available/)
   })
 
-  it('F4: rejects when current head is in_flight (no response yet)', async () => {
+  it('F4: walks past an open head and finds n forkable turns when they exist', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }]) // head=open
+    // n=1: from inside the tool-use turn, walk past it to q2 (effective head),
+    // then go back one closed_forkable → land at q1. Should succeed.
+    const res = await call(fx, 'fork_back', { n: 1, message: 'alt' }) as {
+      status?: string
+      error?: string
+    }
+    expect(res.error).toBeUndefined()
+    expect(res.status).toBe('scheduled')
+  })
+
+  it('F4: errors when no settled revision exists (everything in_flight)', async () => {
     fx.producer.emit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b' },
       fx.sessionId,
     )
-    // No response_completed yet — head stays in_flight.
+    // No response_completed yet — head stays in_flight, no ancestor to fall
+    // back to. fork_back should error with the no-settled-revision message.
     const res = await call(fx, 'fork_back', { n: 1, message: 'alt' }) as { error: string }
-    expect(res.error).toMatch(/in_flight|turn is/)
+    expect(res.error).toMatch(/no settled/)
   })
 
   it('writes TOBE + emits fork.back_requested + returns scheduled', async () => {

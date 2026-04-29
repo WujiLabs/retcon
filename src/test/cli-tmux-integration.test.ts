@@ -342,4 +342,218 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     )
     expect(forkPointTaskId).toBe(originalTaskId)
   }, 240000)
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Persistent fork: messages AFTER fork_back continue building on the
+  // forked branch instead of reverting to claude's local jsonl history.
+  //
+  // What this catches: an earlier implementation of fork_back was one-shot —
+  // TOBE swap on the immediate-next /v1/messages, then claude's subsequent
+  // turns sent its own (un-forked) history upstream. The forked context
+  // disappeared after one turn. With branch_context_json on the session row,
+  // every /v1/messages while the branch is active gets rewritten to use the
+  // forked context, and each successful response appends back into the
+  // context so the conversation persistently continues on the branch.
+  //
+  // Test design:
+  //   1. Start retcon, run two warmup turns introducing TWO different
+  //      "secret words" (ZEBRA first, then AARDVARK).
+  //   2. Call fork_back(n=1) which rolls back the AARDVARK turn and asks
+  //      "What is the secret word?" — model should answer ZEBRA, the only
+  //      word in the forked branch's context.
+  //   3. Send a follow-up "Tell me again, what is the secret word?" — model
+  //      should STILL answer ZEBRA (this is the persistence check; without
+  //      branch_context_json it would see AARDVARK in claude's local jsonl
+  //      and answer AARDVARK).
+  //   4. Kill the tmux session and re-launch with `retcon --resume <id>`.
+  //      Ask one more time — should still answer ZEBRA (proves
+  //      branch_context_json survives daemon restart and resume binding).
+  //
+  // We assert via the branch_context_json column on the session row, which
+  // accumulates each (user, assistant) pair as turns happen. Counting
+  // assistant messages and checking each contains "ZEBRA" but never
+  // "AARDVARK" is reliable across model variation in exact wording.
+  it('fork_back persists across multiple turns AND across --resume', async () => {
+    const FORK_ACTOR = `${TEST_ACTOR}-persist`
+    const FORK_SESSION = 'retcon-vitest-itest-fork'
+    const FORK_RESUME_SESSION = 'retcon-vitest-itest-fork-resume'
+
+    // Pre-clean any leftover state from a prior run.
+    try {
+      execFileSync('retcon', ['clean', '--actor', FORK_ACTOR, '--yes'], { stdio: 'ignore' })
+    }
+    catch { /* fine */ }
+    try {
+      tmux('kill-session', '-t', FORK_SESSION)
+    }
+    catch { /* none */ }
+    try {
+      tmux('kill-session', '-t', FORK_RESUME_SESSION)
+    }
+    catch { /* none */ }
+
+    try {
+      tmux(
+        'new-session', '-d', '-s', FORK_SESSION, '-x', '200', '-y', '50',
+        `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --actor ${FORK_ACTOR} --effort low`,
+      )
+      await waitFor(
+        () => /auto mode/.test(tmux('capture-pane', '-t', FORK_SESSION, '-p')),
+        20000,
+        'fork-test claude UI render',
+      )
+      await waitFor(
+        () => sql(`SELECT COUNT(*) FROM sessions WHERE actor='${FORK_ACTOR}'`).length > 0,
+        20000,
+        `${FORK_ACTOR} session row to exist`,
+      )
+      const sessId = sql(
+        `SELECT id FROM sessions WHERE actor='${FORK_ACTOR}' ORDER BY created_at DESC LIMIT 1`,
+      )
+      expect(sessId).toMatch(/^[a-f0-9-]{36}$/)
+      const taskId = sql(`SELECT task_id FROM sessions WHERE id='${sessId}'`)
+
+      // Two warmup turns introducing distinguishable secret words. We assert
+      // closed_forkable revision count grows so the fork target exists.
+      const warmup = async (msg: string, expectedRevCount: number): Promise<void> => {
+        tmux('send-keys', '-t', FORK_SESSION, msg)
+        tmux('send-keys', '-t', FORK_SESSION, 'C-m')
+        await waitFor(
+          () => parseInt(sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10) >= expectedRevCount,
+          45000,
+          `closed_forkable revisions >= ${expectedRevCount}`,
+        )
+      }
+      await warmup('Remember the secret word ZEBRA. Reply with just OK.', 1)
+      await warmup('Remember the secret word AARDVARK. Reply with just OK.', 2)
+
+      // Trigger fork_back. This:
+      //   - rolls back to before AARDVARK was introduced
+      //   - sends the new question through the TOBE swap
+      //   - sets sessions.branch_context_json so subsequent turns continue
+      //     on the forked branch
+      tmux('send-keys', '-t', FORK_SESSION,
+        'Call mcp__retcon__fork_back with arguments {"n":1, '
+        + '"message":"What is the secret word? Reply EXACTLY ONE WORD, no punctuation."}. '
+        + 'Then in your reply, just say DONE.',
+      )
+      tmux('send-keys', '-t', FORK_SESSION, 'C-m')
+
+      await waitFor(
+        () => parseInt(sql(`SELECT COUNT(*) FROM events WHERE session_id='${sessId}' AND topic='fork.back_requested'`), 10) >= 1,
+        90000,
+        'fork.back_requested event',
+      )
+      // After fork_back fires, sessions.branch_context_json must be populated.
+      await waitFor(
+        () => parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10) > 0,
+        10000,
+        'branch_context_json populated after fork_back',
+      )
+
+      // Wait for the TOBE-applied response to land (this is the immediate
+      // next /v1/messages, where upstream sees the forked context and
+      // responds with ZEBRA).
+      const ctxAfterTurn1 = parseInt(
+        sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10,
+      )
+
+      // Persistence check #1: send a follow-up turn. With persistent fork,
+      // the daemon rewrites this /v1/messages using branch_context_json,
+      // so the model still sees the forked context and answers ZEBRA.
+      tmux('send-keys', '-t', FORK_SESSION,
+        'Tell me again, what is the secret word? Reply EXACTLY ONE WORD.')
+      tmux('send-keys', '-t', FORK_SESSION, 'C-m')
+
+      await waitFor(
+        () => {
+          const len = parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10)
+          return len > ctxAfterTurn1
+        },
+        45000,
+        'branch_context_json grows after follow-up turn',
+      )
+
+      // The branch_context_json should contain "ZEBRA" in its assistant
+      // messages and never "AARDVARK". Use SQLite's instr() — testing JSON
+      // shape from shell is awkward.
+      const hasZebra = parseInt(
+        sql(`SELECT instr(branch_context_json, 'ZEBRA') FROM sessions WHERE id='${sessId}'`), 10,
+      )
+      const hasAardvark = parseInt(
+        sql(`SELECT instr(branch_context_json, 'AARDVARK') FROM sessions WHERE id='${sessId}'`), 10,
+      )
+      expect(hasZebra).toBeGreaterThan(0)
+      // Note: branch_context_json may contain "AARDVARK" if the model
+      // happens to mention it in some response (unlikely with our prompts
+      // but possible). The key invariant we test below is that the model's
+      // ANSWER matches the forked context — which is what proxy-handler
+      // sends upstream. We rely on the model + prompt to be consistent.
+      expect(hasAardvark).toBe(0)
+
+      // Persistence check #2: kill the tmux session and resume the same
+      // session id. branch_context_json is on the DB so it should survive.
+      try {
+        tmux('kill-session', '-t', FORK_SESSION)
+      }
+      catch { /* fine */ }
+      // Brief pause so the kill propagates before we relaunch.
+      await sleep(1500)
+
+      const ctxAfterTurn2 = parseInt(
+        sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10,
+      )
+      tmux(
+        'new-session', '-d', '-s', FORK_RESUME_SESSION, '-x', '200', '-y', '50',
+        `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --resume ${sessId} --effort low`,
+      )
+      await waitFor(
+        () => /auto mode/.test(tmux('capture-pane', '-t', FORK_RESUME_SESSION, '-p')),
+        30000,
+        'resumed claude UI render (fork test)',
+      )
+
+      tmux('send-keys', '-t', FORK_RESUME_SESSION,
+        'One more time: what is the secret word? Reply EXACTLY ONE WORD.')
+      tmux('send-keys', '-t', FORK_RESUME_SESSION, 'C-m')
+
+      await waitFor(
+        () => {
+          const len = parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10)
+          return len > ctxAfterTurn2
+        },
+        60000,
+        'branch_context_json grows after post-resume turn',
+      )
+
+      // Final assertion: still has ZEBRA, still no AARDVARK.
+      const hasZebraFinal = parseInt(
+        sql(`SELECT instr(branch_context_json, 'ZEBRA') FROM sessions WHERE id='${sessId}'`), 10,
+      )
+      const hasAardvarkFinal = parseInt(
+        sql(`SELECT instr(branch_context_json, 'AARDVARK') FROM sessions WHERE id='${sessId}'`), 10,
+      )
+      expect(hasZebraFinal).toBeGreaterThan(0)
+      expect(hasAardvarkFinal).toBe(0)
+    }
+    finally {
+      try {
+        tmux('kill-session', '-t', FORK_SESSION)
+      }
+      catch { /* fine */ }
+      try {
+        tmux('kill-session', '-t', FORK_RESUME_SESSION)
+      }
+      catch { /* fine */ }
+      // Self-clean test data so re-runs start fresh.
+      try {
+        execFileSync('retcon', ['stop'], { stdio: 'ignore' })
+      }
+      catch { /* fine */ }
+      try {
+        execFileSync('retcon', ['clean', '--actor', FORK_ACTOR, '--yes'], { stdio: 'ignore' })
+      }
+      catch { /* fine */ }
+    }
+  }, 360000)
 })

@@ -129,6 +129,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
     forkAwaiter,
     bindingTable,
+    db: options.db,
   }
   const mcpCtx: McpContext = {
     producer: options.producer,

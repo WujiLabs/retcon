@@ -17,7 +17,7 @@ import Database from 'better-sqlite3'
 
 export type DB = Database.Database
 
-export const CURRENT_SCHEMA_VERSION = 3
+export const CURRENT_SCHEMA_VERSION = 4
 
 const SOURCE_OF_TRUTH_SCHEMA = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -56,7 +56,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   ended_at INTEGER,
   pid INTEGER,
   harness TEXT,
-  actor TEXT NOT NULL DEFAULT 'default'
+  actor TEXT NOT NULL DEFAULT 'default',
+  -- Persistent fork branch context. NULL when the session is on its
+  -- main branch; otherwise a JSON array of messages representing the
+  -- full conversation in the active forked branch (history up to the
+  -- fork point + every user/assistant pair since). proxy-handler reads
+  -- this on every /v1/messages and rewrites the upstream body to use
+  -- it as the messages array (plus claude's new user input when the
+  -- branch's tail is an assistant turn). Updated after every 2xx
+  -- response. Survives daemon restarts and --resume so cross-resume
+  -- forks stay coherent.
+  branch_context_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_actor ON sessions(actor);
 

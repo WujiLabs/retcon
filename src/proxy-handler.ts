@@ -25,12 +25,18 @@ import zlib from 'node:zlib'
 
 import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes } from './body-blob.js'
+import type { DB } from './db.js'
 import type { EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
 import type { SessionQueue } from './session-queue.js'
-import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
+import {
+  extractAssistantMessageFromJsonBody,
+  extractAssistantMessageFromSseBody,
+  extractStopReasonFromJsonBody,
+  extractStopReasonFromSseBody,
+} from './sse-parser.js'
 import type { TobePending, TobeStore } from './tobe.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
@@ -107,6 +113,14 @@ export interface ProxyContext {
    * id (which becomes the canonical session_id for new sessions).
    */
   readonly bindingTable?: BindingTable
+  /**
+   * Optional DB handle. When provided, dispatch reads sessions.branch_context_json
+   * to apply persistent fork rewrites to /v1/messages, and writes back the new
+   * branch state after each successful upstream response. Without this handle
+   * the proxy still works for non-fork traffic; fork persistence simply degrades
+   * to TOBE one-shot behavior.
+   */
+  readonly db?: DB
 }
 
 /**
@@ -150,6 +164,94 @@ function applyTobe(
   catch {
     return { rewritten: body, originalBody: body }
   }
+}
+
+/**
+ * Persistent fork-context rewrite. If the session has a `branch_context_json`
+ * stored (set by `fork_back` and updated after each successful response),
+ * splice it into claude's outgoing /v1/messages request body.
+ *
+ * Build rule:
+ *   - If branch_context's tail is `role: assistant` (= the previous turn in
+ *     this branch is settled), append claude's last `role: user` text input
+ *     and send `[branch_context, claude_last_user]`.
+ *   - If branch_context's tail is `role: user` (= just after fork_back, no
+ *     response yet), send branch_context as-is.
+ *
+ * Skips the rewrite (returns null) when:
+ *   - branch_context_json is unset
+ *   - claude's body isn't parseable JSON
+ *   - claude's last message isn't a plain user message (e.g., mid-tool-use
+ *     with role:user content blocks containing tool_result — preserving the
+ *     tool round-trip is more important than persisting the fork in that
+ *     edge case)
+ */
+function applyBranchContextRewrite(
+  rawBody: Buffer,
+  sessionId: string,
+  db: DB,
+): { body: Buffer, sentMessages: unknown[] } | null {
+  const row = db
+    .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
+    .get(sessionId) as { branch_context_json: string | null } | undefined
+  if (!row?.branch_context_json) return null
+
+  let branchContext: unknown[]
+  try {
+    const parsed = JSON.parse(row.branch_context_json) as unknown
+    if (!Array.isArray(parsed)) return null
+    branchContext = parsed
+  }
+  catch {
+    return null
+  }
+  if (branchContext.length === 0) return null
+
+  let parsedBody: { messages?: unknown[] }
+  try {
+    parsedBody = JSON.parse(rawBody.toString('utf8')) as { messages?: unknown[] }
+  }
+  catch {
+    return null
+  }
+  if (!Array.isArray(parsedBody.messages) || parsedBody.messages.length === 0) {
+    return null
+  }
+
+  const lastBranch = branchContext[branchContext.length - 1] as { role?: string }
+  let messagesToSend: unknown[]
+
+  if (lastBranch?.role === 'user') {
+    // Just after fork_back: branch_context already contains the new user msg.
+    messagesToSend = [...branchContext]
+  }
+  else {
+    // Branch tail is an assistant turn; we need claude's new user message.
+    const lastClaude = parsedBody.messages[parsedBody.messages.length - 1] as {
+      role?: string
+      content?: unknown
+    }
+    if (lastClaude?.role !== 'user') return null
+    // Skip rewrite when claude is mid-tool-roundtrip (last "user" msg has a
+    // tool_result block). Letting claude's body pass through preserves the
+    // tool result; subsequent /v1/messages will pick rewriting back up.
+    if (Array.isArray(lastClaude.content)) {
+      const hasToolResult = (lastClaude.content as unknown[]).some(
+        (c): boolean =>
+          typeof c === 'object'
+          && c !== null
+          && (c as { type?: string }).type === 'tool_result',
+      )
+      if (hasToolResult) return null
+    }
+    messagesToSend = [...branchContext, lastClaude]
+  }
+
+  const rewrittenBody = Buffer.from(
+    JSON.stringify({ ...parsedBody, messages: messagesToSend }),
+    'utf8',
+  )
+  return { body: rewrittenBody, sentMessages: messagesToSend }
 }
 
 async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Promise<Buffer> {
@@ -222,14 +324,34 @@ async function dispatch(
     source_view_id: string
     original_body_cid: string
   } | undefined
+  // Track the messages we actually send upstream so we can persist the
+  // assistant turn into branch_context_json after a successful response.
+  // Empty array means "this request didn't apply any fork-context rewrite."
+  let sentMessages: unknown[] = []
   if (pending) {
     const { rewritten, originalBody } = applyTobe(rawBody, pending)
     bodyToForward = rewritten
+    sentMessages = pending.messages
     const originalCid = (await blobRefFromBytes(originalBody)).cid
     tobeAppliedFrom = {
       fork_point_revision_id: pending.fork_point_revision_id,
       source_view_id: pending.source_view_id,
       original_body_cid: originalCid,
+    }
+  }
+  else if (isMessagesPath && ctx.db) {
+    // No TOBE pending — check if this session is on a forked branch and, if
+    // so, rewrite messages so the upstream sees the forked context plus
+    // claude's new user input. Non-fork sessions skip this entirely.
+    //
+    // We deliberately don't set tobe_applied_from here; the default parent-
+    // linking ("most recent sealed revision in task") naturally lands on the
+    // previous turn within the active branch, since the active branch's tail
+    // is always the most recent sealed revision after fork_back.
+    const rewriteOutcome = applyBranchContextRewrite(rawBody, sessionId, ctx.db)
+    if (rewriteOutcome) {
+      bodyToForward = rewriteOutcome.body
+      sentMessages = rewriteOutcome.sentMessages
     }
   }
 
@@ -441,15 +563,41 @@ async function dispatch(
           const respBodyBlob = await blobRefFromBytes(rawResponse)
 
           let stopReason: string | null = null
+          let assistantMessage: { role: 'assistant', content: unknown[] } | null = null
           try {
             const decompressed = await decompressIfNeeded(rawResponse, contentEncoding)
             const text = decompressed.toString('utf8')
-            stopReason = isSse
-              ? extractStopReasonFromSseBody(text)
-              : extractStopReasonFromJsonBody(text)
+            if (isSse) {
+              stopReason = extractStopReasonFromSseBody(text)
+              assistantMessage = extractAssistantMessageFromSseBody(text)
+            }
+            else {
+              stopReason = extractStopReasonFromJsonBody(text)
+              assistantMessage = extractAssistantMessageFromJsonBody(text)
+            }
           }
           catch {
             stopReason = null
+          }
+
+          // Persist forked-branch progression: if this request applied either
+          // TOBE or branch_context_rewrite, append the assistant turn to
+          // sessions.branch_context_json so the next /v1/messages from claude
+          // continues building on the same branch instead of reverting to
+          // claude's local jsonl history.
+          //
+          // Only advance on closed_forkable responses (end_turn / stop_sequence).
+          // Tool_use / open / dangling responses don't make a coherent branch
+          // tail to extend from.
+          if (
+            sentMessages.length > 0
+            && assistantMessage
+            && (stopReason === 'end_turn' || stopReason === 'stop_sequence')
+            && ctx.db
+          ) {
+            const newContext = [...sentMessages, assistantMessage]
+            ctx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
+              .run(JSON.stringify(newContext), sessionId)
           }
 
           if (clientAborted) {
