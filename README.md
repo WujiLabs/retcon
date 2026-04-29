@@ -127,6 +127,10 @@ Provider credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, `OPE
 - `POST /hooks/session-start` → SessionStart hook receiver (binding-token rebind, `/clear` and `/compact` invalidation)
 - `POST /actor/register` → records `{transport_id, actor}` so the projector stamps the right actor on the session row when its first event lands
 
+## How it works
+
+[ARCHITECTURE.md](./ARCHITECTURE.md) covers the model: event sourcing, the fork classification, persistent fork branches via the penultimate-user splice, content-addressed message storage, actor identity + resume binding, and a component map of every file under `src/`.
+
 ## License
 
 MIT. See `LICENSE`.
