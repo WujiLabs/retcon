@@ -3,18 +3,24 @@
 //
 // HTTP hook receiver for Claude Code's SessionStart hook.
 //
-// Claude Code POSTs a JSON body to a configured URL on session start (and on
-// resume / clear / compact). We use this to learn the actual session_id for
-// resumed sessions — at retcon CLI startup we only have a binding_token T
-// (passed via x-playtiss-session header). The hook arrives with claude's
-// session_id and our binding_token (echoed via the hook's headers config),
-// letting the daemon rebind T → claude's actual session_id.
+// Claude Code POSTs a JSON body to this URL whenever a session lifecycle
+// event fires. Single hook event, four sources:
+//
+//   startup  — fresh `claude` invocation. We bind T → claude session_id.
+//   resume   — `claude --resume`. We rebind T → claude actual session_id
+//              and merge any events that landed under T pre-hook.
+//   clear    — user typed `/clear`. claude wiped its local conversation;
+//              we drop sessions.branch_context_json so the next /v1/messages
+//              isn't rewritten with a now-stale forked context.
+//   compact  — user typed `/compact`. claude rebuilt its local jsonl from
+//              a summary that already incorporated whatever forked context
+//              we'd been feeding it. Continuing to override would just
+//              re-inflate the body claude just compressed; clear the
+//              override and let claude's compacted view drive future
+//              upstream calls.
 //
 // The hook payload shape (per Claude Code docs):
-//   { session_id: string, source: "startup"|"resume"|"clear"|"compact", ... }
-//
-// We don't care about `source` here — rebind is idempotent and a no-op when
-// transport id already equals session_id (the new-session case).
+//   { session_id, source, transcript_path?, cwd?, hook_event_name }
 
 import http from 'node:http'
 
@@ -79,6 +85,7 @@ export async function handleSessionStartHook(
     res.end('hook payload missing session_id\n')
     return
   }
+  const source = typeof payload.source === 'string' ? payload.source : null
 
   // Same transport_id and session_id → new-session path, no-op rebind.
   if (transportId !== sessionId) {
@@ -118,12 +125,31 @@ export async function handleSessionStartHook(
     }
     ctx.producer.emit(
       'session.rebound',
-      { binding_token: transportId, session_id: sessionId, source: typeof payload.source === 'string' ? payload.source : null },
+      { binding_token: transportId, session_id: sessionId, source },
       sessionId,
     )
   }
   else {
     ctx.bindingTable.set(transportId, sessionId)
+  }
+
+  // Clear any active fork override on /clear or /compact. claude has just
+  // dropped or rewritten its local conversation history; persisting our
+  // own override past that point would either re-inflate the bytes claude
+  // just compressed (compact) or revive a conversation the user explicitly
+  // wiped (clear). Either way, hand the wheel back to claude.
+  if (source === 'clear' || source === 'compact') {
+    const result = ctx.db
+      .prepare(`UPDATE sessions SET branch_context_json = NULL
+                WHERE id = ? AND branch_context_json IS NOT NULL`)
+      .run(sessionId)
+    if (result.changes > 0) {
+      ctx.producer.emit(
+        'session.branch_context_cleared',
+        { session_id: sessionId, source },
+        sessionId,
+      )
+    }
   }
 
   // Respond with continue=true so claude proceeds without injecting any
