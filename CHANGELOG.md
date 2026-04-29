@@ -2,6 +2,33 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.2.1-alpha.0] - 2026-04-28
+
+Hardening pass on top of 0.2.0. No new user-facing features, but fewer surprises across the realistic shapes of a real user's environment.
+
+### Fixed
+
+- **Custom localhost upstreams no longer get silently rerouted to api.anthropic.com.** If you set `ANTHROPIC_BASE_URL=http://localhost:8080` to point at a LiteLLM relay, devstack mock, or any other non-retcon local proxy, retcon now proxies to that URL instead of swallowing it as a self-reference. Previously the prefix check was too broad and your auth tokens could land at the wrong provider.
+- **`ANTHROPIC_CUSTOM_HEADERS` no longer accumulates stale `x-playtiss-session` lines** when retcon is invoked from a shell that re-exported headers from a previous run (or from inside a nested retcon). Pre-existing session headers are stripped before our fresh one is appended.
+- **Resume binding is now race-free.** The in-memory binding-table is updated *before* the SQL rebind transaction, so a `/v1/messages` request landing in the window between transaction commit and binding registration no longer gets stranded under the old transport id.
+- **Hook endpoint `/hooks/session-start` rejects oversize bodies.** A slow-loris-shaped local client could previously stream bytes past the 64 KiB cap indefinitely; now the connection is destroyed on overflow.
+- **Stuck daemons fail loudly instead of silently.** If `retcon stop` (or the version-replace path) sends SIGKILL and the process refuses to die, retcon refuses to delete the PID file and surfaces a clear error pointing at the offending PID. The next invocation no longer spawns a fresh daemon that immediately fails its bind.
+
+### Added
+
+- **Daemon env now passes corporate-network knobs through.** `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR` were missing from the allow-list; users behind MITM proxies or with private CA bundles previously hit silent TLS failures while their interactive `claude` worked fine.
+- **`pnpm lint` and `pnpm lint:fix` scripts** in `package.json` so the lint config stays runnable without remembering the binary path.
+
+### Changed
+
+- **SessionStart hook uses inline `node -e` instead of `curl`.** Works wherever Node runs (which is wherever claude itself runs). curl isn't always installed on minimal Linux containers, and shell variable expansion differs between sh (`$VAR`) and cmd.exe (`%VAR%`); reading the binding token via `process.env` inside the Node script sidesteps both.
+- **`loadJsonArg` file-size cap raised from 1 MiB to 10 MiB.** Real `--mcp-config` / `--settings` files are KBs to a few hundred KB; 10 MiB leaves comfortable headroom for unusual setups while still bounding worst-case allocation.
+- **`findClaudeBinary` skips PATH entries that resolve to directories.** If your PATH happened to contain a directory named `claude`, retcon would previously try to spawn it and surface `EISDIR`. Now it walks past quietly.
+
+### For contributors
+
+- Full `eslint --fix` pass across the package. 51 files touched, no behavior change. 212 unit tests + 2 tmux integration tests still pass. The remaining errors that `--fix` couldn't handle (try/catch and lambda one-liners, unused imports, one `require()` import) were resolved manually.
+
 ## [0.2.0-alpha.0] - 2026-04-28
 
 First end-to-end-usable alpha. retcon spawns claude as a child process, owns one detached daemon per machine, and now survives the realistic shapes of a real user's environment: resumed sessions, custom upstreams, wrapper scripts, conflicting flags, and stray credentials in the shell.
