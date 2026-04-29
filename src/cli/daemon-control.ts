@@ -250,6 +250,21 @@ async function stopExistingDaemon(reason: string): Promise<void> {
   if (isAlive(pid)) {
     try { process.kill(pid, 'SIGKILL') }
     catch { /* race */ }
+    // Give SIGKILL a moment to take effect (kernel needs to reap). If the
+    // process really refuses to die (zombie parent, uninterruptible sleep,
+    // permission flap), keep the PID file around so the next ensureDaemon
+    // run surfaces "another retcon claims this port" instead of spawning a
+    // fresh daemon that immediately fails its bind.
+    const sigkillDeadline = Date.now() + 500
+    while (Date.now() < sigkillDeadline && isAlive(pid)) {
+      await sleep(50)
+    }
+    if (isAlive(pid)) {
+      throw new Error(
+        `existing retcon daemon (pid ${pid}) refused to die after SIGTERM + SIGKILL. `
+        + `Investigate manually: \`ps -p ${pid}\` and \`kill -9 ${pid}\`.`,
+      )
+    }
   }
   cleanupPidFile()
 }
@@ -311,6 +326,14 @@ export function buildDaemonEnv(
     'TMPDIR', 'TMP', 'TEMP',
     'LANG', 'TZ',
     'NODE_OPTIONS', 'NODE_DEBUG', 'NODE_NO_WARNINGS', 'NODE_ENV',
+    // Network egress configuration. The daemon's outbound /v1/* requests use
+    // node:http/https directly (which don't honor HTTP_PROXY natively), but
+    // any future fetch() or upstream-side library that does will need these.
+    // Custom CA bundles ship with corporate MITM setups; without them, TLS
+    // fails silently and the user sees "daemon failed to come up" with vague
+    // errors in daemon.log.
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+    'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
     'RETCON_HOME', 'RETCON_CLI_ENTRY',
   ])
   const ALLOW_PREFIX = ['LC_']  // LC_ALL, LC_CTYPE, LC_TIME, etc.

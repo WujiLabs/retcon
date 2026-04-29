@@ -59,6 +59,9 @@ export function findClaudeBinary(opts: FindClaudeOptions = {}): string {
     const candidate = path.join(dir, 'claude')
     const realCandidate = safeRealPath(candidate)
     if (realCandidate === null) continue
+    // PATH may contain a directory named "claude" (rare but legal). Skip it
+    // so spawn doesn't error EISDIR; let the next entry win.
+    if (!isRegularFile(realCandidate)) continue
     // Same physical file as retcon → would recurse.
     if (selfRealPath !== null && realCandidate === selfRealPath) continue
     if (looksLikeRetconWrapper(realCandidate)) continue
@@ -71,6 +74,11 @@ export function findClaudeBinary(opts: FindClaudeOptions = {}): string {
 function safeRealPath(p: string): string | null {
   try { return fs.realpathSync(p) }
   catch { return null }
+}
+
+function isRegularFile(p: string): boolean {
+  try { return fs.statSync(p).isFile() }
+  catch { return false }
 }
 
 /**

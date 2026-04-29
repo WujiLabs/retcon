@@ -59,18 +59,23 @@ export interface RunAgentOptions {
  * on the child claude unchanged — claude attaches them per request and the
  * daemon forwards them as-is to the upstream provider.
  *
- * If the user already has ANTHROPIC_BASE_URL pointing at retcon's local URL
- * (e.g., they exported it in a previous shell session), don't recurse —
- * fall back to the default upstream.
+ * If the user already has ANTHROPIC_BASE_URL pointing at retcon's exact local
+ * URL (e.g., they exported it in a previous shell session), don't recurse —
+ * fall back to the default upstream. We compare strictly: a different
+ * loopback URL (like a LiteLLM relay on :8080) is a legitimate third-party
+ * upstream and we proxy to it, not to api.anthropic.com.
  */
 export function resolveUpstream(env: NodeJS.ProcessEnv, retconBaseUrl: string): string {
   const userBase = env.ANTHROPIC_BASE_URL
-  if (!userBase || userBase === retconBaseUrl) return ANTHROPIC_UPSTREAM
-  // Common loopback variants the user might set.
-  if (userBase.startsWith('http://127.0.0.1:') || userBase.startsWith('http://localhost:')) {
+  if (!userBase) return ANTHROPIC_UPSTREAM
+  if (stripTrailingSlash(userBase) === stripTrailingSlash(retconBaseUrl)) {
     return ANTHROPIC_UPSTREAM
   }
   return userBase
+}
+
+function stripTrailingSlash(s: string): string {
+  return s.endsWith('/') ? s.slice(0, -1) : s
 }
 
 /**
@@ -92,16 +97,27 @@ export function detectResumeMode(args: readonly string[]): boolean {
  * Merge retcon's ANTHROPIC_CUSTOM_HEADERS contribution with the user's value.
  * The env var format is newline-separated `Header: value` pairs (per Anthropic
  * SDK), so concatenation with `\n` is the documented merge.
+ *
+ * Strips any existing `x-playtiss-session: ...` lines from the user's value
+ * before appending ours. Without this, nested retcon invocations or shells
+ * that re-export ANTHROPIC_CUSTOM_HEADERS from a previous run accumulate
+ * stacked session headers; the daemon picks the first match and attributes
+ * events to a stale or unrelated transport id.
  */
 export function mergeCustomHeaders(
   userValue: string | undefined,
   ourHeader: string,
 ): string {
   if (!userValue || userValue.length === 0) return ourHeader
-  // Avoid double-stamping if the user (or a previous retcon invocation)
-  // already has the same header set.
-  const trimmedUser = userValue.replace(/\n+$/, '')
-  return `${trimmedUser}\n${ourHeader}`
+  // Drop any pre-existing x-playtiss-session line(s); case-insensitive on the
+  // header name, anchor on either start-of-string or newline.
+  const cleaned = userValue
+    .split('\n')
+    .filter(line => !/^\s*x-playtiss-session\s*:/i.test(line))
+    .join('\n')
+    .replace(/\n+$/, '')
+  if (cleaned.length === 0) return ourHeader
+  return `${cleaned}\n${ourHeader}`
 }
 
 /**

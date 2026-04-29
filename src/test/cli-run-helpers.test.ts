@@ -113,6 +113,22 @@ describe('mergeCustomHeaders', () => {
   it('strips trailing newlines from the user value before joining', () => {
     expect(mergeCustomHeaders('x-user: A\n\n', 'x-foo: 1')).toBe('x-user: A\nx-foo: 1')
   })
+  it('drops pre-existing x-playtiss-session lines from the user value', () => {
+    // A nested retcon (or a shell re-exporting prior CUSTOM_HEADERS) must not
+    // produce stacked x-playtiss-session lines; we'd misroute events to a
+    // stale transport id.
+    const stacked = 'x-user: A\nx-playtiss-session: stale-uuid\nx-other: B'
+    expect(mergeCustomHeaders(stacked, 'x-playtiss-session: fresh-uuid'))
+      .toBe('x-user: A\nx-other: B\nx-playtiss-session: fresh-uuid')
+  })
+  it('handles case-insensitive matching on the header name', () => {
+    expect(mergeCustomHeaders('X-Playtiss-Session: stale\nx-other: B', 'x-playtiss-session: fresh'))
+      .toBe('x-other: B\nx-playtiss-session: fresh')
+  })
+  it('returns our header alone when user value contained ONLY a stale session header', () => {
+    expect(mergeCustomHeaders('x-playtiss-session: stale', 'x-playtiss-session: fresh'))
+      .toBe('x-playtiss-session: fresh')
+  })
 })
 
 describe('detectResumeMode', () => {

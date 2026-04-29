@@ -62,6 +62,9 @@ export function removeFlag(args: readonly string[], flag: string): string[] {
   return out
 }
 
+/** Cap on a --mcp-config / --settings file we'll read for introspection. Real configs are KBs; anything bigger is a misuse and we'd rather skip than OOM. */
+const JSON_ARG_FILE_MAX_BYTES = 1024 * 1024
+
 /**
  * Resolve a --mcp-config / --settings argument value to its parsed JSON.
  * Claude accepts either inline JSON or a file path; we try JSON first and
@@ -75,7 +78,11 @@ export function loadJsonArg(value: string): unknown | null {
     try { return JSON.parse(trimmed) }
     catch { /* fall through to file attempt */ }
   }
-  try { return JSON.parse(fs.readFileSync(value, 'utf8')) }
+  try {
+    const stat = fs.statSync(value)
+    if (!stat.isFile() || stat.size > JSON_ARG_FILE_MAX_BYTES) return null
+    return JSON.parse(fs.readFileSync(value, 'utf8'))
+  }
   catch { return null }
 }
 

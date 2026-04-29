@@ -76,4 +76,30 @@ describe('buildDaemonEnv', () => {
     expect(env.MY_DB_PASSWORD).toBeUndefined()
     expect(env.INTERNAL_API_TOKEN).toBeUndefined()
   })
+
+  it('passes through corporate-network env (HTTP_PROXY / NODE_EXTRA_CA_CERTS / SSL_CERT_*)', () => {
+    // Without these, daemons behind MITM proxies or with private CA bundles
+    // get silent TLS failures — daemon.log shows ECONNREFUSED-style errors
+    // while the user's interactive `claude` works fine.
+    const env = buildDaemonEnv(
+      {
+        ...PARENT,
+        HTTP_PROXY: 'http://corp-proxy:3128',
+        HTTPS_PROXY: 'http://corp-proxy:3128',
+        NO_PROXY: 'localhost,127.0.0.1',
+        ALL_PROXY: 'socks5://corp-proxy:1080',
+        NODE_EXTRA_CA_CERTS: '/etc/ssl/corp-ca.pem',
+        SSL_CERT_FILE: '/etc/ssl/cert.pem',
+        SSL_CERT_DIR: '/etc/ssl/certs',
+      },
+      { port: 4099, upstream: 'https://api.anthropic.com' },
+    )
+    expect(env.HTTP_PROXY).toBe('http://corp-proxy:3128')
+    expect(env.HTTPS_PROXY).toBe('http://corp-proxy:3128')
+    expect(env.NO_PROXY).toBe('localhost,127.0.0.1')
+    expect(env.ALL_PROXY).toBe('socks5://corp-proxy:1080')
+    expect(env.NODE_EXTRA_CA_CERTS).toBe('/etc/ssl/corp-ca.pem')
+    expect(env.SSL_CERT_FILE).toBe('/etc/ssl/cert.pem')
+    expect(env.SSL_CERT_DIR).toBe('/etc/ssl/certs')
+  })
 })

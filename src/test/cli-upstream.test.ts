@@ -66,17 +66,26 @@ describe('resolveUpstream', () => {
       .toBe('https://openrouter.ai/api')
   })
 
-  it('does not recurse if ANTHROPIC_BASE_URL already points at retcon', () => {
+  it('does not recurse if ANTHROPIC_BASE_URL exactly equals retcon', () => {
     // Defends against the user `export ANTHROPIC_BASE_URL=http://127.0.0.1:4099`
     // in a long-lived shell — without this guard, retcon would proxy to itself.
     expect(resolveUpstream({ ANTHROPIC_BASE_URL: RETCON_BASE }, RETCON_BASE))
       .toBe(ANTHROPIC_UPSTREAM)
   })
 
-  it('treats any 127.0.0.1:* / localhost:* base as a self-reference', () => {
+  it('treats trailing-slash variants as equivalent to retcon', () => {
+    expect(resolveUpstream({ ANTHROPIC_BASE_URL: `${RETCON_BASE}/` }, RETCON_BASE))
+      .toBe(ANTHROPIC_UPSTREAM)
+  })
+
+  it('does NOT clobber a non-retcon loopback upstream (LiteLLM, devstack, etc.)', () => {
+    // The previous version of this function broadly swallowed any 127.0.0.1:*
+    // or localhost:* URL as a self-reference. That silently misrouted users
+    // running a separate local proxy on a different port — their auth tokens
+    // ended up at api.anthropic.com instead of their intended relay.
     expect(resolveUpstream({ ANTHROPIC_BASE_URL: 'http://127.0.0.1:5000' }, RETCON_BASE))
-      .toBe(ANTHROPIC_UPSTREAM)
+      .toBe('http://127.0.0.1:5000')
     expect(resolveUpstream({ ANTHROPIC_BASE_URL: 'http://localhost:9999' }, RETCON_BASE))
-      .toBe(ANTHROPIC_UPSTREAM)
+      .toBe('http://localhost:9999')
   })
 })

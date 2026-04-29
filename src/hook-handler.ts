@@ -81,6 +81,14 @@ export async function handleSessionStartHook(
 
   // Same transport_id and session_id → new-session path, no-op rebind.
   if (transportId !== sessionId) {
+    // Order matters: register the in-memory binding BEFORE the SQL rebind.
+    // If a /v1/* request lands in the window between transaction commit and
+    // bindingTable.set, it would otherwise resolve transportId → transportId
+    // (binding not yet known) and write events under the stale id. Setting
+    // the binding first means concurrent traffic immediately routes to the
+    // new sessionId; the rebind transaction then migrates any events that
+    // historically landed under transportId before the hook fired.
+    ctx.bindingTable.set(transportId, sessionId)
     rebindSession(ctx.db, transportId, sessionId)
     ctx.producer.emit(
       'session.rebound',
@@ -88,7 +96,9 @@ export async function handleSessionStartHook(
       sessionId,
     )
   }
-  ctx.bindingTable.set(transportId, sessionId)
+  else {
+    ctx.bindingTable.set(transportId, sessionId)
+  }
 
   // Respond with continue=true so claude proceeds without injecting any
   // additional context. Empty additionalContext is the documented "I have
@@ -107,16 +117,33 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
-    let overflowed = false
+    let settled = false
+    const finishOverflow = (): void => {
+      if (settled) return
+      settled = true
+      // Tear down the socket so a slow-loris client can't pin the connection
+      // by streaming bytes-past-the-limit indefinitely.
+      req.destroy()
+      reject(new Error('overflow'))
+    }
     req.on('data', (c: Buffer) => {
+      if (settled) return
       total += c.length
-      if (total > HOOK_MAX_BODY_BYTES) overflowed = true
-      else chunks.push(c)
+      if (total > HOOK_MAX_BODY_BYTES) {
+        finishOverflow()
+        return
+      }
+      chunks.push(c)
     })
     req.on('end', () => {
-      if (overflowed) reject(new Error('overflow'))
-      else resolve(Buffer.concat(chunks))
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks))
     })
-    req.on('error', reject)
+    req.on('error', (err) => {
+      if (settled) return
+      settled = true
+      reject(err)
+    })
   })
 }
