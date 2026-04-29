@@ -32,7 +32,9 @@
 
 import { randomUUID } from 'node:crypto'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
+import { validateUserArgs } from './arg-validate.js'
 import { ensureDaemon, resolvedDefaultPort } from './daemon-control.js'
+import { findClaudeBinary } from './find-claude.js'
 import { spawnAgent } from './spawn-agent.js'
 
 export interface RunAgentOptions {
@@ -85,6 +87,22 @@ export function detectResumeMode(args: readonly string[]): boolean {
 }
 
 /**
+ * Merge retcon's ANTHROPIC_CUSTOM_HEADERS contribution with the user's value.
+ * The env var format is newline-separated `Header: value` pairs (per Anthropic
+ * SDK), so concatenation with `\n` is the documented merge.
+ */
+export function mergeCustomHeaders(
+  userValue: string | undefined,
+  ourHeader: string,
+): string {
+  if (!userValue || userValue.length === 0) return ourHeader
+  // Avoid double-stamping if the user (or a previous retcon invocation)
+  // already has the same header set.
+  const trimmedUser = userValue.replace(/\n+$/, '')
+  return `${trimmedUser}\n${ourHeader}`
+}
+
+/**
  * Run the agent (typically claude) under the retcon proxy. Returns the
  * agent's exit code (or 127 if the agent binary isn't on PATH).
  */
@@ -93,6 +111,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   const host = opts.host ?? '127.0.0.1'
   const retconBaseUrl = `http://${host}:${port}`
   const upstream = resolveUpstream(process.env, retconBaseUrl)
+  const isResume = detectResumeMode(opts.args)
+
+  // Step 0: validate user args against the things we're about to inject.
+  // Surfacing a conflict here gives the user a clear message; letting it
+  // through would either silently mis-bind or produce a cryptic claude error.
+  try {
+    validateUserArgs(opts.args, isResume)
+  }
+  catch (err) {
+    process.stderr.write(`[retcon] ${(err as Error).message}\n`)
+    return 2
+  }
 
   // Step 1: ensure the daemon is running with the right upstream. Throws if
   // a foreign process owns the port OR if a retcon daemon is up but
@@ -115,7 +145,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   // For --resume/--continue we cannot pass --session-id, so this stays as a
   // binding_token until the SessionStart hook arrives with claude's real id.
   const transportId = randomUUID()
-  const isResume = detectResumeMode(opts.args)
 
   // Step 3: build the per-invocation MCP config that claude will load via
   // --mcp-config. Inline JSON keeps our config out of ~/.claude.json so
@@ -177,14 +206,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   const injectedArgs = isResume
     ? ['--mcp-config', mcpConfig, '--settings', settings]
     : ['--session-id', transportId, '--mcp-config', mcpConfig, '--settings', settings]
+  // Resolve the actual claude binary, skipping any wrapper script in PATH
+  // that re-invokes retcon (would fork-bomb). Only do this when the requested
+  // agent is the special-cased "claude"; arbitrary agent names pass through.
+  const resolvedAgent = opts.agent === 'claude' ? findClaudeBinary() : opts.agent
+
+  // Merge our session header into any user-set ANTHROPIC_CUSTOM_HEADERS
+  // (telemetry, anti-CSRF, etc.) instead of clobbering theirs.
+  const ourHeader = `x-playtiss-session: ${transportId}`
+  const mergedHeaders = mergeCustomHeaders(process.env.ANTHROPIC_CUSTOM_HEADERS, ourHeader)
+
   const result = await spawnAgent({
-    agent: opts.agent,
+    agent: resolvedAgent,
     args: [...injectedArgs, ...opts.args],
     baseUrl: `http://${host}:${port}`,
     envOverrides: {
-      // Tells claude's Anthropic SDK to add this header on every /v1/*
-      // request. Format is newline-separated `Header: value` pairs.
-      ANTHROPIC_CUSTOM_HEADERS: `x-playtiss-session: ${transportId}`,
+      // Anthropic SDK reads this on every /v1/* request. Format is newline-
+      // separated `Header: value` pairs.
+      ANTHROPIC_CUSTOM_HEADERS: mergedHeaders,
       // Available to the SessionStart command hook so it can echo the
       // binding token back to the daemon (see settings JSON above).
       RETCON_BINDING: transportId,
