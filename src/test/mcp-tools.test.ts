@@ -383,6 +383,43 @@ describe('fork_back', () => {
     expect(msgs[msgs.length - 1].content).toBe('retry')
   })
 
+  it('errors when neither child nor target body resolves (no usable source blob)', async () => {
+    // Two forkable revisions chained. fork_back n=1 makes the FIRST the
+    // target and the SECOND the child. Both event payloads carry
+    // body_cids that don't have a corresponding blob row, so
+    // reconstructForkMessages returns null down both branches.
+    const target = fx.producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-target-ghost' },
+      fx.sessionId,
+      // NO blob attached.
+    )
+    fx.producer.emit(
+      'proxy.response_completed',
+      { request_event_id: target.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
+      fx.sessionId,
+    )
+    const child = fx.producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-child-ghost' },
+      fx.sessionId,
+      // NO blob attached.
+    )
+    fx.producer.emit(
+      'proxy.response_completed',
+      { request_event_id: child.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
+      fx.sessionId,
+    )
+
+    const res = await call(fx, 'fork_back', { n: 1, message: 'retry' }) as {
+      status?: string
+      error?: string
+    }
+    expect(res.status).toBeUndefined()
+    expect(res.error).toMatch(/no usable source blob/)
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+  })
+
   it('fork_show caps walk-back depth to prevent cyclic-chain runaway (A-WR13)', async () => {
     // Emit a version, then hack its parent_version_id to point at itself
     // (simulating a corrupt projection). fork_show must NOT hang.

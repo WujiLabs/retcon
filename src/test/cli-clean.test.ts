@@ -11,7 +11,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { formatCleanResult, parseCleanArgs, runClean } from '../cli/clean.js'
+import { detectLiveDaemon, formatCleanResult, parseCleanArgs, runClean } from '../cli/clean.js'
 import { type DB, migrate, openDb } from '../db.js'
 
 describe('parseCleanArgs', () => {
@@ -171,6 +171,48 @@ describe('runClean', () => {
     const remaining = (db2.prepare(`SELECT COUNT(*) AS n FROM pending_actors WHERE actor='test'`).get() as { n: number }).n
     db2.close()
     expect(remaining).toBe(0)
+  })
+})
+
+describe('detectLiveDaemon', () => {
+  let tmpRoot: string
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(path.join(tmpdir(), 'retcon-pid-test-'))
+    process.env.RETCON_HOME = tmpRoot
+  })
+  afterEach(() => {
+    delete process.env.RETCON_HOME
+    rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  it('returns null when no PID file exists', () => {
+    expect(detectLiveDaemon()).toBeNull()
+  })
+
+  it('returns null when the PID file is empty / malformed', () => {
+    const pidPath = path.join(tmpRoot, 'proxy.pid')
+    writeFileSync(pidPath, '')
+    expect(detectLiveDaemon()).toBeNull()
+    writeFileSync(pidPath, 'not-a-number')
+    expect(detectLiveDaemon()).toBeNull()
+    writeFileSync(pidPath, '-1')
+    expect(detectLiveDaemon()).toBeNull()
+    writeFileSync(pidPath, '0')
+    expect(detectLiveDaemon()).toBeNull()
+  })
+
+  it('returns null when the PID points at a dead process', () => {
+    // 999999 is well past anything we'd realistically have running. If it
+    // happens to match a real process this test will spuriously pass via
+    // the alive-pid path, which is harmless.
+    writeFileSync(path.join(tmpRoot, 'proxy.pid'), '999999')
+    expect(detectLiveDaemon()).toBeNull()
+  })
+
+  it('returns the pid when process.kill(pid, 0) succeeds', () => {
+    // Our own PID is guaranteed to satisfy kill(pid, 0).
+    writeFileSync(path.join(tmpRoot, 'proxy.pid'), `${process.pid}\n`)
+    expect(detectLiveDaemon()).toBe(process.pid)
   })
 })
 

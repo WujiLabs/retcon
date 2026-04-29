@@ -77,6 +77,22 @@ describe('blobRefFromMessagesBody', () => {
     expect(split.refs[0].cid).toBe(split.topCid)
   })
 
+  it('falls back to a single raw blob for valid JSON that is not a plain object', async () => {
+    // The non-object guard prevents `{...parsedRaw}` of an array from
+    // copying numeric index keys into the linkified top blob, and prevents
+    // null/primitive bodies from crashing the spread.
+    for (const payload of [
+      JSON.stringify([{ role: 'user', content: 'x' }]),
+      'null',
+      '42',
+      '"a string"',
+    ]) {
+      const split = await blobRefFromMessagesBody(new TextEncoder().encode(payload))
+      expect(split.refs).toHaveLength(1)
+      expect(split.refs[0].cid).toBe(split.topCid)
+    }
+  })
+
   it('linkifies tools[] separately so identical tool definitions dedupe', async () => {
     const tools = [
       { name: 'fork_back', description: 'Roll back N turns', input_schema: { type: 'object' } },
@@ -108,6 +124,23 @@ describe('loadHydratedMessagesBody', () => {
     const hydrated = await loadHydratedMessagesBody(provider, split.topCid)
     expect(hydrated).not.toBeNull()
     expect(hydrated!.messages).toEqual(messages)
+    db.close()
+  })
+
+  it('round-trips tools[] alongside messages[]', async () => {
+    const db = freshDb()
+    const messages = [{ role: 'user', content: 'q' }]
+    const tools = [
+      { name: 'fork_back', description: 'roll back', input_schema: { type: 'object' } },
+      { name: 'fork_list', description: 'list', input_schema: { type: 'object' } },
+    ]
+    const split = await blobRefFromMessagesBody(buildBody(messages, tools))
+    writeBlobs(db, split.refs)
+    const provider = new SqliteStorageProvider(db)
+    const hydrated = await loadHydratedMessagesBody(provider, split.topCid)
+    expect(hydrated).not.toBeNull()
+    expect(hydrated!.messages).toEqual(messages)
+    expect(hydrated!.tools).toEqual(tools)
     db.close()
   })
 

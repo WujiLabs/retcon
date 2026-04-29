@@ -89,4 +89,20 @@ describe('rebindSession actor isolation', () => {
     insertSession(db, 'new-id', 'task-new', 'charlie')
     expect(() => rebindSession(db, 'old-id', 'new-id')).toThrow(ActorConflictError)
   })
+
+  it('bare-pending with no existing newId session: re-keys pending entry oldId → newId', () => {
+    // Hook-fires-first for a brand-new session: /actor/register registered
+    // an actor under the transport id, but no /v1/* event has landed yet
+    // for either oldId OR newId. The rebind moves the pending row to the
+    // new transport id so the projector picks the right actor when the
+    // session's first event arrives.
+    insertPending(db, 'old-id', 'bob')
+    rebindSession(db, 'old-id', 'new-id')
+    const oldRow = db.prepare('SELECT 1 FROM pending_actors WHERE transport_id=?').get('old-id')
+    expect(oldRow).toBeUndefined()
+    const newRow = db
+      .prepare('SELECT actor FROM pending_actors WHERE transport_id=?')
+      .get('new-id') as { actor: string } | undefined
+    expect(newRow?.actor).toBe('bob')
+  })
 })

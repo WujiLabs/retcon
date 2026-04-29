@@ -538,4 +538,69 @@ describe('proxy pass-through + event emission', () => {
     expect(stillPending).not.toBeNull()
     expect(stillPending!.fork_point_revision_id).toBe('v-keep')
   })
+
+  it('emits session.branch_context_overflow when fork context grows past 8 MiB', async () => {
+    // Seed a session whose branch_context_json is already at the cap, so
+    // any suffix from claude's body pushes the next write over.
+    const sessionId = 'sess-overflow'
+    fx.db.prepare(
+      'INSERT INTO sessions (id, task_id, actor, created_at, harness, branch_context_json) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      sessionId,
+      'task-overflow',
+      'default',
+      Date.now(),
+      'claude-code',
+      JSON.stringify([{ role: 'user', content: 'x'.repeat(8 * 1024 * 1024) }]),
+    )
+
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+      }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      db: fx.db,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      // Three messages: first matches branchContext head, second is the
+      // assistant intermediate, third is the new user input. The
+      // penultimate-user splice would produce a column past the cap.
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [
+          { role: 'user', content: 'x'.repeat(8 * 1024 * 1024) },
+          { role: 'assistant', content: 'a-resp' },
+          { role: 'user', content: 'follow-up' },
+        ],
+      }),
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+
+    const overflowPayload = await waitForEvent(fx.db, 'session.branch_context_overflow') as {
+      session_id: string
+      max_bytes: number
+    }
+    expect(overflowPayload.session_id).toBe(sessionId)
+    expect(overflowPayload.max_bytes).toBe(8 * 1024 * 1024)
+
+    // Column NULL'd so future requests fall back to claude's local view.
+    const row = fx.db
+      .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
+      .get(sessionId) as { branch_context_json: string | null }
+    expect(row.branch_context_json).toBeNull()
+  })
 })
