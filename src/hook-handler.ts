@@ -29,6 +29,7 @@ import { ActorConflictError, rebindSession } from './binding-table.js'
 import type { DB } from './db.js'
 import type { EventProducer } from './events.js'
 import { SESSION_HEADER } from './proxy-handler.js'
+import { readBoundedBody } from './util/http-body.js'
 
 const HOOK_MAX_BODY_BYTES = 64 * 1024
 
@@ -61,7 +62,7 @@ export async function handleSessionStartHook(
 
   let body: Buffer
   try {
-    body = await readBody(req)
+    body = await readBoundedBody(req, HOOK_MAX_BODY_BYTES)
   }
   catch {
     res.writeHead(413, { 'content-type': 'text/plain' })
@@ -163,39 +164,4 @@ function readBindingHeader(req: http.IncomingMessage): string | undefined {
   const raw = req.headers[SESSION_HEADER]
   if (typeof raw !== 'string' || raw.length === 0) return undefined
   return raw.split(',')[0].trim() || undefined
-}
-
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    let settled = false
-    const finishOverflow = (): void => {
-      if (settled) return
-      settled = true
-      // Tear down the socket so a slow-loris client can't pin the connection
-      // by streaming bytes-past-the-limit indefinitely.
-      req.destroy()
-      reject(new Error('overflow'))
-    }
-    req.on('data', (c: Buffer) => {
-      if (settled) return
-      total += c.length
-      if (total > HOOK_MAX_BODY_BYTES) {
-        finishOverflow()
-        return
-      }
-      chunks.push(c)
-    })
-    req.on('end', () => {
-      if (settled) return
-      settled = true
-      resolve(Buffer.concat(chunks))
-    })
-    req.on('error', (err) => {
-      if (settled) return
-      settled = true
-      reject(err)
-    })
-  })
 }

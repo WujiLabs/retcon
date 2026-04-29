@@ -3,29 +3,35 @@
 //
 // `retcon clean --actor <name>` — wipe every row associated with sessions
 // tagged under <name>: events, branch_views, revisions, tasks, sessions,
-// and the per-session TOBE pending files on disk. Atomic transaction in
-// SQLite; filesystem cleanup is best-effort after the DB transaction
-// commits.
+// pending_actors, and the per-session TOBE pending files on disk. Atomic
+// SQLite transaction; filesystem cleanup is best-effort after commit.
+//
+// Destructive of the event log. Events are normally append-only source-of-
+// truth; this command removes them so an actor's traffic vanishes from
+// history (intended use: cleaning up integration-test runs). Projection
+// cursors (`projection_offsets.last_processed_event_id`) are not reset —
+// the cursor's `event_id > last_processed` predicate naturally jumps the
+// gap to the next remaining event when the projector resumes.
 //
 // Pre-1.0 alpha policy: this skips the daemon entirely and operates on
-// `~/.retcon/proxy.db` directly. SQLite WAL mode lets a CLI process write
-// concurrently with the daemon; for safety we surface a one-line warning
-// if the daemon is running so the user can choose whether to proceed.
+// `~/.retcon/proxy.db` directly. If the daemon is running, the CLI
+// refuses without `--force` so a mid-stream session can't be split-written.
 //
 // Defaults to dry-run. `--yes` confirms the delete.
 
 import fs from 'node:fs'
-import path from 'node:path'
 
 import { closeDb, openDb } from '../db.js'
-import { retconDbPath, retconTobeDir } from './paths.js'
-
-const ACTOR_RE = /^[A-Za-z0-9_-]{1,64}$/
+import { createTobeStore } from '../tobe.js'
+import { ACTOR_RE } from '../util/actor-name.js'
+import { retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
 
 export interface CleanOptions {
   actor: string
   /** True means "actually delete"; false (the default) is dry-run. */
   yes: boolean
+  /** Bypass the running-daemon refusal. Default false. */
+  force: boolean
 }
 
 export interface CleanResult {
@@ -42,14 +48,19 @@ export interface CleanResult {
 
 /**
  * Parse a `retcon clean` argv list into options. Accepts `--actor <name>`,
- * `--actor=<name>`, and `--yes`. Throws on missing / malformed actor.
+ * `--actor=<name>`, `--yes`/`-y`, and `--force`. Throws on missing or
+ * malformed actor.
  */
 export function parseCleanArgs(args: readonly string[]): CleanOptions {
   let actor: string | undefined
   let yes = false
+  let force = false
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
-    if (a === '--actor' && i + 1 < args.length) {
+    if (a === '--actor') {
+      if (i + 1 >= args.length) {
+        throw new Error('missing value for --actor')
+      }
       actor = args[i + 1]
       i++
     }
@@ -58,6 +69,9 @@ export function parseCleanArgs(args: readonly string[]): CleanOptions {
     }
     else if (a === '--yes' || a === '-y') {
       yes = true
+    }
+    else if (a === '--force') {
+      force = true
     }
     else {
       throw new Error(`unknown argument: ${a}`)
@@ -72,7 +86,32 @@ export function parseCleanArgs(args: readonly string[]): CleanOptions {
       + `Allowed: 1–64 characters from [A-Za-z0-9_-].`,
     )
   }
-  return { actor, yes }
+  return { actor, yes, force }
+}
+
+/**
+ * Probe the retcon PID file to see if a daemon currently owns it. Returns
+ * the PID if alive, null otherwise. We use a 0-signal kill to test for the
+ * process; ESRCH (no process) and stale-file are both treated as "no live
+ * daemon".
+ */
+export function detectLiveDaemon(): number | null {
+  let raw: string
+  try {
+    raw = fs.readFileSync(retconPidFile(), 'utf8')
+  }
+  catch {
+    return null
+  }
+  const pid = Number.parseInt(raw.trim(), 10)
+  if (!Number.isFinite(pid) || pid <= 0) return null
+  try {
+    process.kill(pid, 0)
+    return pid
+  }
+  catch {
+    return null
+  }
 }
 
 /**
@@ -154,12 +193,13 @@ export function runClean(opts: CleanOptions): CleanResult {
       })
       tx()
 
-      // Filesystem cleanup of TOBE pending files. Best-effort: a missing file
-      // is a no-op, errors get swallowed (we don't want to hold a half-committed
-      // state for a stale file).
-      const tobeDir = retconTobeDir()
+      // Filesystem cleanup of TOBE pending files. Routed through the live
+      // tobeStore so we use the same `tobe_pending-${safeName(sid)}.json`
+      // path format the writer used; a hand-built `${sid}.json` is wrong
+      // and silently no-ops every cleanup.
+      const tobeStore = createTobeStore(retconTobeDir())
       for (const sessionId of sessionIds) {
-        const tobePath = path.join(tobeDir, `${sessionId}.json`)
+        const tobePath = tobeStore.fileFor(sessionId)
         try {
           fs.unlinkSync(tobePath)
           tobeFilesRemoved++

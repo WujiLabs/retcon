@@ -19,11 +19,19 @@ export type DB = Database.Database
 
 export const CURRENT_SCHEMA_VERSION = 4
 
-const SOURCE_OF_TRUTH_SCHEMA = `
+// Single source of truth for the schema_version table DDL. Used in three
+// places (initial create in migrate(), the SOURCE_OF_TRUTH_SCHEMA bundle,
+// and the post-nuke recreate) so a column-shape change here propagates to
+// all of them.
+const SCHEMA_VERSION_DDL = `
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
   applied_at INTEGER NOT NULL
 );
+`
+
+const SOURCE_OF_TRUTH_SCHEMA = `
+${SCHEMA_VERSION_DDL}
 
 CREATE TABLE IF NOT EXISTS blobs (
   cid TEXT PRIMARY KEY,
@@ -161,12 +169,7 @@ export function closeDb(db: DB): void {
 export function migrate(db: DB): void {
   // schema_version belongs to source-of-truth, but we read from it before
   // the rest of the schema exists. Create just that table first, idempotently.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_version (
-      version INTEGER PRIMARY KEY,
-      applied_at INTEGER NOT NULL
-    );
-  `)
+  db.exec(SCHEMA_VERSION_DDL)
 
   const row = db
     .prepare('SELECT MAX(version) AS v FROM schema_version')
@@ -209,6 +212,10 @@ function nukeAllTables(db: DB): void {
     DROP TABLE IF EXISTS pending_actors;
     DROP TABLE IF EXISTS branch_views;
     DROP TABLE IF EXISTS revisions;
+    -- Defensive cleanup: 'versions' was the v1 table name that became
+    -- 'revisions' after the v1→v2 rename. Any DB old enough to still have
+    -- it would already trigger nuke-and-reinit via schema_version<CURRENT,
+    -- but the explicit DROP keeps the post-nuke state predictable.
     DROP TABLE IF EXISTS versions;
     DROP TABLE IF EXISTS tasks;
     DROP TABLE IF EXISTS sessions;
@@ -217,10 +224,5 @@ function nukeAllTables(db: DB): void {
     DROP TABLE IF EXISTS blobs;
     DROP TABLE IF EXISTS schema_version;
   `)
-  db.exec(`
-    CREATE TABLE schema_version (
-      version INTEGER PRIMARY KEY,
-      applied_at INTEGER NOT NULL
-    );
-  `)
+  db.exec(SCHEMA_VERSION_DDL)
 }

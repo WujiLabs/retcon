@@ -15,9 +15,10 @@
 import http from 'node:http'
 
 import type { DB } from './db.js'
+import { ACTOR_RE } from './util/actor-name.js'
+import { readBoundedBody } from './util/http-body.js'
 
 const REGISTER_MAX_BODY_BYTES = 4 * 1024
-const ACTOR_RE = /^[A-Za-z0-9_-]{1,64}$/
 const TRANSPORT_RE = /^[A-Za-z0-9_-]{1,128}$/
 
 interface RegisterPayload {
@@ -38,7 +39,7 @@ export async function handleActorRegister(
 
   let raw: Buffer
   try {
-    raw = await readBody(req)
+    raw = await readBoundedBody(req, REGISTER_MAX_BODY_BYTES)
   }
   catch {
     res.writeHead(413, { 'content-type': 'text/plain' })
@@ -82,37 +83,4 @@ export async function handleActorRegister(
 
   res.writeHead(204)
   res.end()
-}
-
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    let settled = false
-    const finishOverflow = (): void => {
-      if (settled) return
-      settled = true
-      req.destroy()
-      reject(new Error('overflow'))
-    }
-    req.on('data', (c: Buffer) => {
-      if (settled) return
-      total += c.length
-      if (total > REGISTER_MAX_BODY_BYTES) {
-        finishOverflow()
-        return
-      }
-      chunks.push(c)
-    })
-    req.on('end', () => {
-      if (settled) return
-      settled = true
-      resolve(Buffer.concat(chunks))
-    })
-    req.on('error', (err) => {
-      if (settled) return
-      settled = true
-      reject(err)
-    })
-  })
 }

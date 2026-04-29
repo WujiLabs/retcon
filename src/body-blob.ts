@@ -88,15 +88,24 @@ export interface MessagesBodySplit {
  * conversation length.
  */
 export async function blobRefFromMessagesBody(body: Uint8Array): Promise<MessagesBodySplit> {
-  let parsed: { messages?: unknown[], tools?: unknown[], [k: string]: unknown }
+  let parsedRaw: unknown
   try {
-    parsed = JSON.parse(Buffer.from(body).toString('utf8')) as typeof parsed
+    parsedRaw = JSON.parse(Buffer.from(body).toString('utf8'))
   }
   catch {
     // Fallback: store the raw body as a single blob.
     const flat = await blobRefFromBytes(body)
     return { topCid: flat.cid, refs: [flat.ref] }
   }
+  // Only plain object bodies are recognised; null, primitives, or arrays
+  // (valid JSON but not the /v1/messages shape) get the single-blob path.
+  // Without this guard, `{...parsedRaw}` of an array would copy index keys
+  // into the linkified top blob.
+  if (parsedRaw === null || typeof parsedRaw !== 'object' || Array.isArray(parsedRaw)) {
+    const flat = await blobRefFromBytes(body)
+    return { topCid: flat.cid, refs: [flat.ref] }
+  }
+  const parsed = parsedRaw as { messages?: unknown[], tools?: unknown[], [k: string]: unknown }
 
   const refs: BlobRef[] = []
   const linkified: typeof parsed = { ...parsed }

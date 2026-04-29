@@ -6,9 +6,9 @@
 // because validate runs against the full args list (claude's flags too)
 // while these helpers strip retcon's own flags before claude sees them.
 
-const ACTOR_RE = /^[A-Za-z0-9_-]{1,64}$/
+import { DEFAULT_ACTOR, validateActor } from '../util/actor-name.js'
 
-export const DEFAULT_ACTOR = 'default'
+export { DEFAULT_ACTOR }
 
 export interface ExtractActorResult {
   /** The actor the user typed, or undefined if `--actor` wasn't present. */
@@ -25,6 +25,10 @@ export interface ExtractActorResult {
  * Validation: 1–64 chars, alphanumeric + `_` + `-`. Rejects whitespace,
  * slashes, semicolons, quotes — anything that would be awkward in CLI
  * scripting or would let a typo silently produce an unintended actor.
+ *
+ * `--actor` with no following value (last arg in the list) throws rather
+ * than silently passing through to claude. Otherwise the user's typo
+ * surfaces as a confusing error from claude far downstream.
  */
 export function extractActor(args: readonly string[]): ExtractActorResult {
   let actor: string | undefined
@@ -32,7 +36,10 @@ export function extractActor(args: readonly string[]): ExtractActorResult {
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
-    if (a === '--actor' && i + 1 < args.length) {
+    if (a === '--actor') {
+      if (i + 1 >= args.length) {
+        throw new Error('missing value for --actor')
+      }
       actor = validateActor(args[i + 1])
       i++
       continue
@@ -45,14 +52,4 @@ export function extractActor(args: readonly string[]): ExtractActorResult {
   }
 
   return { actor, remaining }
-}
-
-function validateActor(value: string): string {
-  if (!ACTOR_RE.test(value)) {
-    throw new Error(
-      `--actor "${value}" is not a valid name. `
-      + `Allowed: 1–64 characters from [A-Za-z0-9_-].`,
-    )
-  }
-  return value
 }

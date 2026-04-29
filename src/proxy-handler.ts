@@ -201,7 +201,7 @@ function applyBranchContextRewrite(
   rawBody: Buffer,
   sessionId: string,
   db: DB,
-): { body: Buffer, sentMessages: unknown[] } | null {
+): Buffer | null {
   const row = db
     .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
     .get(sessionId) as { branch_context_json: string | null } | undefined
@@ -261,16 +261,15 @@ function finalizeRewrite(
   db: DB,
   sessionId: string,
   prevBranchContext: unknown[],
-): { body: Buffer, sentMessages: unknown[] } {
+): Buffer {
   if (messagesToSend.length > prevBranchContext.length) {
     db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
       .run(JSON.stringify(messagesToSend), sessionId)
   }
-  const rewrittenBody = Buffer.from(
+  return Buffer.from(
     JSON.stringify({ ...parsedBody, messages: messagesToSend }),
     'utf8',
   )
-  return { body: rewrittenBody, sentMessages: messagesToSend }
 }
 
 async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Promise<Buffer> {
@@ -362,9 +361,9 @@ async function dispatch(
     // linking ("most recent sealed revision in task") naturally lands on the
     // previous turn within the active branch, since the active branch's tail
     // is always the most recent sealed revision after fork_back.
-    const rewriteOutcome = applyBranchContextRewrite(rawBody, sessionId, ctx.db)
-    if (rewriteOutcome) {
-      bodyToForward = rewriteOutcome.body
+    const rewritten = applyBranchContextRewrite(rawBody, sessionId, ctx.db)
+    if (rewritten) {
+      bodyToForward = rewritten
     }
   }
 

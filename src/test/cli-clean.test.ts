@@ -16,17 +16,23 @@ import { type DB, migrate, openDb } from '../db.js'
 
 describe('parseCleanArgs', () => {
   it('parses --actor <value>', () => {
-    expect(parseCleanArgs(['--actor', 'test'])).toEqual({ actor: 'test', yes: false })
+    expect(parseCleanArgs(['--actor', 'test'])).toEqual({ actor: 'test', yes: false, force: false })
   })
   it('parses --actor=value', () => {
-    expect(parseCleanArgs(['--actor=test'])).toEqual({ actor: 'test', yes: false })
+    expect(parseCleanArgs(['--actor=test'])).toEqual({ actor: 'test', yes: false, force: false })
   })
   it('parses --yes / -y', () => {
-    expect(parseCleanArgs(['--actor', 'test', '--yes'])).toEqual({ actor: 'test', yes: true })
-    expect(parseCleanArgs(['-y', '--actor=test'])).toEqual({ actor: 'test', yes: true })
+    expect(parseCleanArgs(['--actor', 'test', '--yes'])).toEqual({ actor: 'test', yes: true, force: false })
+    expect(parseCleanArgs(['-y', '--actor=test'])).toEqual({ actor: 'test', yes: true, force: false })
+  })
+  it('parses --force', () => {
+    expect(parseCleanArgs(['--actor', 'test', '--force', '--yes'])).toEqual({ actor: 'test', yes: true, force: true })
   })
   it('throws when --actor is missing', () => {
     expect(() => parseCleanArgs([])).toThrow(/--actor.*required/)
+  })
+  it('throws when --actor is the last arg with no value', () => {
+    expect(() => parseCleanArgs(['--yes', '--actor'])).toThrow(/missing value for --actor/)
   })
   it('throws on malformed actor', () => {
     expect(() => parseCleanArgs(['--actor', 'bad name'])).toThrow(/not a valid name/)
@@ -50,12 +56,14 @@ describe('runClean', () => {
     migrate(db)
     seedFixture(db)
     db.close()
-    // Pre-create some TOBE files so we can verify filesystem cleanup.
+    // Pre-create TOBE files using the same `tobe_pending-${safeName(sid)}.json`
+    // format the live tobeStore writes; runClean now routes through
+    // tobeStore.fileFor() so the formats must match.
     const tobeDir = path.join(tmpRoot, 'tobe')
     mkdirSync(tobeDir, { recursive: true })
-    writeFileSync(path.join(tobeDir, 'sess-test-1.json'), '{}')
-    writeFileSync(path.join(tobeDir, 'sess-test-2.json'), '{}')
-    writeFileSync(path.join(tobeDir, 'sess-keep-1.json'), '{}')
+    writeFileSync(path.join(tobeDir, 'tobe_pending-sess-test-1.json'), '{}')
+    writeFileSync(path.join(tobeDir, 'tobe_pending-sess-test-2.json'), '{}')
+    writeFileSync(path.join(tobeDir, 'tobe_pending-sess-keep-1.json'), '{}')
   })
 
   afterEach(() => {
@@ -64,12 +72,13 @@ describe('runClean', () => {
   })
 
   it('dry-run reports counts without writing', () => {
-    const r = runClean({ actor: 'test', yes: false })
+    const r = runClean({ actor: 'test', yes: false, force: false })
     expect(r.applied).toBe(false)
     expect(r.sessions).toBe(2)
     expect(r.events).toBe(4)
     expect(r.revisions).toBe(2)
     expect(r.tasks).toBe(2)
+    expect(r.branchViews).toBe(2) // one per task under 'test'
     expect(r.tobeFilesRemoved).toBe(0) // dry-run: no fs change
 
     // Verify rows still exist
@@ -81,11 +90,12 @@ describe('runClean', () => {
   })
 
   it('--yes deletes only the matching actor\'s rows', () => {
-    const r = runClean({ actor: 'test', yes: true })
+    const r = runClean({ actor: 'test', yes: true, force: false })
     expect(r.applied).toBe(true)
     expect(r.sessions).toBe(2)
     expect(r.events).toBe(4)
-    expect(r.tobeFilesRemoved).toBe(2) // sess-test-1.json + sess-test-2.json
+    expect(r.branchViews).toBe(2)
+    expect(r.tobeFilesRemoved).toBe(2) // tobe_pending-sess-test-{1,2}.json
 
     // Verify only the 'keep' actor's rows remain.
     const db = openDb({ path: dbPath })
@@ -94,15 +104,17 @@ describe('runClean', () => {
     const remainingEvents = (db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n
     const remainingTasks = (db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n
     const remainingRevisions = (db.prepare('SELECT COUNT(*) AS n FROM revisions').get() as { n: number }).n
+    const remainingBranchViews = (db.prepare('SELECT COUNT(*) AS n FROM branch_views').get() as { n: number }).n
     db.close()
     expect(remainingSessions).toEqual([{ id: 'sess-keep-1', actor: 'keep' }])
     expect(remainingEvents).toBe(2) // 2 events under sess-keep-1
     expect(remainingTasks).toBe(1)
     expect(remainingRevisions).toBe(1)
+    expect(remainingBranchViews).toBe(1) // only branch under task-keep-1 survives
   })
 
   it('returns zeros for a non-matching actor', () => {
-    const r = runClean({ actor: 'nonexistent', yes: true })
+    const r = runClean({ actor: 'nonexistent', yes: true, force: false })
     expect(r.sessions).toBe(0)
     expect(r.events).toBe(0)
     expect(r.applied).toBe(true)
@@ -115,7 +127,7 @@ describe('runClean', () => {
 
   it('handles a never-seen DB path gracefully', () => {
     rmSync(dbPath)
-    const r = runClean({ actor: 'test', yes: true })
+    const r = runClean({ actor: 'test', yes: true, force: false })
     expect(r.sessions).toBe(0)
   })
 })
@@ -123,7 +135,7 @@ describe('runClean', () => {
 describe('formatCleanResult', () => {
   it('labels output as dry-run when not applied', () => {
     const out = formatCleanResult(
-      { actor: 'test', yes: false },
+      { actor: 'test', yes: false, force: false },
       { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, tobeFilesRemoved: 0, applied: false },
     )
     expect(out).toContain('would delete')
@@ -131,7 +143,7 @@ describe('formatCleanResult', () => {
   })
   it('labels output as deleted when applied', () => {
     const out = formatCleanResult(
-      { actor: 'test', yes: true },
+      { actor: 'test', yes: true, force: false },
       { sessions: 1, tasks: 1, revisions: 2, branchViews: 0, events: 5, tobeFilesRemoved: 1, applied: true },
     )
     expect(out).toContain('deleted')
@@ -168,5 +180,13 @@ function seedFixture(db: DB): void {
   for (const [tid] of [['task-test-1'], ['task-test-2'], ['task-keep-1']]) {
     db.prepare(`INSERT INTO revisions (id, task_id, classification, created_at) VALUES (?, ?, ?, ?)`)
       .run(`rev-${tid}`, tid, 'closed_forkable', now)
+  }
+
+  // 1 branch_view per task — without this the DELETE FROM branch_views path
+  // executes against an empty result set and a typo in the SQL would not
+  // be caught.
+  for (const tid of ['task-test-1', 'task-test-2', 'task-keep-1']) {
+    db.prepare(`INSERT INTO branch_views (id, task_id, head_revision_id, auto_label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(`bv-${tid}`, tid, `rev-${tid}`, 'main', now, now)
   }
 }

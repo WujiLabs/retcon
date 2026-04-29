@@ -19,7 +19,7 @@
 // Future agent flags (`--cursor`, `--aider`, etc.) are stubbed: today they
 // print "not yet supported" and exit 2.
 
-import { formatCleanResult, parseCleanArgs, runClean } from './cli/clean.js'
+import { detectLiveDaemon, formatCleanResult, parseCleanArgs, runClean } from './cli/clean.js'
 import { runDaemon } from './cli/daemon.js'
 import { statusDaemon, stopDaemon } from './cli/daemon-control.js'
 import { runAgent } from './cli/run.js'
@@ -104,6 +104,16 @@ async function main(): Promise<number> {
     catch (err) {
       process.stderr.write(`[retcon] ${(err as Error).message}\n`)
       return 2
+    }
+    if (!opts.force) {
+      const livePid = detectLiveDaemon()
+      if (livePid !== null) {
+        process.stderr.write(
+          `[retcon] daemon is running (pid ${livePid}); refusing to clean. `
+          + `Stop it with \`retcon stop\` or pass --force to override.\n`,
+        )
+        return 1
+      }
     }
     const result = runClean(opts)
     process.stdout.write(formatCleanResult(opts, result))

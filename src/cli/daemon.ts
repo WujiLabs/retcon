@@ -60,6 +60,14 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   const db = openDb({ path: retconDbPath() })
   migrate(db)
 
+  // Garbage-collect stale pending_actors entries. A row leaks here if a
+  // `retcon` invocation registered an actor but the user CTRL-C'd before
+  // claude made its first /v1/messages call (so the projector's consume-
+  // on-first-event never ran). One hour is well past any normal launch
+  // delay; anything older is abandoned.
+  db.prepare('DELETE FROM pending_actors WHERE registered_at < ?')
+    .run(Date.now() - 3600_000)
+
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())
   const mcpTools = createForkTools({ db, tobeStore, forkBackEnabled: true })
