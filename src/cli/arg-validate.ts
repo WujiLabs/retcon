@@ -62,8 +62,8 @@ export function removeFlag(args: readonly string[], flag: string): string[] {
   return out
 }
 
-/** Cap on a --mcp-config / --settings file we'll read for introspection. Real configs are KBs; anything bigger is a misuse and we'd rather skip than OOM. */
-const JSON_ARG_FILE_MAX_BYTES = 1024 * 1024
+/** Cap on a --mcp-config / --settings file we'll read for introspection. Real configs are KBs to a few hundred KB at most; 10 MiB leaves comfortable headroom while still bounding worst-case allocation. */
+const JSON_ARG_FILE_MAX_BYTES = 10 * 1024 * 1024
 
 /**
  * Resolve a --mcp-config / --settings argument value to its parsed JSON.

@@ -270,16 +270,29 @@ export async function runAgent(opts: RunAgentOptions): Promise<number> {
   //
   // We use a command hook (not http) because Claude Code rejects http hooks
   // for SessionStart specifically: "HTTP hooks are not supported for
-  // SessionStart" (verified against v2.1.122). The command pipes stdin (the
-  // hook payload JSON) to curl, which POSTs to our daemon. The transport id
-  // travels via the RETCON_BINDING env var, which we set on the child.
+  // SessionStart" (verified against v2.1.122). The command runs an inline
+  // Node script that reads claude's hook payload from stdin and POSTs it to
+  // our daemon. Node-not-curl avoids two portability issues: curl isn't
+  // always installed (rare but possible on minimal Linux containers), and
+  // shell variable expansion differs between sh ($VAR) and cmd.exe (%VAR%).
+  // The transport id is read inside the Node script via process.env, which
+  // works identically across shells.
   //
-  // For new-session it's a harmless echo (transport id == claude session_id);
+  // The script is single-quoted JS only (no double quotes, no backticks, no
+  // backslashes) so it survives both POSIX sh and Windows cmd.exe quoting
+  // when wrapped in outer double quotes. Host and port are baked at
+  // retcon-startup time so the script doesn't need extra env vars.
+  //
+  // For new sessions it's a harmless echo (transport id == claude session_id);
   // for resumed sessions it's how we learn claude's session_id post-picker.
-  const hookCmd
-    = `curl -sS -X POST -H 'content-type: application/json' `
-    + `-H "x-playtiss-session: $RETCON_BINDING" `
-    + `--data-binary @- http://${host}:${port}/hooks/session-start >/dev/null`
+  const hookScript
+    = `let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{`
+    + `const r=require('http').request({hostname:'${host}',port:${port},`
+    + `path:'/hooks/session-start',method:'POST',`
+    + `headers:{'content-type':'application/json',`
+    + `'x-playtiss-session':process.env.RETCON_BINDING}},res=>res.resume());`
+    + `r.on('error',()=>{});r.end(d)})`
+  const hookCmd = `node -e "${hookScript}"`
   // Build merged settings JSON. If the user passed --settings, our hook is
   // appended to their hooks.SessionStart array (rather than colliding); we
   // also drop their --settings flag so claude doesn't see two competing.
