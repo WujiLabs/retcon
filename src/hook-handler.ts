@@ -104,9 +104,13 @@ export async function handleSessionStartHook(
     catch (err) {
       if (err instanceof ActorConflictError) {
         // Resume specified --actor that disagrees with the resumed session's
-        // existing actor. Emit an audit event, return 409 to claude. The
-        // hook is advisory so claude continues, but the new traffic stays
-        // attributed to transportId until the user reconciles.
+        // existing actor. Roll back the speculative bindingTable.set() so
+        // in-memory routing matches the rolled-back DB state — otherwise
+        // subsequent /v1/* traffic would resolve transportId → sessionId
+        // even though the SQL merge never committed. Emit an audit event,
+        // return 409 to claude. The hook is advisory so claude continues;
+        // new traffic stays attributed to transportId until reconciled.
+        ctx.bindingTable.unset(transportId)
         ctx.producer.emit(
           'session.actor_conflict',
           {

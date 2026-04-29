@@ -150,6 +150,14 @@ export async function blobRefFromMessagesBody(body: Uint8Array): Promise<Message
  * Tolerates partially-missing leaves: if a single message blob is gone for
  * some reason, that entry is dropped from the result rather than aborting
  * the whole hydration. The reconstruction is "best effort" by design.
+ *
+ * Format-detection is sniff-based: any dag-json blob whose `messages[]` is
+ * an array of CID-typed entries gets the link-walk path; anything else
+ * falls through. That works as long as nuke-and-reinit is the schema-bump
+ * policy (a future format change can't accidentally collide because the
+ * old DB is gone). When real migrations land (Phase 2), revisit by adding
+ * a magic version field to the linkified top blob, e.g.
+ * `{__retcon_split: 1, messages: [...links...], tools: [...]}`.
  */
 export function loadHydratedMessagesBody(
   db: DB,

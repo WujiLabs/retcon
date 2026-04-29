@@ -34,6 +34,16 @@ export class BindingTable {
     this.map.set(transportId, sessionId)
   }
 
+  /**
+   * Drop the alias for a transport id. Used to roll back a speculative
+   * `set()` when the SQL rebind transaction fails (e.g. ActorConflictError),
+   * so the in-memory routing table doesn't disagree with the persisted
+   * state.
+   */
+  unset(transportId: string): void {
+    this.map.delete(transportId)
+  }
+
   /** Test-only: inspect current bindings. */
   size(): number {
     return this.map.size

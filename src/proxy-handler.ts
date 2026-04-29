@@ -197,11 +197,31 @@ function applyTobe(
  *   - claude has fewer than 2 user messages (shouldn't happen post-fork
  *     since the fork always followed at least 2 user turns)
  */
+/**
+ * Hard cap on the JSON-encoded size of `branch_context_json`. The column
+ * grows by one user/assistant turn per /v1/messages once a fork is active.
+ * 8 MiB is well past any model's context window (≈2M+ tokens), so hitting
+ * this cap means something went wrong: a runaway tool loop, an
+ * adversarial LLM, or a misbehaving client. On overflow we wipe the
+ * override and fall back to claude's local view — the fork is lost, but
+ * we don't grow the column further.
+ */
+export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
+
+export interface BranchContextRewriteResult {
+  /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
+  body: Buffer
+  /** True iff the fork's branch_context_json crossed BRANCH_CONTEXT_MAX_BYTES
+   *  on this turn. Caller wipes the column, emits an audit event, and
+   *  forwards the original (unrewritten) body. */
+  overflow: boolean
+}
+
 function applyBranchContextRewrite(
   rawBody: Buffer,
   sessionId: string,
   db: DB,
-): Buffer | null {
+): BranchContextRewriteResult | null {
   const row = db
     .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
     .get(sessionId) as { branch_context_json: string | null } | undefined
@@ -253,7 +273,8 @@ function applyBranchContextRewrite(
 /**
  * Helper: serialize the rewritten body, persist the extended branch_context
  * (only when it actually grew so daemon-restart-then-replay stays idempotent),
- * and return.
+ * and return. On overflow (column would exceed BRANCH_CONTEXT_MAX_BYTES),
+ * NULL the column and signal the caller to fall back to the unrewritten body.
  */
 function finalizeRewrite(
   parsedBody: { messages?: unknown[] },
@@ -261,15 +282,24 @@ function finalizeRewrite(
   db: DB,
   sessionId: string,
   prevBranchContext: unknown[],
-): Buffer {
+): BranchContextRewriteResult {
   if (messagesToSend.length > prevBranchContext.length) {
+    const json = JSON.stringify(messagesToSend)
+    if (json.length > BRANCH_CONTEXT_MAX_BYTES) {
+      db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
+        .run(sessionId)
+      return { body: Buffer.alloc(0), overflow: true }
+    }
     db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
-      .run(JSON.stringify(messagesToSend), sessionId)
+      .run(json, sessionId)
   }
-  return Buffer.from(
-    JSON.stringify({ ...parsedBody, messages: messagesToSend }),
-    'utf8',
-  )
+  return {
+    body: Buffer.from(
+      JSON.stringify({ ...parsedBody, messages: messagesToSend }),
+      'utf8',
+    ),
+    overflow: false,
+  }
 }
 
 async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Promise<Buffer> {
@@ -362,8 +392,19 @@ async function dispatch(
     // previous turn within the active branch, since the active branch's tail
     // is always the most recent sealed revision after fork_back.
     const rewritten = applyBranchContextRewrite(rawBody, sessionId, ctx.db)
-    if (rewritten) {
-      bodyToForward = rewritten
+    if (rewritten?.overflow) {
+      // branch_context_json was about to exceed BRANCH_CONTEXT_MAX_BYTES
+      // (8 MiB). The column has been NULL'd; pass claude's body through
+      // unchanged. The fork is now broken — claude's local view drives
+      // future turns. Emit an audit event so the operator sees it.
+      ctx.producer.emit(
+        'session.branch_context_overflow',
+        { session_id: sessionId, max_bytes: BRANCH_CONTEXT_MAX_BYTES },
+        sessionId,
+      )
+    }
+    else if (rewritten) {
+      bodyToForward = rewritten.body
     }
   }
 
