@@ -172,6 +172,20 @@ function applyTobe(
  */
 export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
 
+/**
+ * Anthropic's hard limit on ephemeral `cache_control` blocks per /v1/messages
+ * request. As of 2026-04, requests with > 4 cache_control markers across
+ * `system`, `tools`, and `messages.content[].cache_control` get a 400.
+ *
+ * retcon's persistent-fork splice naturally accumulates message-level cache
+ * markers across turns: each branch_context_json round-trip preserves whatever
+ * claude attached on prior turns, then claude attaches more on the new
+ * suffix. After 2-3 spliced turns we hit the cap. capCacheControlBlocks
+ * strips from the most recent messages first so the heading markers (which
+ * Anthropic uses for the long-lived prefix cache) stay intact.
+ */
+export const MAX_CACHE_CONTROL_BLOCKS = 4
+
 export interface BranchContextRewriteResult {
   /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
   body: Buffer
@@ -306,6 +320,89 @@ function finalizeRewrite(
   }
 }
 
+/**
+ * Cap the number of ephemeral `cache_control` markers in a /v1/messages body
+ * to `max` (default 4 — Anthropic's hard limit). Counts markers across
+ * `system` (array form), `tools`, and `messages[i].content[j]` content blocks.
+ *
+ * Stripping policy: protect system + tools (long-lived prefix that always
+ * caches), and strip the EARLIEST message markers first — keeping the
+ * tailing ones intact. Reasoning: in retcon's persistent-fork splice, each
+ * outgoing /v1/messages has a different prefix shape (we keep prepending
+ * branch_context), so heading message-level markers don't actually hit
+ * Anthropic's prompt cache — they just consume a slot for nothing. The
+ * tail markers are at the freshest, longest-prefix point and are what
+ * primes the cache for the next call. Strip what doesn't pay rent.
+ *
+ * Mutates `parsedBody` in-place (cheaper than deep-cloning a multi-MB body).
+ * Returns the number of markers removed; 0 means no change. Caller is
+ * responsible for re-serializing.
+ *
+ * Exported for unit testing.
+ */
+export function capCacheControlBlocks(
+  parsedBody: { system?: unknown, tools?: unknown, messages?: unknown },
+  max: number = MAX_CACHE_CONTROL_BLOCKS,
+): number {
+  let protectedCount = 0
+
+  // System (array form only; string form has no cache_control).
+  if (Array.isArray(parsedBody.system)) {
+    for (const block of parsedBody.system) {
+      if (block && typeof block === 'object' && 'cache_control' in block) {
+        protectedCount++
+      }
+    }
+  }
+
+  // Tools (array of tool definitions; cache_control is a top-level field).
+  if (Array.isArray(parsedBody.tools)) {
+    for (const tool of parsedBody.tools) {
+      if (tool && typeof tool === 'object' && 'cache_control' in tool) {
+        protectedCount++
+      }
+    }
+  }
+
+  // Messages: enumerate cache_control sites in heading-first order. We strip
+  // from the START (earliest first) so the latest markers — the ones that
+  // prime the cache for the NEXT request — survive.
+  const messageStrippers: Array<() => void> = []
+  if (Array.isArray(parsedBody.messages)) {
+    for (let i = 0; i < parsedBody.messages.length; i++) {
+      const msg = parsedBody.messages[i] as { content?: unknown } | null
+      if (!msg || typeof msg !== 'object') continue
+      const content = msg.content
+      if (!Array.isArray(content)) continue
+      for (let j = 0; j < content.length; j++) {
+        const block = content[j] as { cache_control?: unknown } | null
+        if (block && typeof block === 'object' && 'cache_control' in block) {
+          // Capture by reference so the closure deletes the right field.
+          const target = block
+          messageStrippers.push(() => {
+            delete target.cache_control
+          })
+        }
+      }
+    }
+  }
+
+  const total = protectedCount + messageStrippers.length
+  if (total <= max) return 0
+
+  // Strip from the START (earliest first). If protected alone exceeds max
+  // (degenerate case retcon doesn't normally produce), we leave protected
+  // alone — Anthropic will still 400 but the operator sees a clearer signal
+  // than retcon silently messing with their system/tools markers.
+  const toStrip = total - max
+  let stripped = 0
+  for (let k = 0; k < messageStrippers.length && stripped < toStrip; k++) {
+    messageStrippers[k]!()
+    stripped++
+  }
+  return stripped
+}
+
 async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Promise<Buffer> {
   if (!encoding || encoding === 'identity') return buf
   const enc = encoding.toLowerCase()
@@ -412,6 +509,35 @@ async function dispatch(
     }
     else if (rewritten) {
       bodyToForward = rewritten.body
+    }
+  }
+
+  // Cap cache_control markers to MAX_CACHE_CONTROL_BLOCKS (Anthropic's hard
+  // limit). Persistent-fork splicing tends to accumulate markers across
+  // turns; without this cap, the second or third spliced turn 400s with
+  // "A maximum of 4 blocks with cache_control may be provided." The
+  // stripping prefers the latest message tail so the long-lived prefix
+  // cache (system + tools + early messages) stays intact.
+  if (isMessagesPath) {
+    try {
+      const parsed = JSON.parse(bodyToForward.toString('utf8')) as {
+        system?: unknown
+        tools?: unknown
+        messages?: unknown
+      }
+      const stripped = capCacheControlBlocks(parsed, MAX_CACHE_CONTROL_BLOCKS)
+      if (stripped > 0) {
+        bodyToForward = Buffer.from(JSON.stringify(parsed), 'utf8')
+        ctx.producer.emit(
+          'proxy.cache_control_capped',
+          { session_id: sessionId, removed: stripped, max: MAX_CACHE_CONTROL_BLOCKS },
+          sessionId,
+        )
+      }
+    }
+    catch {
+      // Body wasn't JSON — leave it alone (the upstream will surface its
+      // own error). Capping is opportunistic, not a hard prerequisite.
     }
   }
 

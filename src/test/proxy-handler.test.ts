@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer, createEventProducer, type EventProducer } from '../events.js'
-import { SESSION_HEADER } from '../proxy-handler.js'
+import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
 import { defaultProjectors } from '../server.js'
 import { type ServerHandle, startServer } from '../server.js'
@@ -602,5 +602,164 @@ describe('proxy pass-through + event emission', () => {
       .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
       .get(sessionId) as { branch_context_json: string | null }
     expect(row.branch_context_json).toBeNull()
+  })
+})
+
+// ─── capCacheControlBlocks (pure helper) ────────────────────────────────────
+
+describe('capCacheControlBlocks', () => {
+  const cc = (extra: Record<string, unknown> = {}) => ({ type: 'ephemeral', ...extra })
+
+  it('MAX_CACHE_CONTROL_BLOCKS default is 4 (Anthropic limit)', () => {
+    expect(MAX_CACHE_CONTROL_BLOCKS).toBe(4)
+  })
+
+  it('returns 0 when total markers <= max (no-op)', () => {
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: cc() }],
+      tools: [{ name: 't1', cache_control: cc() }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: cc() }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a' }] },
+      ],
+    }
+    expect(capCacheControlBlocks(body)).toBe(0)
+  })
+
+  it('strips earliest message markers first; tail survives (cache primes next call)', () => {
+    // 1 system + 1 tools + 4 message blocks = 6, max=4 → strip 2 EARLIEST.
+    // Heading message markers don't hit Anthropic's prompt cache because
+    // retcon's spliced prefix changes every turn; tail markers prime the
+    // cache for the upcoming call. So we keep the tail.
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: cc({ tag: 'sys' }) }],
+      tools: [{ name: 't1', cache_control: cc({ tag: 'tool' }) }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q1', cache_control: cc({ tag: 'm1' }) }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a1', cache_control: cc({ tag: 'm2' }) }] },
+        { role: 'user', content: [{ type: 'text', text: 'q2', cache_control: cc({ tag: 'm3' }) }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a2', cache_control: cc({ tag: 'm4' }) }] },
+      ],
+    }
+    const removed = capCacheControlBlocks(body)
+    expect(removed).toBe(2)
+    // System + tools survived.
+    expect(body.system[0]!.cache_control).toBeDefined()
+    expect(body.tools[0]!.cache_control).toBeDefined()
+    // Earliest message markers stripped (m1, m2) — they don't pay rent.
+    expect(body.messages[0]!.content[0]!.cache_control).toBeUndefined()
+    expect(body.messages[1]!.content[0]!.cache_control).toBeUndefined()
+    // Latest two survived (m3, m4) — these prime the cache for the next call.
+    expect(body.messages[2]!.content[0]!.cache_control).toBeDefined()
+    expect(body.messages[3]!.content[0]!.cache_control).toBeDefined()
+  })
+
+  it('strips multiple markers within the same message from the START', () => {
+    // 1 system + 0 tools + message with 5 cache_controls in content[]: total 6, strip 2.
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: cc() }],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '0', cache_control: cc({ tag: 'b0' }) },
+            { type: 'text', text: '1', cache_control: cc({ tag: 'b1' }) },
+            { type: 'text', text: '2', cache_control: cc({ tag: 'b2' }) },
+            { type: 'text', text: '3', cache_control: cc({ tag: 'b3' }) },
+            { type: 'text', text: '4', cache_control: cc({ tag: 'b4' }) },
+          ],
+        },
+      ],
+    }
+    const removed = capCacheControlBlocks(body)
+    expect(removed).toBe(2)
+    expect(body.messages[0]!.content[0]!.cache_control).toBeUndefined() // b0 stripped
+    expect(body.messages[0]!.content[1]!.cache_control).toBeUndefined() // b1 stripped
+    expect(body.messages[0]!.content[2]!.cache_control).toBeDefined() // b2 survived
+    expect(body.messages[0]!.content[3]!.cache_control).toBeDefined() // b3 survived
+    expect(body.messages[0]!.content[4]!.cache_control).toBeDefined() // b4 survived
+  })
+
+  it('handles string `system` (no array) without crashing', () => {
+    const body = {
+      system: 'plain string system, no cache_control possible',
+      tools: [{ name: 't', cache_control: cc() }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: cc() }] },
+      ],
+    }
+    expect(capCacheControlBlocks(body)).toBe(0) // 0 + 1 + 1 = 2 ≤ 4
+  })
+
+  it('handles string `content` (no array) without scanning it', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: 'plain string, no cache_control' },
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: cc() }] },
+      ],
+    }
+    expect(capCacheControlBlocks(body)).toBe(0)
+  })
+
+  it('protects system + tools when only messages exceed; never touches them', () => {
+    // 2 system + 2 tools = 4 protected (right at cap). Add 3 message markers
+    // → total 7, must strip all 3 message markers.
+    const body = {
+      system: [
+        { type: 'text', text: 's0', cache_control: cc() },
+        { type: 'text', text: 's1', cache_control: cc() },
+      ],
+      tools: [
+        { name: 't0', cache_control: cc() },
+        { name: 't1', cache_control: cc() },
+      ],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q1', cache_control: cc() }] },
+        { role: 'user', content: [{ type: 'text', text: 'q2', cache_control: cc() }] },
+        { role: 'user', content: [{ type: 'text', text: 'q3', cache_control: cc() }] },
+      ],
+    }
+    expect(capCacheControlBlocks(body)).toBe(3)
+    // All system + tools preserved.
+    expect(body.system[0]!.cache_control).toBeDefined()
+    expect(body.system[1]!.cache_control).toBeDefined()
+    expect(body.tools[0]!.cache_control).toBeDefined()
+    expect(body.tools[1]!.cache_control).toBeDefined()
+    // All message markers gone.
+    expect(body.messages[0]!.content[0]!.cache_control).toBeUndefined()
+    expect(body.messages[1]!.content[0]!.cache_control).toBeUndefined()
+    expect(body.messages[2]!.content[0]!.cache_control).toBeUndefined()
+  })
+
+  it('leaves protected alone when system+tools ALONE exceed the cap (degenerate case)', () => {
+    // 5 system markers, no messages. We don't strip from system — Anthropic
+    // will 400 but the operator sees a clear signal rather than retcon
+    // mangling their config.
+    const body = {
+      system: Array.from({ length: 5 }, () => ({ type: 'text', text: 's', cache_control: cc() })),
+      messages: [],
+    }
+    expect(capCacheControlBlocks(body)).toBe(0)
+    expect(body.system.filter(s => s.cache_control).length).toBe(5)
+  })
+
+  it('respects custom max parameter (strips heading; tail survives)', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '0', cache_control: cc() }] },
+        { role: 'user', content: [{ type: 'text', text: '1', cache_control: cc() }] },
+        { role: 'user', content: [{ type: 'text', text: '2', cache_control: cc() }] },
+      ],
+    }
+    expect(capCacheControlBlocks(body, 1)).toBe(2) // keep 1 (latest)
+    expect(body.messages[0]!.content[0]!.cache_control).toBeUndefined()
+    expect(body.messages[1]!.content[0]!.cache_control).toBeUndefined()
+    expect(body.messages[2]!.content[0]!.cache_control).toBeDefined()
+  })
+
+  it('handles missing system / tools / messages fields', () => {
+    expect(capCacheControlBlocks({})).toBe(0)
+    expect(capCacheControlBlocks({ messages: [] })).toBe(0)
+    expect(capCacheControlBlocks({ system: undefined, tools: null })).toBe(0)
   })
 })
