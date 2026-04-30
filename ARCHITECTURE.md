@@ -94,29 +94,11 @@ After /compact, claude's local jsonl is therefore *aligned* with the forked bran
 
 The deeper insight: **retcon doesn't introspect claude's jsonl to know when to stop overriding.** claude tells us via the hook. One bit: "reset your override." We trust the harness on its own state, which keeps coupling minimal. The /compact case happens to be the one where stepping out is also the right thing semantically, but we don't know that from inspecting the new body — we know it because the harness signaled it.
 
-## cache_control: why retcon caps to 4 by stripping heading message markers
+## cache_control: stripping heading markers when the splice exceeds 4
 
-Anthropic's prompt caching lets up to 4 ephemeral `cache_control` markers per `/v1/messages` request, distributed across `tools`, `system`, and `messages` content blocks. A marker on a block writes a cache entry whose value is the cumulative prefix (`tools` + `system` + `messages`) up through that block. On the next request, Anthropic walks back **20 blocks** from the new marker looking for any prior entry whose position is still in range. Hit → cache hit on that prefix.
+Anthropic caps a `/v1/messages` request at 4 ephemeral `cache_control` markers ([prompt-caching docs](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching)). retcon's persistent-fork splice prepends `branch_context` carrying markers from prior turns onto a body that already has claude's fresh markers, so a few spliced turns later the body has 5+ and Anthropic 400s.
 
-Claude Code attaches markers strategically and migrates them forward as the conversation grows. The natural pattern over a session looks like:
-
-- **Turn 1:** marker at end of system, end of tools, end of latest user message.
-- **Turn 2:** the system + tools markers stay (those prefixes never change). The latest-user marker moves forward to the new latest user message; the previous one drops off.
-- **Turn N:** same shape — markers always sit at the latest stable block, with the older message-level markers naturally aging out.
-
-This works because the cache that matters is the LONGEST one. A marker at block N caches a prefix of N blocks; the next turn's marker (a few blocks further) finds that entry via the 20-block lookback. The cached frontier extends turn-by-turn, paying off increasingly over the session.
-
-retcon's persistent-fork splice complicates this. We prepend `branch_context` to claude's body before sending upstream. Each spliced turn still carries claude's markers AND any markers that were already in `branch_context` from prior splices. After 2-3 turns of splicing, the body has 5+ `cache_control` markers and Anthropic returns a 400.
-
-retcon's `capCacheControlBlocks` (proxy-handler.ts) handles this by **mirroring the strategy claude is already using internally**. When the body has > 4 markers:
-
-1. Protect `system` and `tools` markers (always — those prefixes are stable across requests; the cache hits trivially).
-2. Strip the **earliest** message-level markers first.
-3. Keep the **latest** message-level markers — those are the ones at the longest cached prefix, primed to be found by the next turn's lookback.
-
-This is the same shape claude itself produces when generating a fresh request: heading message markers age out, the cached frontier rides at the tail. retcon's cap just enforces the same discipline when the splice has accumulated stale markers from prior turns. A `proxy.cache_control_capped` audit event fires on each cap so an operator can monitor how often it's needed.
-
-The deeper insight: **caching policy is a frontier problem, not a "where's the boundary" problem.** The block where you place the marker is where the cached value lives. The next request's lookback decides whether you get a hit. Putting markers at the latest stable position maximizes cache reuse over the conversation lifetime; putting them at the heading caps the savings at a fixed prefix. Stripping earliest mirrors what claude does naturally.
+`capCacheControlBlocks` (proxy-handler.ts) protects `system` + `tools` markers and strips the **earliest** `messages` markers first. This mirrors what claude already does turn-to-turn: the cached frontier rides at the tail (latest stable block), so the next turn's lookback finds it; older message markers age out naturally. retcon's cap just enforces the same discipline when stale markers accumulate. Each cap emits `proxy.cache_control_capped`.
 
 ## Assumptions we make about the harness
 
