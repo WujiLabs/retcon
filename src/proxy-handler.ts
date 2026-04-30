@@ -349,9 +349,8 @@ function finalizeRewrite(
  * turn. The tail strategy progressively caches more, paying off increasingly
  * over the session lifetime.
  *
- * Mutates `parsedBody` in-place (cheaper than deep-cloning a multi-MB body).
- * Returns the number of markers removed; 0 means no change. Caller is
- * responsible for re-serializing.
+ * Mutates `parsedBody` in-place. Returns the number of markers removed;
+ * 0 means no change. Caller is responsible for re-serializing.
  *
  * Exported for unit testing.
  */
@@ -361,21 +360,25 @@ export function capCacheControlBlocks(
 ): number {
   let protectedCount = 0
 
+  // hasMarker: a `cache_control` field counts only if it's a truthy object
+  // (Anthropic's actual semantics — `null` and `undefined` are no-op
+  // markers that don't consume one of the 4 slots).
+  const hasMarker = (x: unknown): x is { cache_control: object } =>
+    !!x && typeof x === 'object' && 'cache_control' in x
+      && !!(x as { cache_control?: unknown }).cache_control
+      && typeof (x as { cache_control?: unknown }).cache_control === 'object'
+
   // System (array form only; string form has no cache_control).
   if (Array.isArray(parsedBody.system)) {
     for (const block of parsedBody.system) {
-      if (block && typeof block === 'object' && 'cache_control' in block) {
-        protectedCount++
-      }
+      if (hasMarker(block)) protectedCount++
     }
   }
 
   // Tools (array of tool definitions; cache_control is a top-level field).
   if (Array.isArray(parsedBody.tools)) {
     for (const tool of parsedBody.tools) {
-      if (tool && typeof tool === 'object' && 'cache_control' in tool) {
-        protectedCount++
-      }
+      if (hasMarker(tool)) protectedCount++
     }
   }
 
@@ -390,10 +393,10 @@ export function capCacheControlBlocks(
       const content = msg.content
       if (!Array.isArray(content)) continue
       for (let j = 0; j < content.length; j++) {
-        const block = content[j] as { cache_control?: unknown } | null
-        if (block && typeof block === 'object' && 'cache_control' in block) {
+        const block = content[j]
+        if (hasMarker(block)) {
           // Capture by reference so the closure deletes the right field.
-          const target = block
+          const target = block as { cache_control?: unknown }
           messageStrippers.push(() => {
             delete target.cache_control
           })
