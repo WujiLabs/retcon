@@ -155,7 +155,7 @@ Code lives under `src/`. The four files that implement the model above are:
 
 - [`proxy-handler.ts`](./src/proxy-handler.ts) — the body rewrites (TOBE swap + persistent-fork splice).
 - [`hook-handler.ts`](./src/hook-handler.ts) — the hook contract (rebind, clear/compact release).
-- [`mcp-tools.ts`](./src/mcp-tools.ts) — the fork tools.
+- [`mcp-tools.ts`](./src/mcp-tools.ts) — the rewind tools.
 - [`tobe.ts`](./src/tobe.ts) — the one-shot rewind baton.
 
 Everything else is plumbing. `ls src/` and the header comment of each file is a faster tour than any component map could be.
