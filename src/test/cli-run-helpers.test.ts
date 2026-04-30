@@ -12,8 +12,15 @@ import {
   mergeCustomHeaders,
   pickTransportId,
   resolveUpstream,
+  retconAllowEntries,
 } from '../cli/run.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
+
+/**
+ * Fixed allow entries used in tests so they don't depend on the test
+ * runner's home directory. Real callers pass `retconAllowEntries(os.homedir())`.
+ */
+const TEST_ALLOW_ENTRIES = retconAllowEntries('/home/test')
 
 describe('pickTransportId', () => {
   const VALID = '11111111-2222-3333-4444-555555555555'
@@ -47,14 +54,20 @@ describe('buildSettingsAndArgs', () => {
   const HOOK_CMD = 'curl http://x/hooks/session-start'
 
   it('builds settings with our SessionStart hook when the user supplied none', () => {
-    const result = buildSettingsAndArgs(['--effort', 'low'], HOOK_CMD)
+    const result = buildSettingsAndArgs(['--effort', 'low'], HOOK_CMD, TEST_ALLOW_ENTRIES)
     expect(result.argsWithoutSettings).toEqual(['--effort', 'low'])
     const parsed = JSON.parse(result.settings)
     expect(parsed.hooks.SessionStart).toHaveLength(1)
     expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe(HOOK_CMD)
   })
 
-  it('appends our hook to the user\'s existing SessionStart array', () => {
+  it('injects retcon dumps allowlist when user supplied no settings', () => {
+    const result = buildSettingsAndArgs(['--effort', 'low'], HOOK_CMD, TEST_ALLOW_ENTRIES)
+    const parsed = JSON.parse(result.settings)
+    expect(parsed.permissions.allow).toEqual(TEST_ALLOW_ENTRIES)
+  })
+
+  it('appends our hook AND merges allow entries with the user\'s', () => {
     const userSettings = JSON.stringify({
       hooks: {
         SessionStart: [
@@ -62,9 +75,9 @@ describe('buildSettingsAndArgs', () => {
         ],
         PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'pre' }] }],
       },
-      permissions: { allowedTools: ['Bash'] },
+      permissions: { allowedTools: ['Bash'], allow: ['Bash(npm test)'] },
     })
-    const result = buildSettingsAndArgs(['--settings', userSettings, '--effort', 'low'], HOOK_CMD)
+    const result = buildSettingsAndArgs(['--settings', userSettings, '--effort', 'low'], HOOK_CMD, TEST_ALLOW_ENTRIES)
     // User's --settings flag is removed; we'll add our merged version back in run.ts.
     expect(result.argsWithoutSettings).toEqual(['--effort', 'low'])
     const parsed = JSON.parse(result.settings)
@@ -74,32 +87,72 @@ describe('buildSettingsAndArgs', () => {
     // Other hook events and unrelated settings preserved.
     expect(parsed.hooks.PreToolUse[0].hooks[0].command).toBe('pre')
     expect(parsed.permissions.allowedTools).toEqual(['Bash'])
+    // allow entries: user's first, then ours appended.
+    expect(parsed.permissions.allow).toEqual(['Bash(npm test)', ...TEST_ALLOW_ENTRIES])
+  })
+
+  it('dedupes allow entries: user-supplied retcon entries are not duplicated', () => {
+    const userSettings = JSON.stringify({
+      permissions: { allow: [TEST_ALLOW_ENTRIES[0]!, 'Bash(other)'] },
+    })
+    const result = buildSettingsAndArgs(['--settings', userSettings], HOOK_CMD, TEST_ALLOW_ENTRIES)
+    const parsed = JSON.parse(result.settings)
+    // First entry is preserved (user-supplied); 'Bash(other)' kept; remaining
+    // 4 retcon entries appended; the first retcon entry is NOT re-added.
+    expect(parsed.permissions.allow).toEqual([
+      TEST_ALLOW_ENTRIES[0],
+      'Bash(other)',
+      ...TEST_ALLOW_ENTRIES.slice(1),
+    ])
   })
 
   it('creates SessionStart array when user has hooks but no SessionStart', () => {
     const userSettings = JSON.stringify({
       hooks: { PreToolUse: [{ matcher: '*', hooks: [] }] },
     })
-    const result = buildSettingsAndArgs(['--settings', userSettings], HOOK_CMD)
+    const result = buildSettingsAndArgs(['--settings', userSettings], HOOK_CMD, TEST_ALLOW_ENTRIES)
     const parsed = JSON.parse(result.settings)
     expect(parsed.hooks.SessionStart).toHaveLength(1)
     expect(parsed.hooks.PreToolUse).toBeDefined()
+    // permissions key gets created with our entries even though user had none.
+    expect(parsed.permissions.allow).toEqual(TEST_ALLOW_ENTRIES)
   })
 
-  it('handles --settings=value form', () => {
+  it('handles --settings=value form and merges into empty permissions', () => {
     const userSettings = JSON.stringify({ permissions: {} })
-    const result = buildSettingsAndArgs([`--settings=${userSettings}`, '--effort', 'low'], HOOK_CMD)
+    const result = buildSettingsAndArgs([`--settings=${userSettings}`, '--effort', 'low'], HOOK_CMD, TEST_ALLOW_ENTRIES)
     expect(result.argsWithoutSettings).toEqual(['--effort', 'low'])
     const parsed = JSON.parse(result.settings)
-    expect(parsed.permissions).toEqual({})
+    // User had permissions:{} — we add allow without disturbing other keys.
+    expect(parsed.permissions.allow).toEqual(TEST_ALLOW_ENTRIES)
     expect(parsed.hooks.SessionStart).toHaveLength(1)
   })
 
-  it('drops unparseable user --settings and installs our hook standalone', () => {
-    const result = buildSettingsAndArgs(['--settings', 'not-json', '--keep'], HOOK_CMD)
+  it('drops unparseable user --settings and installs our hook + allowlist standalone', () => {
+    const result = buildSettingsAndArgs(['--settings', 'not-json', '--keep'], HOOK_CMD, TEST_ALLOW_ENTRIES)
     expect(result.argsWithoutSettings).toEqual(['--keep'])
     const parsed = JSON.parse(result.settings)
     expect(parsed.hooks.SessionStart).toHaveLength(1)
+    expect(parsed.permissions.allow).toEqual(TEST_ALLOW_ENTRIES)
+  })
+})
+
+describe('retconAllowEntries', () => {
+  it('returns 5 entries (Read/Edit/Write/Glob/Grep) for the dumps directory', () => {
+    const entries = retconAllowEntries('/home/alice')
+    expect(entries).toHaveLength(5)
+    expect(entries).toContain('Read(/home/alice/.retcon/dumps/**)')
+    expect(entries).toContain('Edit(/home/alice/.retcon/dumps/**)')
+    expect(entries).toContain('Write(/home/alice/.retcon/dumps/**)')
+    expect(entries).toContain('Glob(/home/alice/.retcon/dumps/**)')
+    expect(entries).toContain('Grep(/home/alice/.retcon/dumps/**)')
+  })
+
+  it('uses ** so any depth under dumps/ matches', () => {
+    const entries = retconAllowEntries('/h')
+    for (const e of entries) {
+      expect(e).toMatch(/\.retcon\/dumps\/\*\*\)$/)
+    }
   })
 })
 

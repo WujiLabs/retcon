@@ -32,9 +32,9 @@ retcon clean --actor X --yes        # apply the wipe
 
 ## Persistent fork branches
 
-Once you run `fork_back`, retcon doesn't just rewrite one /v1/messages call — it keeps the forked branch alive across every subsequent turn until you start a new session, run `/clear`, or run `/compact` inside claude. Each new turn from claude is spliced onto the fork's history at the penultimate-user message, so the upstream Anthropic API sees a coherent conversation that picks up from your edit instead of from claude's local jsonl.
+Once you run `rewind_to`, retcon doesn't just rewrite one /v1/messages call — it keeps the forked branch alive across every subsequent turn until you start a new session, run `/clear`, or run `/compact` inside claude. Each new turn from claude is spliced onto the fork's history at the penultimate-user message, so the upstream Anthropic API sees a coherent conversation that picks up from your edit instead of from claude's local jsonl.
 
-The branch survives daemon restarts, `claude --resume`, and `claude --continue`. Run a fresh `fork_back` to switch branches. Run `/clear` or `/compact` inside claude to release the fork and let claude's local view drive future turns.
+The branch survives daemon restarts, `claude --resume`, and `claude --continue`. Run a fresh `rewind_to` to switch branches. Run `/clear` or `/compact` inside claude to release the fork and let claude's local view drive future turns.
 
 ## Actors and cleanup
 
@@ -44,16 +44,35 @@ Every session is tagged with an actor name. The default actor is `default`; pass
 
 This is destructive of the event log (the source-of-truth append-only history) for that actor. The intended use is cleaning up integration-test runs and unwanted exploration. Other actors' data is untouched.
 
-## Fork tools
+## Rewind tools
 
 Available to claude inside the session via the MCP server retcon auto-registers as `mcp__retcon__*`:
 
-- `fork_list` — list every previous turn that's still forkable
-- `fork_show` — inspect a specific revision's request and response
-- `fork_bookmark` — pin a revision so it survives garbage collection
-- `fork_back` — roll the conversation back to a chosen revision and replace your next message
+- `recall` — list recent forkable turns (no args) OR inspect one (`turn_back_n: N` for the Nth turn back, `turn_id: "..."` for a specific id). Returns content previews so you can pick a target without dumping the full conversation.
+- `rewind_to` — roll the conversation back to a chosen turn and replace the next message. **Two-step call**: the first call returns rules + a single-use `confirm_clean`/`confirm_meta` token pair; the AI classifies its own message (does it stand alone, or does it contain a meta-reference to cut-off content?) and re-calls with the matching token. Catches the AI before it sends a `"redo your last answer"`-style message that would confuse the post-rewind context.
+- `bookmark` — pin the latest forkable turn with an optional human label so you can return to it via `recall` later.
 
-Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state.
+**When to reach for which:**
+
+| You want to... | Tool |
+|---|---|
+| See what turns you can rewind to | `recall` (no args) |
+| Inspect a specific turn before rewinding | `recall` with `turn_id` or `turn_back_n` |
+| Actually rewind | `rewind_to` (two-step: first call returns rules + tokens, second call applies) |
+| Save a spot to return to later | `bookmark` |
+
+Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets.
+
+### What "two-step" means for `rewind_to`
+
+The AI handling the next /v1/messages after a rewind has *no memory* of the rewind — its context is the rewound history + your `message` arg as the next user-role turn. If `message` says "redo your previous answer", that AI sees no "previous answer" anywhere in its visible history and produces a confused response.
+
+To prevent this, `rewind_to` returns rules + a token pair on the first call. The rules text teaches the AI to write a self-contained `message` (no meta-references to cut-off content). The AI then re-calls with one of two tokens:
+
+- `confirm=<clean_token>` — the AI's own claim that the message stands alone. Server runs a narrow regex backstop on a 4-pattern list (catches "see above", "continue from here", "redo your last answer", "the last/previous question I asked") and either writes the rewind to the TOBE pending file or rejects with a fresh token pair.
+- `confirm=<meta_token>` — the AI self-flagged a meta-reference. Server returns "good catch — revise" with new tokens.
+
+Tokens are 8-char opaque random per call, server-side keyed by session_id with a 5-min TTL, single-use. The AI can't pick the "ship it" path without reading the rules text to learn which token does what. Pass `allow_meta_refs: true` if your message intentionally references content visible in the rewound history.
 
 ## Custom upstream
 
@@ -73,10 +92,10 @@ If a daemon is already running with a different upstream, retcon errors with an 
 
 - claude can't accept `--session-id` together with `--resume`, so retcon mints a binding token and installs a `SessionStart` command hook via `--settings`.
 - When the picker resolves (or `--continue` picks the latest), the hook fires and posts claude's actual session id back to the daemon's `/hooks/session-start`.
-- The daemon re-keys events and revisions from the binding token to the actual session id, reconnecting the DAG so `fork_back` can walk across the resume boundary.
+- The daemon re-keys events and revisions from the binding token to the actual session id, reconnecting the DAG so `rewind_to` can walk across the resume boundary.
 - For new sessions the binding token equals claude's session id and the rebind is a no-op.
 
-If you pass `--session-id <uuid>` to a new session, retcon adopts your id rather than minting one of its own. The id you typed is the id you'll see in the local jsonl filename and fork tools.
+If you pass `--session-id <uuid>` to a new session, retcon adopts your id rather than minting one of its own. The id you typed is the id you'll see in the local jsonl filename and rewind tools.
 
 ## Mergeable user args / env
 

@@ -9,7 +9,7 @@
 // Lifecycle:
 //
 //   start  → openDb + migrate
-//          → createTobeStore + createDefaultProducer + createForkTools
+//          → createTobeStore + createDefaultProducer + createMcpTools
 //          → startServer
 //          → write PID file
 //          → install signal handlers
@@ -34,7 +34,7 @@
 import fs from 'node:fs'
 
 import { closeDb, migrate, openDb } from '../db.js'
-import { createForkTools } from '../mcp-tools.js'
+import { createMcpTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { createDefaultProducer, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
@@ -79,7 +79,7 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())
   const storageProvider = new SqliteStorageProvider(db)
-  const mcpTools = createForkTools({ db, tobeStore, storageProvider, forkBackEnabled: true })
+  const mcpTools = createMcpTools({ db, tobeStore, storageProvider, rewindEnabled: true })
 
   const handle = await startServer({
     port,

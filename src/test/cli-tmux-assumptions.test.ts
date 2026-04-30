@@ -210,7 +210,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     )
     const taskId = sql(`SELECT task_id FROM sessions WHERE id='${sid}'`)
 
-    // Two warmup turns, then fork_back. Same shape as the persistence test.
+    // Two warmup turns, then rewind_to. Same shape as the persistence test.
     const warmup = async (msg: string, count: number): Promise<void> => {
       tmux('send-keys', '-t', sessionName, msg)
       tmux('send-keys', '-t', sessionName, 'C-m')
@@ -224,7 +224,10 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     await warmup('Remember the secret word AARDVARK. Reply with just OK.', 2)
 
     tmux('send-keys', '-t', sessionName,
-      'Call mcp__retcon__fork_back with arguments {"n":1, "message":"What is the secret word?"}. '
+      'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"What is the secret word?"}. '
+      + 'It will return status:rules_returned + a confirm_clean token. '
+      + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
+      + 'confirm=<the confirm_clean value from the first response>. '
       + 'Then in your reply, just say DONE.')
     tmux('send-keys', '-t', sessionName, 'C-m')
 
@@ -311,7 +314,10 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     await warmup('Remember the secret word AARDVARK. Reply with just OK.', 2)
 
     tmux('send-keys', '-t', sessionName,
-      'Call mcp__retcon__fork_back with arguments {"n":1, "message":"What is the secret word?"}. '
+      'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"What is the secret word?"}. '
+      + 'It will return status:rules_returned + a confirm_clean token. '
+      + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
+      + 'confirm=<the confirm_clean value from the first response>. '
       + 'Then in your reply, just say DONE.')
     tmux('send-keys', '-t', sessionName, 'C-m')
 
@@ -429,7 +435,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     //
     // We deliberately don't wait for `session.branch_context_cleared` —
     // that event only fires when branch_context_json was non-NULL at
-    // hook time, and this test doesn't run a fork_back. The H1 (compact)
+    // hook time, and this test doesn't run a rewind_to. The H1 (compact)
     // test above covers the cleared-event side; this one isolates the
     // summarization-shape assumption.
     await waitFor(

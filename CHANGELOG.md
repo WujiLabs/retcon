@@ -2,6 +2,43 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.4.0-alpha.0] - 2026-04-30
+
+The release where retcon's MCP tools stop sounding like protocol jargon and start sounding like what the user actually wants to do. The empirical signal that drove this: Sonnet didn't reach for `fork_back` even when asked to rewind, while Opus did. That's a tool-design problem, not a model problem. We renamed (hard cut, no aliases — pre-1.0 alpha policy), rewrote descriptions in USE WHEN form, leaned out result text, and added a progressive-disclosure guardrail on `rewind_to` that delivers rules + an opaque dual-secret classifier on the first call so the AI can't bypass the rules-read with a guessed value.
+
+### Migration
+
+**Hard cut.** No deprecated aliases. If you have anything pointing at the old tool names, update it:
+
+| Old | New | Notes |
+|---|---|---|
+| `mcp__retcon__fork_list` | `mcp__retcon__recall` | No args = list. |
+| `mcp__retcon__fork_show` | `mcp__retcon__recall` | Pass `turn_id` or `turn_back_n` for detail mode. |
+| `mcp__retcon__fork_back` | `mcp__retcon__rewind_to` | Two-step now: first call returns rules + tokens, re-call with `confirm=<clean_token>`. |
+| `mcp__retcon__fork_bookmark` | `mcp__retcon__bookmark` | Same semantics. |
+| `n` argument on `fork_back` | `turn_back_n` on `rewind_to` | Or pass `turn_id` to target a specific turn. |
+| `MAX_FORK_BACK_MESSAGE_BYTES` | `MAX_REWIND_MESSAGE_BYTES` | Same 1 MiB cap. |
+| `FORK_SHOW_MAX_DEPTH` | `RECALL_MAX_DEPTH` | Same 1000-depth cap. |
+| `createForkTools` | `createMcpTools` | Same factory shape; tests can use `createMcpToolsWithTokens` to inject a `ConfirmTokenStore` for assertions. |
+
+### Added
+
+- **`recall` MCP tool.** Combines `fork_list` + `fork_show` into one intent-aligned tool. No args lists recent forkable turns with content previews + turn ids. Pass `turn_back_n: N` or `turn_id: "..."` to inspect a specific turn. Lean result text by default (turn_id, position, preview, stop_reason); `verbose: true` exposes internal fields for debugging.
+- **`rewind_to` MCP tool — opaque dual-secret + narrow regex.** Replaces `fork_back`. First call WITHOUT a valid `confirm` token returns the rules text inline + a freshly-generated 8-char-random `confirm_clean` and `confirm_meta` token pair (server-side keyed by session_id with 5-min TTL, single-use). The AI classifies its own message and re-calls with the matching token. clean_token + clean message → narrow regex check (4 patterns: "see above", "continue from here/where we left off", "redo your/my last answer", "the last/previous question I asked/gave/sent") → write TOBE + return loud-failure-text response. clean_token + regex-matched message → rejection + new pair. meta_token → educational "good catch — revise" + new pair. The opaque tokens have no semantic prefix, so the AI can't pick the "ship it" path without reading the rules to learn which token does what. Includes `allow_meta_refs: true` escape hatch for the rare intentional case where a message references content visible in the rewound history.
+- **`bookmark` MCP tool.** Renamed from `fork_bookmark`. Same semantics, intent-aligned name + USE WHEN description.
+- **Permissions injection for `~/.retcon/dumps/`.** retcon's CLI now inline-merges `permissions.allow` entries for `Read/Edit/Write/Glob/Grep` over `<HOME>/.retcon/dumps/**` into the spawned claude's `--settings`. Lands in 0.4 even though the dumps directory is not used yet — it pre-allows the path that Phase 3's `dump_to_file` / `submit_file` tools will write to, so the AI can read/edit dumps without a permission prompt. Five entries per spawn, deduped against any user-supplied allowlist. New `retconAllowEntries(homeDir)` export in `cli/run.ts` for consumers + tests.
+- **Loud-failure response on staged-action tools.** `rewind_to`'s scheduled-success response now includes a `RETCON ERROR: If you are reading this, the rewind did NOT take effect. Tell the user retcon failed to apply the change.` body. On the success path, the proxy's body-splice replaces the entire turn carrying this response, so the AI never reads it. If the splice fails for any reason, the AI sees the response and surfaces the failure to the user — fail-loud-by-construction at zero implementation cost.
+- **Tests.** ~30 new unit tests covering dual-secret flow (first-call rules-return, static-value rejection, opaque-token regression guard, clean-token happy path, synthetic-message verbatim, meta-token self-flag, narrow regex catches, narrow regex no-false-positive regression guard, allow_meta_refs escape hatch, single-use consumption for both paths, TTL expiration), recall list-mode + detail-mode (turn_back_n + turn_id resolution, depth cap, verbose flag), bookmark, META_REFS detector + regex assertions, retconAllowEntries shape, settings-merge with user-supplied permissions (dedup, empty-permissions, append).
+
+### Changed
+
+- **MCP tool surface renamed.** Hard cut. See migration table above.
+- **Tool descriptions in USE WHEN format.** Each tool's description leads with `USE WHEN: <intent-anchored sentence>`, followed by what the tool does, and ends with `NEXT STEPS:` naming concrete follow-ups. Designed to pull the AI into intent-thinking, not protocol-thinking.
+- **Lean result text by default.** `recall` no longer returns `revision_id`, `task_id`, `parent_revision_id`, `asset_cid`, `classification`, etc. unless `verbose: true` is set. The default response is what the AI needs to make a decision: turn_id + preview + stop_reason. Internal fields move behind the verbose flag.
+- **`createForkTools` → `createMcpTools`** in `src/mcp-tools.ts`. The exported factory name now matches what the tools surface is. `createMcpToolsWithTokens(deps, tokenStore)` is exposed for tests that need to inject a custom `ConfirmTokenStore` (e.g., for TTL/single-use assertions).
+- **Constants renamed.** `MAX_FORK_BACK_MESSAGE_BYTES` → `MAX_REWIND_MESSAGE_BYTES`, `FORK_SHOW_MAX_DEPTH` → `RECALL_MAX_DEPTH`. Same values, same semantics.
+- **Test files updated.** `cli-tmux-integration.test.ts` and `cli-tmux-assumptions.test.ts` now drive `mcp__retcon__rewind_to` (with explicit two-step instructions in the prompt) instead of `mcp__retcon__fork_back`. A future Phase 4 will add a tool-adoption A/B harness that tests rewind tool use against both Sonnet and Opus.
+
 ## [0.3.0-alpha.0] - 2026-04-29
 
 The release where retcon's forks stop being one-shot. After `fork_back` you can keep going. Plus actor tagging + cleanup, content-addressed message storage that scales linearly with conversation length, and graceful handling of `/clear` and `/compact` inside claude.

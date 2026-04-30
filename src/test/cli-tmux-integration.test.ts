@@ -3,7 +3,7 @@
 //
 // End-to-end tmux-driven integration test. Spawns the retcon CLI inside a
 // detached tmux session, drives interactive Claude Code via send-keys, and
-// asserts the LLM actually invokes our `mcp__retcon__*` tools AND fork_back
+// asserts the LLM actually invokes our `mcp__retcon__*` tools AND rewind_to
 // reaches the daemon's event log (proves the session-correlation binding
 // works).
 //
@@ -18,7 +18,7 @@
 // We assert by querying the daemon's event log directly rather than parsing
 // claude's UI: claude's response wrapping varies and tmux capture timing is
 // flaky. The event log is the source of truth — fork.back_requested fires
-// only when fork_back actually succeeded end-to-end.
+// only when rewind_to actually succeeded end-to-end.
 //
 // Heavily gated. Requires:
 //   - RETCON_TEST_INTEGRATION=1 (gates all integration tests in the suite)
@@ -143,10 +143,10 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     cleanItestSessions()
   })
 
-  it('claude through retcon → fork_back actually walks the revision DAG end-to-end', async () => {
+  it('claude through retcon → rewind_to actually walks the revision DAG end-to-end', async () => {
     // --effort low for the warmup model: the default (high) burns thinking
     // budget on trivial prompts and the responses come back as max_tokens
-    // (classifier marks them dangling_unforkable, fork_back has nothing to
+    // (classifier marks them dangling_unforkable, rewind_to has nothing to
     // target). Low effort still uses the same model but skips deep thinking.
     tmux(
       'new-session', '-d', '-s', SESSION, '-x', '200', '-y', '50',
@@ -190,11 +190,16 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     await warmup('APPLE', 1)
     await warmup('BANANA', 2)
 
-    // Now ask claude to invoke fork_back. Source of truth is the event log:
-    // fork.back_requested fires only on successful fork_back (all guards
-    // passed, target found, TOBE written).
+    // Now ask claude to invoke rewind_to. Source of truth is the event log:
+    // fork.back_requested fires only on successful rewind_to (all guards
+    // passed, target found, TOBE written). Note: rewind_to is two-step —
+    // first call returns rules + a confirm token, second call (with the
+    // clean_token) does the work. We instruct claude to do both.
     tmux('send-keys', '-t', SESSION,
-      'Call mcp__retcon__fork_back with arguments {"n":1, "message":"CHERRY"}. '
+      'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"CHERRY"}. '
+      + 'It will return status:rules_returned + a confirm_clean token. '
+      + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
+      + 'confirm=<the confirm_clean value from the first response>. '
       + 'Then in your reply, just say DONE.',
     )
     tmux('send-keys', '-t', SESSION, 'C-m')
@@ -235,15 +240,15 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
   //   - SessionStart hook config rejected by claude (we tripped on this once:
   //     v2.1.122 silently drops type:"http" hooks for SessionStart)
   //   - Hook fires but the daemon endpoint doesn't rebind correctly → resumed
-  //     session ends up under T, fork_back can't see the original session's
+  //     session ends up under T, rewind_to can't see the original session's
   //     revisions
-  //   - Rebind happens but DAG isn't reconnected → fork_back targets land
+  //   - Rebind happens but DAG isn't reconnected → rewind_to targets land
   //     under the binding-token's sub-DAG instead of the original tail
   //
   // We use `--resume <sessionId>` (positional) to bypass the picker UI; the
   // picker is interactive and tmux-driving it is brittle. Picker behavior is
   // covered manually.
-  it('claude --resume binds late + fork_back walks across the resume boundary', async () => {
+  it('claude --resume binds late + rewind_to walks across the resume boundary', async () => {
     // Capture the session created by the prior test. If that test ran first,
     // we have a valid claude-code session row with closed_forkable revisions
     // we can fork back into.
@@ -296,7 +301,7 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     const actorAfterRebind = sql(`SELECT actor FROM sessions WHERE id='${originalSessionId}'`)
     expect(actorAfterRebind).toBe(TEST_ACTOR)
 
-    // Now ask claude to fork_back. The fork_point_revision_id MUST be a
+    // Now ask claude to rewind_to. The fork_point_revision_id MUST be a
     // revision from the original task (proves DAG reconnection worked: the
     // resumed session's revisions land under originalTaskId, and the most
     // recent closed_forkable in that task is reachable as a fork target).
@@ -310,7 +315,10 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     ), 10)
 
     tmux('send-keys', '-t', RESUME_SESSION,
-      'Call mcp__retcon__fork_back with arguments {"n":1, "message":"DURIAN"}. '
+      'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"DURIAN"}. '
+      + 'It will return status:rules_returned + a confirm_clean token. '
+      + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
+      + 'confirm=<the confirm_clean value from the first response>. '
       + 'Then in your reply, just say DONE.',
     )
     tmux('send-keys', '-t', RESUME_SESSION, 'C-m')
@@ -344,10 +352,10 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
   }, 240000)
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Persistent fork: messages AFTER fork_back continue building on the
+  // Persistent fork: messages AFTER rewind_to continue building on the
   // forked branch instead of reverting to claude's local jsonl history.
   //
-  // What this catches: an earlier implementation of fork_back was one-shot —
+  // What this catches: an earlier implementation of rewind_to was one-shot —
   // TOBE swap on the immediate-next /v1/messages, then claude's subsequent
   // turns sent its own (un-forked) history upstream. The forked context
   // disappeared after one turn. With branch_context_json on the session row,
@@ -358,9 +366,9 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
   // Test design:
   //   1. Start retcon, run two warmup turns introducing TWO different
   //      "secret words" (ZEBRA first, then AARDVARK).
-  //   2. Call fork_back(n=1) which rolls back the AARDVARK turn and asks
-  //      "What is the secret word?" — model should answer ZEBRA, the only
-  //      word in the forked branch's context.
+  //   2. Call rewind_to(turn_back_n=1) which rolls back the AARDVARK turn
+  //      and asks "What is the secret word?" — model should answer ZEBRA,
+  //      the only word in the forked branch's context.
   //   3. Send a follow-up "Tell me again, what is the secret word?" — model
   //      should STILL answer ZEBRA (this is the persistence check; without
   //      branch_context_json it would see AARDVARK in claude's local jsonl
@@ -373,7 +381,7 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
   // accumulates each (user, assistant) pair as turns happen. Counting
   // assistant messages and checking each contains "ZEBRA" but never
   // "AARDVARK" is reliable across model variation in exact wording.
-  it('fork_back persists across multiple turns AND across --resume', async () => {
+  it('rewind_to persists across multiple turns AND across --resume', async () => {
     const FORK_ACTOR = `${TEST_ACTOR}-persist`
     const FORK_SESSION = 'retcon-vitest-itest-fork'
     const FORK_RESUME_SESSION = 'retcon-vitest-itest-fork-resume'
@@ -427,14 +435,17 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       await warmup('Remember the secret word ZEBRA. Reply with just OK.', 1)
       await warmup('Remember the secret word AARDVARK. Reply with just OK.', 2)
 
-      // Trigger fork_back. This:
+      // Trigger rewind_to. This:
       //   - rolls back to before AARDVARK was introduced
       //   - sends the new question through the TOBE swap
       //   - sets sessions.branch_context_json so subsequent turns continue
       //     on the forked branch
       tmux('send-keys', '-t', FORK_SESSION,
-        'Call mcp__retcon__fork_back with arguments {"n":1, '
+        'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, '
         + '"message":"What is the secret word? Reply EXACTLY ONE WORD, no punctuation."}. '
+        + 'It will return status:rules_returned + a confirm_clean token. '
+        + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
+        + 'confirm=<the confirm_clean value from the first response>. '
         + 'Then in your reply, just say DONE.',
       )
       tmux('send-keys', '-t', FORK_SESSION, 'C-m')
@@ -444,11 +455,11 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
         90000,
         'fork.back_requested event',
       )
-      // After fork_back fires, sessions.branch_context_json must be populated.
+      // After rewind_to fires, sessions.branch_context_json must be populated.
       await waitFor(
         () => parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10) > 0,
         10000,
-        'branch_context_json populated after fork_back',
+        'branch_context_json populated after rewind_to',
       )
 
       // Wait for the TOBE-applied response to land (this is the immediate

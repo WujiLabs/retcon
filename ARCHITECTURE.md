@@ -15,29 +15,51 @@ There is no "retcon mode" inside claude. claude doesn't know it's running under 
 
 ## How the AI sees its past, and why it gets to fork
 
-`fork_list`, `fork_show`, `fork_bookmark`, and `fork_back` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains four entries in `tools/list`.
+`recall`, `rewind_to`, and `bookmark` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains three entries in `tools/list`.
 
-This is a deliberate choice. Fork tools could have been a CLI command or a slash-command UI; they're tools instead so the AI itself can decide to rewind. A model that recognizes its current path is going off the rails can `fork_back 2` without the user pulling a lever. retcon's model isn't "user rewinds the model"; it's "the AI has agency over its own past."
+The names are intent-aligned, not protocol-aligned. The earlier surface (`fork_list`, `fork_show`, `fork_back`, `fork_bookmark`) was technically correct but pulled the model into protocol-thinking. The empirical signal: Sonnet didn't reach for `fork_back` even when explicitly asked to rewind. We renamed in v0.4 (hard cut, no aliases) and rewrote descriptions in `USE WHEN: <intent sentence>` form. "fork" is engineer jargon; "rewind" is what the user means.
 
-## The fork_back trick: why the rewind doesn't replace the in-flight turn
+This is also a deliberate architectural choice. Rewind could have been a CLI command or a slash-command UI; it's a tool instead so the AI itself can decide to rewind. A model that recognizes its current path is going off the rails can call `rewind_to(turn_back_n=2, ...)` without the user pulling a lever. retcon's model isn't "user rewinds the model"; it's "the AI has agency over its own past."
 
-`fork_back` gets called inside an in-flight `tool_use` round-trip. Anthropic's protocol forbids replying to a `tool_use` with anything other than a `tool_result`. So we acknowledge `fork_back` with `{status: "scheduled"}` as its tool_result, let claude finish that turn cleanly, and apply the rewind on the *next* LLM call.
+## The rewind_to trick: why the rewind doesn't replace the in-flight turn
+
+`rewind_to` gets called inside an in-flight `tool_use` round-trip. Anthropic's protocol forbids replying to a `tool_use` with anything other than a `tool_result`. So we acknowledge `rewind_to` with `{status: "scheduled", ...}` as its tool_result, let claude finish that turn cleanly, and apply the rewind on the *next* LLM call.
 
 That next LLM call is **guaranteed to happen**. After any `tool_use → tool_result` round-trip, the harness has to give the model another turn so it can read the result and decide what to do next. That's just how tool use works in any tool-capable LLM API: the model interprets the result, then either calls more tools or emits a final answer. retcon piggybacks on that guaranteed next-turn.
 
-The TOBE pending file is the one-shot baton. `fork_back` writes the desired messages array to `~/.retcon/tobe/tobe_pending-<sid>.json`. The next outbound `/v1/messages` reads it, swaps the body's `messages[]`, and deletes the file. Atomic via tempfile + rename.
+The TOBE pending file is the one-shot baton. `rewind_to` writes the desired messages array to `~/.retcon/tobe/tobe_pending-<sid>.json`. The next outbound `/v1/messages` reads it, swaps the body's `messages[]`, and deletes the file. Atomic via tempfile + rename.
 
-Insight: **separating WHEN the fork is requested from WHEN it's applied is what makes the protocol legal.** The in-flight turn closes naturally with a normal tool_result. The rewind happens between turns, invisibly.
+Insight: **separating WHEN the rewind is requested from WHEN it's applied is what makes the protocol legal.** The in-flight turn closes naturally with a normal tool_result. The rewind happens between turns, invisibly.
+
+## The dual-secret guardrail (v0.4)
+
+The post-rewind AI has *no memory* of the rewind. Its context is the rewound history + the calling AI's `message` arg as the next user-role turn. If `message` says "redo your previous answer", the post-rewind AI sees no "previous answer" anywhere in its visible history and produces a confused response.
+
+`rewind_to` defends this with three layers:
+
+1. **Progressive disclosure with an opaque dual-secret classifier.** The first call WITHOUT a valid `confirm` token returns the rules text inline + a freshly-generated 8-char-random `confirm_clean` and `confirm_meta` token pair. The rules teach the AI to write a self-contained `message`. The AI re-calls with the matching token: clean if its message stands alone, meta if it spotted a meta-reference. Tokens are server-side keyed by session_id with a 5-min TTL, single-use. Opaque (no semantic prefix like `PROCEED-*`) so the AI can't pick the "ship it" path without reading the rules to learn which token does what.
+
+2. **Narrow regex backstop.** On the clean-token path, a 4-pattern regex catches the worst-case meta-references the AI engaged with the rules but still missed: "see above", "continue from here / where we left off", "redo your/my last answer", "the last/previous question I asked / gave / sent". False-positive rate near zero — these don't have plausible legitimate uses. Earlier drafts had 8 patterns including "previous answer" and "as I said"; those were dropped because the dual-secret classifier handles ambiguous cases better than static patterns. Pass `allow_meta_refs: true` for the rare intentional case.
+
+3. **Loud-failure response.** The scheduled-success response includes `RETCON ERROR: If you are reading this, the rewind did NOT take effect. Tell the user retcon failed.` On the success path, the proxy's body-splice replaces the entire turn carrying this response, so the AI never reads it. If the splice fails for any reason, the AI sees the response and surfaces the failure to the user — fail-loud-by-construction at zero implementation cost.
+
+Why this shape: the rules can't live in the tool description (every conversation that loads retcon would pay the token cost on every turn, even ones that never rewind, and after a rewind the rules are in turns that get thrown out anyway). Progressive disclosure delivers the rules on demand, fresh, right before the action lands.
 
 ## What the rewound context actually looks like
 
-The TOBE messages array shape is `[...history-up-to-fork-point, {role: "user", content: <fork_back's message argument>}]`. The synthetic user message at the tail is the rewind instruction.
+The TOBE messages array shape is `[...history-up-to-fork-point, {role: "user", content: <rewind_to's message argument>}]`. The synthetic user message at the tail is the rewind instruction.
 
-This shape is load-bearing. The model needs a normal-looking user turn at the end so its next response has a clear next-action. From the model's POV the next turn is just "responding to a user message that says X starting from state Y." It doesn't see fork_back's internals; the rewind is invisible on the receiving side. The contract surfaced to the LLM is explicit ("`message` becomes the next user turn"), but the *mechanism* is hidden.
+This shape is load-bearing. The model needs a normal-looking user turn at the end so its next response has a clear next-action. From the model's POV the next turn is just "responding to a user message that says X starting from state Y." It doesn't see rewind_to's internals; the rewind is invisible on the receiving side. The contract surfaced to the LLM is explicit ("`message` becomes the next user turn"), but the *mechanism* is hidden.
+
+The `message` arg is delivered VERBATIM. No prefix, no wrapping, no `[retcon: this is a rewound context]` metadata. The dual-secret guardrail above is what ensures the AI writes a self-contained message in the first place; once that's verified, retcon stays out of the way.
+
+## What gets rewritten upstream
+
+retcon only swaps `messages[]`. The system prompt and `tools[]` come from claude's outgoing body unchanged. This is a deliberate scope reduction in v0.4: rewriting tools[] would let us add tools mid-conversation but at the cost of every rewind-affected turn diverging from claude's local view of what tools exist. We don't do that. The model's tool set is whatever claude's harness configured for the current invocation; the rewind only edits history.
 
 ## Persistent fork: how the rewound branch survives across turns
 
-After fork_back, retcon doesn't just rewrite one `/v1/messages` and stop. It keeps the forked branch alive across every subsequent turn until you explicitly release it. Each session row carries a `branch_context_json` column: a JSON array holding the full conversation in the active forked branch.
+After rewind_to, retcon doesn't just rewrite one `/v1/messages` and stop. It keeps the forked branch alive across every subsequent turn until you explicitly release it. Each session row carries a `branch_context_json` column: a JSON array holding the full conversation in the active forked branch.
 
 For each `/v1/messages` from claude, the proxy:
 

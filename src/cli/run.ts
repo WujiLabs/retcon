@@ -32,6 +32,7 @@
 
 import { randomUUID } from 'node:crypto'
 import http from 'node:http'
+import os from 'node:os'
 
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { DEFAULT_ACTOR, extractActor } from './arg-parse.js'
@@ -157,11 +158,38 @@ export function pickTransportId(args: readonly string[], isResume: boolean): str
 }
 
 /**
- * Build the --settings JSON that gets handed to claude. Always installs
- * retcon's SessionStart command hook for binding-token rebind. If the user
- * passed their own --settings (file path or inline JSON), we deep-merge:
- * SessionStart hook entries are appended to the user's array; everything
- * else under `hooks.*` and other top-level keys is preserved as-is.
+ * Compute the permissions.allow entries that retcon pre-installs on every
+ * spawned claude. Today these cover `~/.retcon/dumps/` so the AI can
+ * Read/Edit/Write/Glob/Grep dump files without prompting the user (Phase 3
+ * dump_to_file/submit_file flow). Lands in Phase 1 as part of the v0.4
+ * release even though the dumps directory is not used yet — pre-allowing a
+ * not-yet-existing path is harmless and bakes the full permissions story
+ * into one release.
+ *
+ * Each entry is in the Claude Code permissions DSL: `Tool(<glob>)`. The glob
+ * uses `**` so any depth under the dumps directory matches.
+ */
+export function retconAllowEntries(homeDir: string): string[] {
+  const dumpsGlob = `${homeDir}/.retcon/dumps/**`
+  return [
+    `Read(${dumpsGlob})`,
+    `Edit(${dumpsGlob})`,
+    `Write(${dumpsGlob})`,
+    `Glob(${dumpsGlob})`,
+    `Grep(${dumpsGlob})`,
+  ]
+}
+
+/**
+ * Build the --settings JSON that gets handed to claude. Always installs:
+ *   - retcon's SessionStart command hook (for binding-token rebind), and
+ *   - the dumps-path permissions allowlist (so the AI can read/edit dumps
+ *     without prompting the user).
+ *
+ * If the user passed their own --settings (file path or inline JSON), we
+ * deep-merge: SessionStart hook entries are appended to the user's array;
+ * permissions.allow entries are appended (deduped); everything else under
+ * `hooks.*`, `permissions.*`, and other top-level keys is preserved as-is.
  *
  * Returns the combined JSON string AND a copy of `args` with the user's
  * `--settings <value>` removed (we replace it with our merged version so
@@ -170,6 +198,7 @@ export function pickTransportId(args: readonly string[], isResume: boolean): str
 export function buildSettingsAndArgs(
   args: readonly string[],
   ourHookCmd: string,
+  ourAllowEntries: readonly string[] = retconAllowEntries(os.homedir()),
 ): { settings: string, argsWithoutSettings: string[] } {
   const ourHookEntry = {
     hooks: [
@@ -181,10 +210,15 @@ export function buildSettingsAndArgs(
     ],
   }
 
+  const baseSettings = (): Record<string, unknown> => ({
+    hooks: { SessionStart: [ourHookEntry] },
+    permissions: { allow: [...ourAllowEntries] },
+  })
+
   const userValue = readFlag(args, '--settings')
   if (userValue === undefined) {
     return {
-      settings: JSON.stringify({ hooks: { SessionStart: [ourHookEntry] } }),
+      settings: JSON.stringify(baseSettings()),
       argsWithoutSettings: [...args],
     }
   }
@@ -195,7 +229,7 @@ export function buildSettingsAndArgs(
     // flag, install ours, and let claude surface their bad input via its
     // own settings-loader if there's still something to load.
     return {
-      settings: JSON.stringify({ hooks: { SessionStart: [ourHookEntry] } }),
+      settings: JSON.stringify(baseSettings()),
       argsWithoutSettings: removeFlag(args, '--settings'),
     }
   }
@@ -209,6 +243,18 @@ export function buildSettingsAndArgs(
     : [ourHookEntry]
   hooksRaw.SessionStart = sessionStartArr
   merged.hooks = hooksRaw
+
+  // Permissions merge: append our allow entries, dedupe against the user's.
+  const userPermsRaw = parsed.permissions
+  const userPerms = isRecord(userPermsRaw) ? { ...userPermsRaw } : {}
+  const userAllowRaw = userPerms.allow
+  const userAllow: string[] = Array.isArray(userAllowRaw)
+    ? userAllowRaw.filter((s): s is string => typeof s === 'string')
+    : []
+  const seen = new Set(userAllow)
+  const additions = ourAllowEntries.filter(e => !seen.has(e))
+  userPerms.allow = [...userAllow, ...additions]
+  merged.permissions = userPerms
 
   return {
     settings: JSON.stringify(merged),
