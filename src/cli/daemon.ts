@@ -60,6 +60,14 @@ const PENDING_ACTOR_GC_TTL_MS = 60 * 60 * 1000
 const DUMPS_GC_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
+ * How often to re-sweep dumps after the daemon starts. A startup-only
+ * sweep would let dumps accumulate indefinitely on a long-running
+ * daemon. Hourly is fine: the dumps dir's normal working set is
+ * dozens of files at most.
+ */
+const DUMPS_GC_INTERVAL_MS = 60 * 60 * 1000
+
+/**
  * Run the daemon body. Blocks until SIGTERM/SIGINT (clean shutdown) or
  * uncaughtException (emergency shutdown). Resolves with the exit code.
  *
@@ -88,8 +96,16 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   // Garbage-collect stale dumps. dump_to_file writes JSONL conversation
   // snapshots that submit_file later reads back; either the AI submits
   // within the same conversation or the dump is orphaned. 24-hour TTL
-  // is well past any reasonable session length.
-  gcDumps(retconDumpsDir(), DUMPS_GC_TTL_MS)
+  // is well past any reasonable session length. Sweep on boot AND on a
+  // recurring interval so a long-running daemon doesn't accumulate files
+  // forever — the unref() lets the process exit cleanly without waiting
+  // for the next tick.
+  const dumpsDirPath = retconDumpsDir()
+  gcDumps(dumpsDirPath, DUMPS_GC_TTL_MS)
+  const dumpsGcTimer = setInterval(() => {
+    gcDumps(dumpsDirPath, DUMPS_GC_TTL_MS)
+  }, DUMPS_GC_INTERVAL_MS)
+  dumpsGcTimer.unref()
 
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())
@@ -123,6 +139,7 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
       if (shuttingDown) return
       shuttingDown = true
       process.stdout.write(`[retcon] daemon got ${sig}, shutting down\n`)
+      clearInterval(dumpsGcTimer)
       await gracefulShutdown(handle, db)
       if (writePid) cleanupPidFile()
       resolve(exitCode)
@@ -181,6 +198,10 @@ function cleanupPidFile(): void {
  * a single failed unlink doesn't abort the rest. Errors reading the
  * directory itself are swallowed since dumps are scratch space and the
  * daemon must boot regardless. Exported for tests.
+ *
+ * Uses lstatSync (not statSync) so symlinks aren't followed — a user-
+ * placed symlink in dumps/ pointing outside is left alone rather than
+ * having its target inspected.
  */
 export function gcDumps(dir: string, ttlMs: number, now: number = Date.now()): void {
   let entries: string[]
@@ -194,8 +215,8 @@ export function gcDumps(dir: string, ttlMs: number, now: number = Date.now()): v
   for (const name of entries) {
     const full = path.join(dir, name)
     try {
-      const stat = fs.statSync(full)
-      if (!stat.isFile()) continue
+      const stat = fs.lstatSync(full)
+      if (!stat.isFile()) continue // skip dirs, symlinks, sockets, etc.
       if (stat.mtimeMs < cutoff) fs.unlinkSync(full)
     }
     catch {

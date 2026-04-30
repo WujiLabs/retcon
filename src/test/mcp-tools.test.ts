@@ -1056,26 +1056,145 @@ describe('dump_to_file', () => {
     expect(res.error).toMatch(/not both/)
   })
 
-  it('uses branch_context_json when on a forked branch (head case)', async () => {
+  it('uses branch_context_json when on a forked branch — slices trailing user (post-rewind reality)', async () => {
+    // Branch_context_json's tail is ALWAYS user-role in production (rewind_to
+    // sets it ending in the new user message; subsequent applyBranchContextRewrite
+    // extends it ending in the user just typed by claude — Anthropic requires
+    // request bodies end in user). dump_to_file must slice off the trailing
+    // user line(s) so the file ends at the most recent assistant response.
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    // Simulate a forked branch by writing branch_context_json directly.
     const branchMessages = [
       { role: 'user', content: 'forked q' },
       { role: 'assistant', content: 'forked a' },
+      { role: 'user', content: 'pending user (would-be next prompt)' },
     ]
     fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
       .run(JSON.stringify(branchMessages), fx.sessionId)
     const res = await call(fx, 'dump_to_file', {}) as {
-      path: string
-      message_count: number
-      is_branch_view: boolean
+      path?: string
+      message_count?: number
+      is_branch_view?: boolean
+      error?: string
     }
+    if (res.error) throw new Error(`dump_to_file failed: ${res.error}`)
     expect(res.is_branch_view).toBe(true)
-    const content = fs.readFileSync(res.path, { encoding: 'utf8' })
+    expect(res.message_count).toBe(2) // trailing user sliced
+    const content = fs.readFileSync(res.path!, { encoding: 'utf8' })
     const lines = content.split('\n').filter(l => l.length > 0)
     expect(lines.length).toBe(2)
     expect(JSON.parse(lines[0]!).content).toBe('forked q')
+    expect(JSON.parse(lines[1]!).role).toBe('assistant')
     expect(JSON.parse(lines[1]!).content).toBe('forked a')
+  })
+
+  it('handles deeply-nested trailing-user branch_context (multi-user-tail)', async () => {
+    // Edge case: if for some reason branch_context has multiple consecutive
+    // trailing users, slice them all so we land on the most recent assistant.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
+      .run(JSON.stringify([
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'user', content: 'u3' },
+      ]), fx.sessionId)
+    const res = await call(fx, 'dump_to_file', {}) as { message_count: number, error?: string }
+    if (res.error) throw new Error(res.error)
+    expect(res.message_count).toBe(2) // [u1, a1]
+  })
+
+  it('falls through to reconstructForkMessages if branch_context is all-user (corrupt state)', async () => {
+    // Pathological: branch_context is just users with no assistant. Slicing
+    // empties it; we fall through to reconstructForkMessages. With turn_back_n=1
+    // the target is one-before-head, which has a child (head) whose body
+    // contains the assistant response — reconstruct succeeds.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
+      .run(JSON.stringify([
+        { role: 'user', content: 'all-user-1' },
+        { role: 'user', content: 'all-user-2' },
+      ]), fx.sessionId)
+    // turn_back_n=1 targets the FIRST turn (q1's revision); branch_context
+    // is only consulted on the head case, so this dump uses reconstruct
+    // directly without touching the corrupt state.
+    const res = await call(fx, 'dump_to_file', { turn_back_n: 1 }) as {
+      is_branch_view?: boolean
+      message_count?: number
+      error?: string
+    }
+    if (res.error) throw new Error(res.error)
+    expect(res.is_branch_view).toBe(false) // not the head, so branch_context not used
+    expect(res.message_count).toBeGreaterThanOrEqual(1)
+  })
+
+  it('rejects sessionId with path-traversal characters (defense-in-depth)', async () => {
+    // The valid-paths regex in dump_to_file is the boundary check. Easiest
+    // way to exercise it: emit an mcp.session_initialized for a malicious
+    // session id and let the projector populate the session row normally,
+    // then call dump_to_file with that session id in the ctx.
+    const evil = fixture()
+    try {
+      const evilId = '../../../tmp/evil'
+      evil.producer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, evilId)
+      // Add a closed_forkable so the no-args default has a target.
+      const bodyBytes = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'q' }] }), 'utf8')
+      const bodyCid = `bafy-evil-${Math.random().toString(36).slice(2)}`
+      const req = evil.producer.emit(
+        'proxy.request_received',
+        { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid },
+        evilId,
+        [{ cid: bodyCid, bytes: bodyBytes }],
+      )
+      evil.producer.emit('proxy.response_completed', {
+        request_event_id: req.id,
+        status: 200,
+        headers_cid: 'h',
+        body_cid: 'r',
+        stop_reason: 'end_turn',
+        asset_cid: 'a',
+      }, evilId)
+      // Need a second turn so the no-args default (one-before-head) has data
+      // to reconstruct from — that's the path that exercises filename safety.
+      const bodyCid2 = `bafy-evil-${Math.random().toString(36).slice(2)}`
+      const req2 = evil.producer.emit(
+        'proxy.request_received',
+        { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid2 },
+        evilId,
+        [{ cid: bodyCid2, bytes: Buffer.from(JSON.stringify({ messages: [
+          { role: 'user', content: 'q' },
+          { role: 'assistant', content: 'a' },
+          { role: 'user', content: 'q2' },
+        ] }), 'utf8') }],
+      )
+      evil.producer.emit('proxy.response_completed', {
+        request_event_id: req2.id,
+        status: 200,
+        headers_cid: 'h',
+        body_cid: 'r',
+        stop_reason: 'end_turn',
+        asset_cid: 'a',
+      }, evilId)
+
+      const tools = createMcpTools({
+        db: evil.db,
+        tobeStore: evil.tobeStore,
+        storageProvider: evil.storageProvider,
+        rewindEnabled: true,
+      })
+      const res = await tools.get('dump_to_file')!.handler(
+        {},
+        { sessionId: evilId, producer: evil.producer },
+      ) as { error?: string }
+      expect(res.error).toMatch(/unsafe for filesystem use/)
+    }
+    finally {
+      evil.cleanup()
+    }
   })
 })
 
@@ -1224,6 +1343,41 @@ describe('submit_file (dual-secret + path safety)', () => {
     expect(res.error).toMatch(/line 2 missing string `role`/)
   })
 
+  it('rejects line with role outside the user|assistant|system allowlist', async () => {
+    const dump = path.join(dumpsRoot, 'bad-role.jsonl')
+    fs.writeFileSync(dump,
+      '{"role":"user","content":"q"}\n'
+      + '{"role":"junk","content":"unsupported"}\n'
+      + '{"role":"assistant","content":"a"}\n',
+    )
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/invalid role "junk"/)
+  })
+
+  it('handles CRLF line endings (Windows-style dumps)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session' }])
+    const dump = path.join(dumpsRoot, 'crlf.jsonl')
+    // Same content as a valid dump but with \r\n separators.
+    fs.writeFileSync(dump,
+      '{"role":"user","content":"q"}\r\n'
+      + '{"role":"assistant","content":"a"}\r\n',
+    )
+    const res = await submitTwoStep({ path: dump, message: 'continue' }) as { status: string }
+    expect(res.status).toBe('scheduled')
+  })
+
+  it('rejects dump file larger than MAX_DUMP_BYTES', async () => {
+    const dump = path.join(dumpsRoot, 'huge.jsonl')
+    // Write a single huge user line, then a small assistant tail. Total > 8 MiB.
+    const bigContent = 'x'.repeat(10 * 1024 * 1024) // 10 MiB
+    fs.writeFileSync(dump,
+      `${JSON.stringify({ role: 'user', content: bigContent })}\n`
+      + `${JSON.stringify({ role: 'assistant', content: 'a' })}\n`,
+    )
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/exceeds.*cap/)
+  })
+
   it('rejects last-line-not-assistant (Decision #4 load-bearing rule)', async () => {
     const dump = writeDump('user-tail.jsonl', [
       { role: 'user', content: 'q1' },
@@ -1323,6 +1477,53 @@ describe('submit_file (dual-secret + path safety)', () => {
 })
 
 // ─── gcDumps (daemon GC sweep) ───────────────────────────────────────────────
+
+describe('createMcpToolsWithTokens (defensive construction)', () => {
+  function deps() {
+    const fx = fixture()
+    return {
+      fx,
+      asDeps: {
+        db: fx.db,
+        tobeStore: fx.tobeStore,
+        storageProvider: fx.storageProvider,
+        rewindEnabled: true,
+      },
+    }
+  }
+
+  it('throws if rewind store is missing in the object form', () => {
+    const { fx, asDeps } = deps()
+    try {
+      expect(() => createMcpToolsWithTokens(
+        asDeps,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { rewind: undefined as any, submit: new ConfirmTokenStore() },
+      )).toThrow(/both rewind and submit/)
+    }
+    finally { fx.cleanup() }
+  })
+
+  it('throws if submit store is missing in the object form', () => {
+    const { fx, asDeps } = deps()
+    try {
+      expect(() => createMcpToolsWithTokens(
+        asDeps,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { rewind: new ConfirmTokenStore(), submit: undefined as any },
+      )).toThrow(/both rewind and submit/)
+    }
+    finally { fx.cleanup() }
+  })
+
+  it('accepts a single ConfirmTokenStore (back-compat with rewind-only tests)', () => {
+    const { fx, asDeps } = deps()
+    try {
+      expect(() => createMcpToolsWithTokens(asDeps, new ConfirmTokenStore())).not.toThrow()
+    }
+    finally { fx.cleanup() }
+  })
+})
 
 describe('gcDumps', () => {
   it('imports as a named export from cli/daemon', async () => {

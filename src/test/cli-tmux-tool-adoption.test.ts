@@ -96,11 +96,24 @@ async function waitFor(
 
 const describeIfRunnable = SHOULD_RUN ? describe : describe.skip
 
+// Every (scenario × model) combination uses a unique actor suffix. The set
+// is enumerated explicitly so cleanup hits all of them (retcon clean uses
+// exact-match WHERE actor = ?, not prefix). Add a new scenario? Add it here.
+const SCENARIO_SUFFIXES = ['rewind', 'bookmark', 'dump']
+const MODELS = ['sonnet', 'opus'] as const
+const ALL_ACTORS = SCENARIO_SUFFIXES.flatMap(s => MODELS.map(m => `${ADOPTION_ACTOR}-${s}-${m}`))
+
 function cleanAdoptionState(): void {
-  try {
-    execFileSync('retcon', ['clean', '--actor', ADOPTION_ACTOR, '--yes'], { stdio: 'ignore' })
+  // Wipe every actor combo this suite uses. Without iterating, a stale
+  // session from a prior run's `adopt-rewind-sonnet` would persist and
+  // make waitForReady's `ORDER BY created_at DESC LIMIT 1` return the
+  // OLD session id — every subsequent SQL targets the wrong row.
+  for (const actor of ALL_ACTORS) {
+    try {
+      execFileSync('retcon', ['clean', '--actor', actor, '--yes'], { stdio: 'ignore' })
+    }
+    catch { /* fine */ }
   }
-  catch { /* fine */ }
   try {
     if (fs.existsSync(DUMPS_DIR)) {
       // Sweep stale dumps so a previous run's files don't satisfy the
@@ -198,7 +211,7 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
   // The same scenario runs against both models. Failure on either is a
   // regression — adoption parity is the bar. If sonnet starts skipping a
   // tool the next claude release ships, this test catches it.
-  for (const model of ['sonnet', 'opus'] as const) {
+  for (const model of MODELS) {
     describe(`model=${model}`, () => {
       it('rewind_to: natural-language "rewind" prompt invokes the tool', async () => {
         const session = spawnClaude('rewind', model)

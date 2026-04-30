@@ -52,6 +52,24 @@ export const MAX_REWIND_MESSAGE_BYTES = 1024 * 1024 // 1 MiB
 export const RECALL_MAX_DEPTH = 1000
 
 /**
+ * Hard cap on dump_to_file's serialized output size and submit_file's input
+ * file size. Mirrors the 8 MiB cap on `branch_context_json` in proxy-handler
+ * — if a conversation is too long for an in-memory branch context, it's also
+ * too long for a JSONL dump+submit round-trip. Without this, a runaway dump
+ * fills the disk and an attacker-crafted submit blows up the daemon's heap.
+ */
+export const MAX_DUMP_BYTES = 8 * 1024 * 1024 // 8 MiB
+
+/**
+ * Filename-safety regex for the session id component of dump filenames.
+ * Defense-in-depth against a malformed/malicious Mcp-Session-Id header
+ * making `${sessionId}-${turnId}.jsonl` escape the dumps directory via path
+ * traversal. The proxy already mints UUIDs, but the binding-table can carry
+ * any string; we sanitize at the boundary anyway.
+ */
+const SAFE_SESSION_ID_RE = /^[A-Za-z0-9._-]+$/
+
+/**
  * Confirm-token TTL. After 5 minutes the token pair is considered stale
  * and the AI's next call returns fresh rules + a new pair.
  */
@@ -674,6 +692,14 @@ export function createMcpToolsWithTokens(
 ): Map<string, McpTool> {
   const rewindStore = stores instanceof ConfirmTokenStore ? stores : stores.rewind
   const submitStore = stores instanceof ConfirmTokenStore ? stores : stores.submit
+  // Defensive: caller could pass {rewind: store, submit: undefined} which
+  // type-checks but explodes later when submit_file calls submitStore.match().
+  // Fail loudly at construction time instead.
+  if (!(rewindStore instanceof ConfirmTokenStore) || !(submitStore instanceof ConfirmTokenStore)) {
+    throw new Error(
+      'createMcpToolsWithTokens: both rewind and submit ConfirmTokenStores are required',
+    )
+  }
   const tools = new Map<string, McpTool>()
 
   // ── recall ────────────────────────────────────────────────────────────────
@@ -1156,16 +1182,37 @@ export function createMcpToolsWithTokens(
       // branch's view directly — that's the truth of what Anthropic has been
       // seeing across this branch's lifetime. Otherwise reconstruct from the
       // request body via reconstructForkMessages (same path rewind_to uses).
+      //
+      // CRITICAL: branch_context_json's tail is ALWAYS user-role in production.
+      // rewind_to writes it as [history..., new_user_message]; subsequent
+      // applyBranchContextRewrite extends it to [..., asst, final_user]
+      // because Anthropic requires request bodies end in user. So when we
+      // adopt branch_context as the dump source, we MUST slice off the
+      // trailing user line(s) to satisfy the load-bearing assistant-tail
+      // rule. See proxy-handler.ts:240-274 for the upstream invariant.
       let messages: unknown[] | null = null
       const branchRow = deps.db.prepare(
         'SELECT branch_context_json FROM sessions WHERE id = ?',
       ).get(ctx.sessionId) as { branch_context_json: string | null } | undefined
       const headRev = mostRecentForkableRevision(deps.db, sess.task_id)
       const isHead = headRev?.id === target.id
-      if (isHead && branchRow?.branch_context_json) {
+      const usedBranchView = isHead && !!branchRow?.branch_context_json
+      if (usedBranchView) {
         try {
-          const parsedJson = JSON.parse(branchRow.branch_context_json) as unknown
-          if (Array.isArray(parsedJson)) messages = parsedJson
+          const parsedJson = JSON.parse(branchRow!.branch_context_json!) as unknown
+          if (Array.isArray(parsedJson)) {
+            // Slice off any trailing user line(s) so the dump ends at the
+            // most recent assistant response. Empty result falls through to
+            // reconstructForkMessages.
+            const trimmed = [...parsedJson]
+            while (
+              trimmed.length > 0
+              && (trimmed[trimmed.length - 1] as { role?: unknown } | null | undefined)?.role === 'user'
+            ) {
+              trimmed.pop()
+            }
+            if (trimmed.length > 0) messages = trimmed
+          }
         }
         catch { /* fall through to reconstruction */ }
       }
@@ -1177,9 +1224,7 @@ export function createMcpToolsWithTokens(
       }
 
       // The load-bearing rule: dumps must end with assistant role so
-      // submit_file's appended user message blends naturally. Both source
-      // paths (branch_context_json + reconstructForkMessages) should already
-      // satisfy this, but verify.
+      // submit_file's appended user message blends naturally.
       const lastMsg = messages[messages.length - 1] as { role?: unknown } | undefined
       if (!lastMsg || lastMsg.role !== 'assistant') {
         return {
@@ -1187,9 +1232,20 @@ export function createMcpToolsWithTokens(
         }
       }
 
+      // Defense-in-depth: sanitize the session id component of the filename
+      // so a malformed Mcp-Session-Id can't escape dumpsDir via path traversal.
+      // The proxy mints UUIDs that pass this regex; orphan/binding-table
+      // sessions in theory could carry odd strings.
+      if (!SAFE_SESSION_ID_RE.test(ctx.sessionId)) {
+        return {
+          error: `session id contains characters unsafe for filesystem use; cannot dump (id=${ctx.sessionId.slice(0, 32)}...)`,
+        }
+      }
+
       // Write JSONL atomically: tmpfile + rename. Filename includes session
       // and target ids so different sessions / different rewind anchors
-      // don't collide.
+      // don't collide. Tmp file gets a PID + random suffix to survive
+      // concurrent dump_to_file calls for the same target without races.
       const dumpsDir = retconDumpsDir()
       try {
         fs.mkdirSync(dumpsDir, { recursive: true })
@@ -1199,8 +1255,17 @@ export function createMcpToolsWithTokens(
       }
       const filename = `${ctx.sessionId}-${target.id}.jsonl`
       const fullPath = path.join(dumpsDir, filename)
-      const tmpPath = `${fullPath}.tmp`
       const content = messages.map(m => JSON.stringify(m)).join('\n') + '\n'
+      // Size cap: refuse to write a dump larger than MAX_DUMP_BYTES so a
+      // long conversation doesn't fill the disk and submit_file's matching
+      // cap doesn't OOM.
+      if (Buffer.byteLength(content, 'utf8') > MAX_DUMP_BYTES) {
+        return {
+          error: `dump would exceed ${MAX_DUMP_BYTES} bytes (conversation too long). Bookmark or rewind to an earlier turn instead.`,
+        }
+      }
+      const tmpSuffix = `${process.pid}.${randomBytes(4).toString('hex')}`
+      const tmpPath = `${fullPath}.${tmpSuffix}.tmp`
       try {
         fs.writeFileSync(tmpPath, content, { encoding: 'utf8' })
         fs.renameSync(tmpPath, fullPath)
@@ -1217,7 +1282,7 @@ export function createMcpToolsWithTokens(
         path: fullPath,
         turn_id: target.id,
         message_count: messages.length,
-        is_branch_view: isHead && branchRow?.branch_context_json !== null && branchRow?.branch_context_json !== undefined,
+        is_branch_view: usedBranchView,
         next_steps: 'Use the Read tool to inspect this dump (one Anthropic message per line). Use Edit to modify any line — keep the {role, content} shape intact. The LAST line MUST remain an assistant-role message; submit_file will reject otherwise. When ready, call `submit_file` with `path` set to this file and `message` set to your new user instruction.',
       }
     },
@@ -1325,6 +1390,21 @@ export function createMcpToolsWithTokens(
       }
 
       // ── Phase 2: parse + validate the JSONL ───────────────────────────────
+      // Size cap before we read the file into memory. statSync is cheap and
+      // catches dumps that grew past MAX_DUMP_BYTES (e.g., AI hand-crafted
+      // a giant JSONL outside dump_to_file's path).
+      try {
+        const fileStat = fs.statSync(resolvedPath)
+        if (fileStat.size > MAX_DUMP_BYTES) {
+          return {
+            error: `dump file is ${fileStat.size} bytes (exceeds ${MAX_DUMP_BYTES} cap). Edit it down before submitting.`,
+          }
+        }
+      }
+      catch (err) {
+        return { error: `failed to stat dump: ${(err as Error).message}` }
+      }
+
       let raw: string
       try {
         raw = fs.readFileSync(resolvedPath, { encoding: 'utf8' })
@@ -1333,7 +1413,10 @@ export function createMcpToolsWithTokens(
         return { error: `failed to read dump: ${(err as Error).message}` }
       }
 
-      const lines = raw.split('\n').filter(l => l.length > 0)
+      // Split on \n (Unix) or \r\n (CRLF). The trim catches both stray \r
+      // from CRLF tools AND whitespace-only lines that JSON.parse would
+      // reject anyway. Keeps the parse loop simple.
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0)
       if (lines.length === 0) {
         return { error: 'dump file is empty (no JSONL lines)' }
       }
@@ -1353,6 +1436,16 @@ export function createMcpToolsWithTokens(
         const m = msg as { role?: unknown, content?: unknown }
         if (typeof m.role !== 'string') {
           return { error: `dump line ${i + 1} missing string \`role\` field` }
+        }
+        // Allowlist roles. Anthropic's /v1/messages accepts user/assistant/
+        // system; anything else (e.g. role:"junk", role:"tool_result")
+        // makes upstream 400 the next request, breaking the conversation
+        // silently from the AI's POV (it just sees "scheduled" and waits
+        // forever). Catch malformed values here.
+        if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
+          return {
+            error: `dump line ${i + 1} has invalid role "${m.role}" (expected user|assistant|system)`,
+          }
         }
         if (m.content === undefined) {
           return { error: `dump line ${i + 1} missing \`content\` field` }
