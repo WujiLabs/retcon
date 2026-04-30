@@ -180,9 +180,16 @@ export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
  * retcon's persistent-fork splice naturally accumulates message-level cache
  * markers across turns: each branch_context_json round-trip preserves whatever
  * claude attached on prior turns, then claude attaches more on the new
- * suffix. After 2-3 spliced turns we hit the cap. capCacheControlBlocks
- * strips from the most recent messages first so the heading markers (which
- * Anthropic uses for the long-lived prefix cache) stay intact.
+ * suffix. After 2-3 spliced turns we hit the cap. `capCacheControlBlocks`
+ * strips earliest message markers first so the LATEST markers (which extend
+ * the cache progressively via Anthropic's 20-block lookback) survive.
+ *
+ * See https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching
+ * for the exact mechanics. Key quote: "Place the breakpoint on the last
+ * block that stays identical across requests. In a growing conversation
+ * the final block works as long as each turn adds fewer than 20 blocks:
+ * earlier content never changes, so the next request's lookback finds the
+ * prior write."
  */
 export const MAX_CACHE_CONTROL_BLOCKS = 4
 
@@ -325,14 +332,22 @@ function finalizeRewrite(
  * to `max` (default 4 — Anthropic's hard limit). Counts markers across
  * `system` (array form), `tools`, and `messages[i].content[j]` content blocks.
  *
- * Stripping policy: protect system + tools (long-lived prefix that always
- * caches), and strip the EARLIEST message markers first — keeping the
- * tailing ones intact. Reasoning: in retcon's persistent-fork splice, each
- * outgoing /v1/messages has a different prefix shape (we keep prepending
- * branch_context), so heading message-level markers don't actually hit
- * Anthropic's prompt cache — they just consume a slot for nothing. The
- * tail markers are at the freshest, longest-prefix point and are what
- * primes the cache for the next call. Strip what doesn't pay rent.
+ * Stripping policy: protect system + tools (the truly stable prefix), and
+ * strip the EARLIEST message markers first — keeping the tail markers.
+ *
+ * Why tail wins: Anthropic's caching writes an entry AT each marker (the
+ * cumulative prefix up through that block). The next request's marker
+ * triggers a 20-block lookback that hits any of the prior entries whose
+ * positions are still in range. A marker at the LATEST stable point caches
+ * the LONGEST prefix, and as the conversation grows the next turn's marker
+ * (a few blocks further) finds it via lookback — so the cache grows with
+ * the conversation.
+ *
+ * A heading-only strategy still hits cache (the heading prefix is byte-
+ * identical across retcon's spliced turns), but the cached prefix never
+ * extends past the heading. Everything after pays full input price every
+ * turn. The tail strategy progressively caches more, paying off increasingly
+ * over the session lifetime.
  *
  * Mutates `parsedBody` in-place (cheaper than deep-cloning a multi-MB body).
  * Returns the number of markers removed; 0 means no change. Caller is
@@ -513,11 +528,12 @@ async function dispatch(
   }
 
   // Cap cache_control markers to MAX_CACHE_CONTROL_BLOCKS (Anthropic's hard
-  // limit). Persistent-fork splicing tends to accumulate markers across
-  // turns; without this cap, the second or third spliced turn 400s with
-  // "A maximum of 4 blocks with cache_control may be provided." The
-  // stripping prefers the latest message tail so the long-lived prefix
-  // cache (system + tools + early messages) stays intact.
+  // limit). Persistent-fork splicing accumulates markers across turns;
+  // without this cap, the second or third spliced turn 400s with "A maximum
+  // of 4 blocks with cache_control may be provided." Stripping prefers the
+  // latest markers (system + tools + tail messages) because the tail caches
+  // a progressively longer prefix via Anthropic's 20-block lookback —
+  // see capCacheControlBlocks doc for the why.
   if (isMessagesPath) {
     try {
       const parsed = JSON.parse(bodyToForward.toString('utf8')) as {
