@@ -506,6 +506,7 @@ function rewindScheduledResponse(extra: {
   target_view_id: string
   pending_path: string
   prior_outcome: unknown
+  next_steps: string
 } {
   return {
     status: 'scheduled',
@@ -520,6 +521,7 @@ function rewindScheduledResponse(extra: {
     target_view_id: extra.target_view_id,
     pending_path: extra.pending_path,
     prior_outcome: extra.prior_outcome,
+    next_steps: 'WAIT for the next message from the user — that\'s where the rewind lands. Do not call further tools, do not generate any other output for this turn. The proxy will splice the rewound history into your next /v1/messages call automatically.',
   }
 }
 
@@ -622,6 +624,7 @@ export function createMcpToolsWithTokens(
           return {
             turn: lean,
             preceding_open_turn_count: preceding.length,
+            next_steps: 'To rewind to this turn, call `rewind_to` with `turn_id` set to this turn\'s id (or `turn_back_n` matching its position in the list). To save it as a bookmark, call `bookmark`.',
           }
         }
         return {
@@ -633,6 +636,7 @@ export function createMcpToolsWithTokens(
             created_at: target.created_at,
           },
           preceding_open_turns: preceding,
+          next_steps: 'To rewind to this turn, call `rewind_to` with `turn_id` set to this turn\'s id. To save it as a bookmark, call `bookmark`.',
         }
       }
 
@@ -696,7 +700,11 @@ export function createMcpToolsWithTokens(
         return { ...lean, created_at: r.created_at }
       }))
 
-      return { total, turns, current_head_turn_id: headId }
+      const nextSteps = turns.length === 0
+        ? 'No rewindable turns yet. The current state is `current_head_turn_id`. After more turns close, call `recall` again.'
+        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). To save the current spot, call `bookmark`.'
+
+      return { total, turns, current_head_turn_id: headId, next_steps: nextSteps }
     },
   })
 
@@ -915,7 +923,12 @@ export function createMcpToolsWithTokens(
         },
         ctx.sessionId,
       )
-      return { view_id: viewId, head_revision_id: head.id, label: parsed.label ?? null }
+      return {
+        view_id: viewId,
+        head_revision_id: head.id,
+        label: parsed.label ?? null,
+        next_steps: 'Bookmark saved. The next time you want to return here, call `recall` to list turns (this bookmark is the current head, so you\'ll see its `head_revision_id` as `current_head_turn_id`) and then `rewind_to` with `turn_id` matching it.',
+      }
     },
   })
 
