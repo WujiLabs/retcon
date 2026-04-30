@@ -15,7 +15,7 @@ There is no "retcon mode" inside claude. claude doesn't know it's running under 
 
 ## How the AI sees its past, and why it gets to fork
 
-`recall`, `rewind_to`, and `bookmark` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains three entries in `tools/list`.
+`recall`, `rewind_to`, `bookmark`, `dump_to_file`, and `submit_file` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains five entries in `tools/list`.
 
 The names are intent-aligned, not protocol-aligned. The earlier surface (`fork_list`, `fork_show`, `fork_back`, `fork_bookmark`) was technically correct but pulled the model into protocol-thinking. The empirical signal: Sonnet didn't reach for `fork_back` even when explicitly asked to rewind. We renamed in v0.4 (hard cut, no aliases) and rewrote descriptions in `USE WHEN: <intent sentence>` form. "fork" is engineer jargon; "rewind" is what the user means.
 

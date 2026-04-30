@@ -51,6 +51,8 @@ Available to claude inside the session via the MCP server retcon auto-registers 
 - `recall` — list recent forkable turns (no args) OR inspect one (`turn_back_n: N` for the Nth turn back, `turn_id: "..."` for a specific id). Returns content previews so you can pick a target without dumping the full conversation.
 - `rewind_to` — roll the conversation back to a chosen turn and replace the next message. **Two-step call**: the first call returns rules + a single-use `confirm_clean`/`confirm_meta` token pair; the AI classifies its own message (does it stand alone, or does it contain a meta-reference to cut-off content?) and re-calls with the matching token. Catches the AI before it sends a `"redo your last answer"`-style message that would confuse the post-rewind context.
 - `bookmark` — pin the latest forkable turn with an optional human label so you can return to it via `recall` later.
+- `dump_to_file` — write the conversation through a chosen turn to `~/.retcon/dumps/<id>.jsonl` (one Anthropic message per line). retcon's CLI pre-allows `Read`/`Edit`/`Write`/`Glob`/`Grep` over `~/.retcon/dumps/**` in the spawned claude's permissions, so the AI can inspect and modify the file without prompting you. No args = dump current state; `turn_id` or `turn_back_n` = dump through that turn.
+- `submit_file` — read a JSONL dump back, validate it (each line a well-formed Anthropic message, last line must be assistant-role), append your `message` arg as a new user turn, and queue it as the next /v1/messages from claude. Same **two-step token flow** as `rewind_to`. Pairs with `dump_to_file` for the "let me actually edit a few past turns before continuing" use case that pure `rewind_to` can't express.
 
 **When to reach for which:**
 
@@ -58,7 +60,8 @@ Available to claude inside the session via the MCP server retcon auto-registers 
 |---|---|
 | See what turns you can rewind to | `recall` (no args) |
 | Inspect a specific turn before rewinding | `recall` with `turn_id` or `turn_back_n` |
-| Actually rewind | `rewind_to` (two-step: first call returns rules + tokens, second call applies) |
+| Actually rewind (replace the next turn only) | `rewind_to` (two-step: first call returns rules + tokens, second call applies) |
+| Edit several past turns before continuing | `dump_to_file` → `Read`/`Edit` the JSONL → `submit_file` |
 | Save a spot to return to later | `bookmark` |
 
 Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets.

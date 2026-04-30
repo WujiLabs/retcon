@@ -17,10 +17,8 @@ Deferred from v1 launch. Source-of-truth alignment docs: `~/filo/collaboration-p
 
 ## P2 — product UX hypothesis
 
-- [ ] **ToBe-as-file MVP (Phase 3 of MCP UX redesign plan)** — dump messages array to local JSON, AI edits with Read/Edit, `submit_file` on next /v1/messages. Validate UX before committing. Edge cases: concurrent edits, edits during streaming, malformed JSON, AI editing fields it shouldn't. Plan: `~/.claude/plans/stateless-nibbling-conway.md` Phase 3. Same opaque dual-secret + loud-failure contracts as `rewind_to` (already shipped in v0.4). Validation rule: last line of submitted JSONL must be assistant-role (so the appended user message blends naturally into the existing context).
-- [ ] **MCP tool-adoption A/B test harness (Phase 4 of MCP UX redesign plan)** — gated tmux test: spawn claude under retcon, prompt with rewind scenarios, assert `mcp__retcon__rewind_to` was called. Run against both Sonnet and Opus. Goal: catch regressions where a future tool surface change drops adoption rate, especially on smaller models. Plan: `~/.claude/plans/stateless-nibbling-conway.md` Phase 4. Run weekly alongside `cli-tmux-assumptions.test.ts`.
 - [ ] **`branch_compare` MCP tool (deferred CEO Proposal C)** — for the "I tried approach A, then B, which is actually better?" use case. `branch_compare(view_a, view_b)` returns divergence point + tail diffs of two forked branches. Real but lower priority — defer until concrete demand surfaces. Adds tool surface area; we want to validate the v0.4 5-tool surface first.
-- [ ] **`--include-system-tools` flag on `dump_to_file`** — when Phase 3 lands, `dump_to_file` writes messages-only by default (idea #5 from the v0.4 design plan). If a concrete need emerges for capturing the system prompt + tools[] alongside the messages, add this flag. Today the proxy.db blobs hold those independently, queryable directly; ship the flag only when a real consumer surfaces.
+- [ ] **`--include-system-tools` flag on `dump_to_file`** — Phase 3 shipped in v0.4 with messages-only output (idea #5 from the v0.4 design plan). If a concrete need emerges for capturing the system prompt + tools[] alongside the messages, add this flag. Today the proxy.db blobs hold those independently, queryable directly; ship the flag only when a real consumer surfaces.
 - [ ] **`retcon --cursor` / `retcon --aider` real impls** — agent flag dispatch is in v1 but only `--claude` works. Add other agents once ANTHROPIC_BASE_URL-equivalent integration is verified per agent.
 
 ## P3 — operational
@@ -39,3 +37,8 @@ Deferred from v1 launch. Source-of-truth alignment docs: `~/filo/collaboration-p
 
 - [ ] **`retcon doctor`** subcommand — check claude on PATH, MCP entry exists at user scope, port 4099 free or owned by retcon, permissions on `~/.retcon/`, daemon health. Useful for triage.
 - [ ] **Auto-update notifier** — warn if a newer retcon version is on npm.
+
+## Completed
+
+- [x] **ToBe-as-file MVP (Phase 3 of MCP UX redesign plan)** — `dump_to_file` + `submit_file` MCP tools. Same opaque dual-secret + loud-failure contracts as `rewind_to`, with assistant-must-end validation on the JSONL so the appended user message blends naturally. **Completed:** v0.4.0-alpha.0 (2026-04-30).
+- [x] **MCP tool-adoption A/B test harness (Phase 4 of MCP UX redesign plan)** — gated tmux test (`RETCON_TEST_INTEGRATION=1` AND `RETCON_TEST_TOOL_ADOPTION=1`) drives Sonnet AND Opus through natural-language rewind/bookmark/dump scenarios with no `mcp__retcon__X` hand-holding. Asserts the right tool was invoked end-to-end via the event log + filesystem. **Completed:** v0.4.0-alpha.0 (initial harness), v0.4.1-alpha.0 (verification fixes — userTurn predicate, ready-detect, instrumentation).
