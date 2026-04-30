@@ -365,8 +365,8 @@ export function capCacheControlBlocks(
   // markers that don't consume one of the 4 slots).
   const hasMarker = (x: unknown): x is { cache_control: object } =>
     !!x && typeof x === 'object' && 'cache_control' in x
-      && !!(x as { cache_control?: unknown }).cache_control
-      && typeof (x as { cache_control?: unknown }).cache_control === 'object'
+    && !!(x as { cache_control?: unknown }).cache_control
+    && typeof (x as { cache_control?: unknown }).cache_control === 'object'
 
   // System (array form only; string form has no cache_control).
   if (Array.isArray(parsedBody.system)) {

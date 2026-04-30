@@ -146,47 +146,85 @@ function spawnClaude(suffix: string, model: 'sonnet' | 'opus'): string {
   // testing — we're testing whether it picks the right tool.
   // claude resolves --model to the latest of that family; this avoids
   // pinning to a specific model id that goes stale.
+  //
+  // --allowedTools pre-approves the retcon MCP tools + Read/Edit/Write so
+  // the interactive permission prompt ("Do you want to proceed?") doesn't
+  // block the test. tmux send-keys can't dismiss that UI cleanly. The
+  // adoption signal we measure is "did the model REACH for the tool" —
+  // approval friction is orthogonal.
+  const allowed = [
+    'mcp__retcon__recall',
+    'mcp__retcon__rewind_to',
+    'mcp__retcon__bookmark',
+    'mcp__retcon__dump_to_file',
+    'mcp__retcon__submit_file',
+    'Read', 'Edit', 'Write', 'Glob', 'Grep',
+  ].join(',')
   tmux(
     'new-session', '-d', '-s', sessionName, '-x', '200', '-y', '50',
-    `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --actor ${ADOPTION_ACTOR}-${suffix}-${model} --model ${model} --effort low`,
+    `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --actor ${ADOPTION_ACTOR}-${suffix}-${model} --model ${model} --effort low --allowedTools "${allowed}"`,
   )
   return sessionName
 }
 
-/** Wait for claude to render its UI and the daemon to mint a session row. */
+/** Wait for claude to register an MCP session row (proves the harness is up
+ *  AND the daemon is reachable). The earlier `auto mode` regex falsely
+ *  matched "auto mode unavailable for this model" on Sonnet, so we drop
+ *  the UI text check entirely and rely on the database signal instead. */
 async function waitForReady(sessionName: string, actor: string): Promise<{ sessionId: string, taskId: string }> {
   await waitFor(
-    () => /auto mode/.test(pane(sessionName)),
-    30_000,
-    'claude UI render',
-    sessionName,
-  )
-  await waitFor(
     () => parseInt(sql(`SELECT COUNT(*) FROM sessions WHERE actor='${actor}'`), 10) > 0,
-    20_000,
-    'session row',
+    45_000,
+    `MCP session row for actor=${actor}`,
     sessionName,
   )
   const sessionId = sql(
     `SELECT id FROM sessions WHERE actor='${actor}' ORDER BY created_at DESC LIMIT 1`,
   )
+  if (!/^[a-f0-9-]{36}$/.test(sessionId)) {
+    throw new Error(`waitForReady got malformed session_id: ${JSON.stringify(sessionId)}`)
+  }
   const taskId = sql(`SELECT task_id FROM sessions WHERE id='${sessionId}'`)
+  if (!taskId.startsWith('t_')) {
+    throw new Error(`waitForReady got malformed task_id: ${JSON.stringify(taskId)} for session ${sessionId}`)
+  }
   return { sessionId, taskId }
 }
 
-/** Send a turn through tmux and wait for closed_forkable count to grow. */
+/** Send a turn through tmux and wait for a NEW closed_forkable revision —
+ *  the signal that claude completed a clean conversational reply (stop_
+ *  reason=end_turn). We deliberately count `closed_forkable` revisions, not
+ *  any `proxy.response_completed`, because claude makes its OWN internal
+ *  /v1 calls during startup (max_tokens probe, system-reminder fetches,
+ *  context-management edits) that fire response_completed events without
+ *  consuming the user's keystrokes. Waiting on those would let `userTurn`
+ *  return prematurely; the next send-keys would arrive while claude was
+ *  still buffering the current user input, and claude would bundle both
+ *  into a single user message — corrupting the test's setup.
+ *
+ *  Snapshots the closed_forkable count for this session's task BEFORE
+ *  send-keys and waits for it to grow. */
 async function userTurn(
   sessionName: string,
   taskId: string,
   msg: string,
-  expectedCount: number,
 ): Promise<void> {
+  const before = parseInt(
+    sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`),
+    10,
+  )
   tmux('send-keys', '-t', sessionName, msg)
   tmux('send-keys', '-t', sessionName, 'C-m')
   await waitFor(
-    () => parseInt(sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10) >= expectedCount,
-    60_000,
-    `closed_forkable count >= ${expectedCount} after "${msg.slice(0, 40)}..."`,
+    () => {
+      const after = parseInt(
+        sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`),
+        10,
+      )
+      return after > before
+    },
+    90_000,
+    `closed_forkable revision for task=${taskId.slice(0, 12)}... after "${msg.slice(0, 40)}..."`,
     sessionName,
   )
 }
@@ -205,7 +243,16 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
       execFileSync('retcon', ['stop'], { stdio: 'ignore' })
     }
     catch { /* fine */ }
-    cleanAdoptionState()
+    // RETCON_TEST_KEEP_DATA=1 leaves the proxy.db rows + dumps in place so
+    // a developer can sqlite3 the file and verify what actually happened.
+    // The next run's beforeAll wipes the state anyway, so this is a one-
+    // way debug switch.
+    if (process.env.RETCON_TEST_KEEP_DATA !== '1') {
+      cleanAdoptionState()
+    }
+    else {
+      process.stderr.write('[adoption-test] RETCON_TEST_KEEP_DATA=1 — preserving DB state\n')
+    }
   })
 
   // The same scenario runs against both models. Failure on either is a
@@ -219,8 +266,8 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
         try {
           const { sessionId, taskId } = await waitForReady(session, actor)
           // Two warmup turns introducing distinguishable secret words.
-          await userTurn(session, taskId, 'Remember the secret word ZEBRA. Reply with just OK.', 1)
-          await userTurn(session, taskId, 'Remember the secret word AARDVARK. Reply with just OK.', 2)
+          await userTurn(session, taskId, 'Remember the secret word ZEBRA. Reply with just OK.')
+          await userTurn(session, taskId, 'Remember the secret word AARDVARK. Reply with just OK.')
 
           // Natural-language rewind. NO mention of mcp__retcon__rewind_to.
           // The AI must recognize "rewind" as the intent and pick the tool.
@@ -242,6 +289,16 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
             `${model} called rewind_to (fork.back_requested event)`,
             session,
           )
+          // Belt-and-suspenders: explicit assertion that the count actually
+          // grew. If for any reason waitFor returns truthy without the event
+          // (e.g. SQL string parse confused, daemon DB swapped mid-test),
+          // this expect catches it loudly instead of a silent pass.
+          const eventCount = parseInt(
+            sql(`SELECT COUNT(*) FROM events WHERE session_id='${sessionId}' AND topic='fork.back_requested'`),
+            10,
+          )
+          process.stderr.write(`[adoption-test ${model}] fork.back_requested count = ${eventCount}\n`)
+          expect(eventCount).toBeGreaterThanOrEqual(1)
           // Sanity check: the event payload references this session's task.
           const payload = sql(
             `SELECT payload FROM events WHERE session_id='${sessionId}' AND topic='fork.back_requested' ORDER BY event_id DESC LIMIT 1`,
@@ -251,6 +308,17 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
           expect(parsed.fork_point_revision_id).toMatch(/^[a-z0-9-]+$/)
         }
         finally {
+          // Capture pane content to a file BEFORE killing the tmux session.
+          // Lets us inspect what claude actually did (which tools it called,
+          // any errors visible in the UI) for a failing run. The file is
+          // written under /tmp/ keyed by session name.
+          try {
+            const captured = pane(session)
+            const dumpPath = `/tmp/p4-pane-${session}.txt`
+            fs.writeFileSync(dumpPath, captured, { encoding: 'utf8' })
+            process.stderr.write(`[adoption-test ${model}] pane → ${dumpPath}\n`)
+          }
+          catch { /* fine */ }
           try {
             tmux('kill-session', '-t', session)
           }
@@ -263,7 +331,7 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
         const actor = `${ADOPTION_ACTOR}-bookmark-${model}`
         try {
           const { sessionId, taskId } = await waitForReady(session, actor)
-          await userTurn(session, taskId, 'Reply with just OK.', 1)
+          await userTurn(session, taskId, 'Reply with just OK.')
 
           tmux('send-keys', '-t', session,
             'Save this spot in our conversation as a bookmark labeled "v1 baseline" '
@@ -279,16 +347,30 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
             `${model} called bookmark (fork.bookmark_created event)`,
             session,
           )
+          const bookmarkCount = parseInt(
+            sql(`SELECT COUNT(*) FROM events WHERE session_id='${sessionId}' AND topic='fork.bookmark_created'`),
+            10,
+          )
+          process.stderr.write(`[adoption-test ${model}] fork.bookmark_created count = ${bookmarkCount}\n`)
+          expect(bookmarkCount).toBeGreaterThanOrEqual(1)
           const payload = sql(
             `SELECT payload FROM events WHERE session_id='${sessionId}' AND topic='fork.bookmark_created' ORDER BY event_id DESC LIMIT 1`,
           )
           const parsed = JSON.parse(payload) as { label: string | null }
-          // Don't strictly require the exact label string — models paraphrase.
-          // The mere fact that the event fired with a non-null label proves
-          // the AI passed the user's intent through.
           expect(parsed.label === null || typeof parsed.label === 'string').toBe(true)
         }
         finally {
+          // Capture pane content to a file BEFORE killing the tmux session.
+          // Lets us inspect what claude actually did (which tools it called,
+          // any errors visible in the UI) for a failing run. The file is
+          // written under /tmp/ keyed by session name.
+          try {
+            const captured = pane(session)
+            const dumpPath = `/tmp/p4-pane-${session}.txt`
+            fs.writeFileSync(dumpPath, captured, { encoding: 'utf8' })
+            process.stderr.write(`[adoption-test ${model}] pane → ${dumpPath}\n`)
+          }
+          catch { /* fine */ }
           try {
             tmux('kill-session', '-t', session)
           }
@@ -302,8 +384,8 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
         try {
           const { taskId } = await waitForReady(session, actor)
           // Need >= 2 forkable turns so dump_to_file's no-args default works.
-          await userTurn(session, taskId, 'My favorite color is BLUE. Reply with OK.', 1)
-          await userTurn(session, taskId, 'Now my favorite is GREEN. Reply with OK.', 2)
+          await userTurn(session, taskId, 'My favorite color is BLUE. Reply with OK.')
+          await userTurn(session, taskId, 'Now my favorite is GREEN. Reply with OK.')
 
           // Snapshot dumps dir size BEFORE the prompt so we detect new files.
           const before = fs.existsSync(DUMPS_DIR)
@@ -327,8 +409,24 @@ describeIfRunnable('tool-adoption A/B harness (Sonnet + Opus)', () => {
             `${model} called dump_to_file (new file in ~/.retcon/dumps/)`,
             session,
           )
+          const finalDumps = fs.existsSync(DUMPS_DIR)
+            ? fs.readdirSync(DUMPS_DIR).filter(f => f.endsWith('.jsonl')).length
+            : 0
+          process.stderr.write(`[adoption-test ${model}] dumps before=${before} after=${finalDumps}\n`)
+          expect(finalDumps).toBeGreaterThan(before)
         }
         finally {
+          // Capture pane content to a file BEFORE killing the tmux session.
+          // Lets us inspect what claude actually did (which tools it called,
+          // any errors visible in the UI) for a failing run. The file is
+          // written under /tmp/ keyed by session name.
+          try {
+            const captured = pane(session)
+            const dumpPath = `/tmp/p4-pane-${session}.txt`
+            fs.writeFileSync(dumpPath, captured, { encoding: 'utf8' })
+            process.stderr.write(`[adoption-test ${model}] pane → ${dumpPath}\n`)
+          }
+          catch { /* fine */ }
           try {
             tmux('kill-session', '-t', session)
           }
