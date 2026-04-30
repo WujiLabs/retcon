@@ -25,11 +25,14 @@
 // fresh first call.
 
 import { randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 
 import type { AssetId, StorageProvider } from '@playtiss/core'
 import { generateTraceId } from '@playtiss/core'
 
 import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
+import { retconDumpsDir } from './cli/paths.js'
 import type { DB } from './db.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
@@ -525,21 +528,152 @@ function rewindScheduledResponse(extra: {
   }
 }
 
+/**
+ * Submit_file's first-call rules. Same dual-secret discipline as rewind_to,
+ * but the rules text adds the JSONL constraints (Decision #4): each line is
+ * a valid Anthropic message, and the LAST line MUST be assistant-role so the
+ * appended user message blends naturally into the existing context.
+ */
+function submitRulesText(tokens: ConfirmTokenPair): string {
+  return [
+    'submit_file: rules + classification tokens (read carefully — these tokens are single-use and you will need them).',
+    '',
+    'WHAT THIS TOOL DOES:',
+    'submit_file reads a JSONL conversation dump (one Anthropic message per line) that you produced via dump_to_file (and possibly edited with Read/Edit), validates it, appends your `message` arg as a new user-role turn, and queues that as the next /v1/messages from claude. The receiving AI sees the (possibly-edited) history + your `message` as the next user turn — and that AI has NO MEMORY of:',
+    '  - the user\'s most recent prompt that triggered this submit',
+    '  - your own reasoning that led to calling this tool',
+    '  - any cut-off turns (they\'re gone from the receiving AI\'s context)',
+    '',
+    'JSONL CONSTRAINTS (validation will reject otherwise):',
+    '  - The path must resolve inside ~/.retcon/dumps/ (no traversal).',
+    '  - Each line must be a valid JSON object with `role` and `content`.',
+    '  - The LAST line\'s role MUST be "assistant". Your `message` arg gets appended as a `{role: "user", content: <message>}` line; if the dump\'s tail is already a user line, the appended user would create back-to-back user turns and the receiving AI would see a malformed conversation.',
+    '',
+    'So `message` must:',
+    '  1. Carry the SUBSTANTIVE instruction. Not "submit my edits" — the edits already happened, and the receiving AI sees them as if they always existed. Send the new value, the corrected plan, the actual instruction.',
+    '  2. Be readable in isolation. Don\'t write "let\'s continue from here" — there\'s no shared "here" for the receiving AI. The history above must already make sense; this turn must already make sense.',
+    '  3. Include change-context if the user should see the AI acknowledge the edit. If you fixed a factual error in the history, write something like "(I corrected an error in the earlier discussion — please verify and continue.)" Pure substantive instruction works for clean replays.',
+    '  4. Be framed from the user\'s POV. It becomes a user-role turn.',
+    '',
+    'EXAMPLES:',
+    '  After editing a dump to fix a wrong calculation:',
+    '    → message: "(I corrected the budget number in the earlier turn from $500 to $5,000.) Continue with the cost analysis using the corrected number."',
+    '  After dumping current state with no edits, just to redirect:',
+    '    → message: "Switch the focus to security review now."',
+    '',
+    'ANTI-PATTERNS — do not pass these:',
+    '  ❌ "submit my changes"  ❌ "see the edits I made"',
+    '  ❌ "as I just edited"  ❌ "now apply this"',
+    '',
+    'NOW CLASSIFY YOUR MESSAGE AND RE-CALL:',
+    '',
+    `  - If your \`message\` STANDS ALONE (no meta-references, readable with no cut-off context): re-call with confirm="${tokens.clean}"`,
+    `  - If your \`message\` contains a META-REFERENCE you spotted: re-call with confirm="${tokens.meta}" — we will reject and you can revise`,
+    '',
+    'Both tokens are single-use. They expire in 5 minutes. If you classify dishonestly (send the clean token with a meta-reference in your message), we run a narrow regex check that catches the most flagrant cases.',
+  ].join('\n')
+}
+
+function submitMetaFlaggedResponse(newTokens: ConfirmTokenPair): { status: string, message: string } {
+  return {
+    status: 'rejected',
+    message: [
+      'Good catch — you flagged a meta-reference in your `message`. Revise to be self-contained.',
+      '',
+      'Remember: the receiving AI has no memory of your edits-in-progress. Pack the substantive instruction into `message` itself, framed as a user-role prompt. If the user should see the AI acknowledge what changed in the dump, include that context in the message.',
+      '',
+      `New tokens (the previous pair was consumed): clean="${newTokens.clean}", meta="${newTokens.meta}"`,
+    ].join('\n'),
+  }
+}
+
+function submitRegexRejectedResponse(
+  matched: RegExp,
+  newTokens: ConfirmTokenPair,
+): { status: string, message: string, matched_pattern: string } {
+  return {
+    status: 'rejected',
+    matched_pattern: matched.source,
+    message: [
+      `Regex caught a meta-reference matching ${matched.source}. The receiving AI has no memory of cut-off turns or your edits — references like this confuse it.`,
+      '',
+      'Revise your `message` to be self-contained.',
+      '',
+      `If your reference is intentional and points at content visible in the dump, set allow_meta_refs=true on the next call.`,
+      '',
+      `New tokens (the previous pair was consumed): clean="${newTokens.clean}", meta="${newTokens.meta}"`,
+    ].join('\n'),
+  }
+}
+
+function submitScheduledResponse(extra: {
+  path: string
+  fork_point: string | null
+  target_view_id: string
+  pending_path: string
+  message_count: number
+}): {
+  status: string
+  message: string
+  path: string
+  fork_point: string | null
+  target_view_id: string
+  pending_path: string
+  message_count: number
+  next_steps: string
+} {
+  return {
+    status: 'scheduled',
+    message: [
+      'RETCON ERROR: If you are reading this, the submit did NOT take effect.',
+      'Tell the user: "retcon failed to apply the submitted dump. The next message will not include the edits."',
+      'They may need to retry, or run `retcon stop && retcon` to restart the daemon.',
+      '',
+      '(On the success path, the proxy splices the submitted history into the next /v1/messages and this entire turn is discarded — meaning you never see this text. Reading it means the splice failed.)',
+    ].join('\n'),
+    path: extra.path,
+    fork_point: extra.fork_point,
+    target_view_id: extra.target_view_id,
+    pending_path: extra.pending_path,
+    message_count: extra.message_count,
+    next_steps: 'WAIT for the next message from the user — that\'s where the submitted dump lands. Do not call further tools, do not generate any other output for this turn.',
+  }
+}
+
 // ─── Tool factory ────────────────────────────────────────────────────────────
 
+/**
+ * Token stores keyed by tool name. rewind_to and submit_file each maintain
+ * their own dual-secret store so a token issued for one tool doesn't validate
+ * a call to the other (rules text differs between the two — Decision #4 adds
+ * the assistant-must-end constraint to submit_file's rules).
+ */
+export interface ConfirmTokenStores {
+  rewind: ConfirmTokenStore
+  submit: ConfirmTokenStore
+}
+
 export function createMcpTools(deps: McpToolDeps): Map<string, McpTool> {
-  const tokenStore = new ConfirmTokenStore()
-  return createMcpToolsWithTokens(deps, tokenStore)
+  return createMcpToolsWithTokens(deps, {
+    rewind: new ConfirmTokenStore(),
+    submit: new ConfirmTokenStore(),
+  })
 }
 
 /**
- * Internal entry for tests that need to inspect the token store. External
- * callers should use createMcpTools() which manages its own store.
+ * Internal entry for tests that need to inspect the token stores. External
+ * callers should use createMcpTools() which manages its own stores.
+ *
+ * Accepts either a {rewind, submit} object or a single ConfirmTokenStore for
+ * backward compatibility with rewind-only test code (the single store is
+ * shared across both tools in that case).
  */
 export function createMcpToolsWithTokens(
   deps: McpToolDeps,
-  tokenStore: ConfirmTokenStore,
+  stores: ConfirmTokenStores | ConfirmTokenStore,
 ): Map<string, McpTool> {
+  const rewindStore = stores instanceof ConfirmTokenStore ? stores : stores.rewind
+  const submitStore = stores instanceof ConfirmTokenStore ? stores : stores.submit
   const tools = new Map<string, McpTool>()
 
   // ── recall ────────────────────────────────────────────────────────────────
@@ -748,13 +882,13 @@ export function createMcpToolsWithTokens(
       // ── Phase 1 of dual-secret flow: classify the confirm token ───────────
       const confirmValue = typeof parsed.confirm === 'string' ? parsed.confirm : ''
       const matchKind = confirmValue.length > 0
-        ? tokenStore.match(ctx.sessionId, confirmValue)
+        ? rewindStore.match(ctx.sessionId, confirmValue)
         : null
 
       if (matchKind === null) {
         // First call (no confirm) OR mismatched/expired/unknown value.
         // Either way: return rules + a fresh token pair. No side effects.
-        const tokens = tokenStore.generate(ctx.sessionId)
+        const tokens = rewindStore.generate(ctx.sessionId)
         return {
           status: 'rules_returned',
           rules: rewindRulesText(tokens),
@@ -764,11 +898,11 @@ export function createMcpToolsWithTokens(
       }
 
       // Whichever path we take, the original pair is consumed.
-      tokenStore.consume(ctx.sessionId)
+      rewindStore.consume(ctx.sessionId)
 
       if (matchKind === 'meta') {
         // AI self-flagged its own message. Educational response + new pair.
-        const newTokens = tokenStore.generate(ctx.sessionId)
+        const newTokens = rewindStore.generate(ctx.sessionId)
         return rewindMetaFlaggedResponse(newTokens)
       }
 
@@ -776,7 +910,7 @@ export function createMcpToolsWithTokens(
       if (parsed.allow_meta_refs !== true) {
         const matched = detectMetaRef(message)
         if (matched) {
-          const newTokens = tokenStore.generate(ctx.sessionId)
+          const newTokens = rewindStore.generate(ctx.sessionId)
           return rewindRegexRejectedResponse(matched, newTokens)
         }
       }
@@ -929,6 +1063,384 @@ export function createMcpToolsWithTokens(
         label: parsed.label ?? null,
         next_steps: 'Bookmark saved. The next time you want to return here, call `recall` to list turns (this bookmark is the current head, so you\'ll see its `head_revision_id` as `current_head_turn_id`) and then `rewind_to` with `turn_id` matching it.',
       }
+    },
+  })
+
+  // ── dump_to_file ──────────────────────────────────────────────────────────
+  // Phase 3 (v0.4): writes the conversation history through and including a
+  // target turn's assistant response to ~/.retcon/dumps/<sid>-<rev>.jsonl.
+  // The AI reads the file (Read tool, pre-allowed by the dumps-path
+  // permissions injection in cli/run.ts), optionally edits it, and submits
+  // via submit_file. Messages-only — system prompt and tools[] come from
+  // claude's outgoing body at replay time and aren't frozen here.
+  tools.set('dump_to_file', {
+    description:
+      'USE WHEN: you want to inspect or edit the conversation history before continuing. '
+      + 'Writes the conversation through a target turn\'s assistant response to a JSONL file (one Anthropic message per line). The file lives at ~/.retcon/dumps/<id>.jsonl, which retcon pre-allowed for Read/Edit/Write/Glob/Grep, so you can use those tools without prompting the user. '
+      + 'No args = dump current state. `turn_id` or `turn_back_n` = dump through that turn. '
+      + 'NEXT STEPS: use `Read` to view the dump, `Edit` to modify any message, then call `submit_file` with the path + a new user instruction to apply.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        turn_id: { type: 'string', description: 'Dump through this specific turn (must be closed_forkable).' },
+        turn_back_n: { type: 'number', description: 'Dump through the Nth forkable turn back (1=first rewindable, matching `recall` numbering).' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const parsed = (args ?? {}) as { turn_id?: string, turn_back_n?: number }
+
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
+      if (sess.harness === 'orphan') {
+        return { error: 'dump_to_file requires an MCP-initialized session (orphan sessions cannot dump)' }
+      }
+      if (typeof parsed.turn_id === 'string' && typeof parsed.turn_back_n === 'number') {
+        return { error: 'pass either turn_id or turn_back_n, not both' }
+      }
+
+      // Resolve the target turn.
+      let target: RevisionRow | undefined
+      if (typeof parsed.turn_id === 'string') {
+        target = loadRevision(deps.db, parsed.turn_id)
+        if (!target || target.task_id !== sess.task_id) {
+          return { error: 'turn_id not found in this session' }
+        }
+        if (target.classification !== 'closed_forkable') {
+          return { error: 'turn_id is not a forkable turn (must be closed_forkable)' }
+        }
+      }
+      else if (typeof parsed.turn_back_n === 'number') {
+        const n = Math.floor(parsed.turn_back_n)
+        if (!Number.isInteger(n) || n < 1) {
+          return { error: 'turn_back_n must be an integer ≥ 1' }
+        }
+        const head = effectiveHead(deps.db, sess.task_id)
+        if (!head) return { error: 'cannot dump: no settled (non-in-flight) revision available' }
+        target = nthForkableBack(deps.db, head, n)
+        if (!target) {
+          const available = countForkableBack(deps.db, head)
+          return { error: `only ${available} rewindable turns available; cannot go back ${n}` }
+        }
+      }
+      else {
+        // No args: default to "current dumpable state". If a forked branch
+        // is active (branch_context_json set), that's the source — and the
+        // target is the current branch head. Otherwise the head's response
+        // body isn't reliably available from the request-body chain (the
+        // head's child doesn't exist yet), so we step back one forkable
+        // turn — `reconstructForkMessages(target=N-1)` uses head as the
+        // child and slices off head's user input, ending the dump at the
+        // one-before-head's assistant response.
+        const branchRowEarly = deps.db.prepare(
+          'SELECT branch_context_json FROM sessions WHERE id = ?',
+        ).get(ctx.sessionId) as { branch_context_json: string | null } | undefined
+        if (branchRowEarly?.branch_context_json) {
+          target = mostRecentForkableRevision(deps.db, sess.task_id)
+          if (!target) return { error: 'forked branch active but no forkable turn anchors it' }
+        }
+        else {
+          const head = effectiveHead(deps.db, sess.task_id)
+          if (!head) return { error: 'no settled turns yet — nothing to dump' }
+          target = nthForkableBack(deps.db, head, 1)
+          if (!target) {
+            return {
+              error: 'cannot dump current state: not enough turn history yet (need either at least 2 forkable turns, or an active forked branch). Pass `turn_back_n` or `turn_id` to dump a specific older turn.',
+            }
+          }
+        }
+      }
+
+      // Resolve messages. If we're on a forked branch (branch_context_json
+      // populated) AND the target IS the current branch head, dump the
+      // branch's view directly — that's the truth of what Anthropic has been
+      // seeing across this branch's lifetime. Otherwise reconstruct from the
+      // request body via reconstructForkMessages (same path rewind_to uses).
+      let messages: unknown[] | null = null
+      const branchRow = deps.db.prepare(
+        'SELECT branch_context_json FROM sessions WHERE id = ?',
+      ).get(ctx.sessionId) as { branch_context_json: string | null } | undefined
+      const headRev = mostRecentForkableRevision(deps.db, sess.task_id)
+      const isHead = headRev?.id === target.id
+      if (isHead && branchRow?.branch_context_json) {
+        try {
+          const parsedJson = JSON.parse(branchRow.branch_context_json) as unknown
+          if (Array.isArray(parsedJson)) messages = parsedJson
+        }
+        catch { /* fall through to reconstruction */ }
+      }
+      if (!messages) {
+        messages = await reconstructForkMessages(deps, target)
+      }
+      if (!messages) {
+        return { error: 'unable to reconstruct messages for the target turn (no usable source blob)' }
+      }
+
+      // The load-bearing rule: dumps must end with assistant role so
+      // submit_file's appended user message blends naturally. Both source
+      // paths (branch_context_json + reconstructForkMessages) should already
+      // satisfy this, but verify.
+      const lastMsg = messages[messages.length - 1] as { role?: unknown } | undefined
+      if (!lastMsg || lastMsg.role !== 'assistant') {
+        return {
+          error: `dump's last message has role=${typeof lastMsg?.role === 'string' ? lastMsg.role : 'unknown'}, expected 'assistant'. This shouldn't happen — please report a bug.`,
+        }
+      }
+
+      // Write JSONL atomically: tmpfile + rename. Filename includes session
+      // and target ids so different sessions / different rewind anchors
+      // don't collide.
+      const dumpsDir = retconDumpsDir()
+      try {
+        fs.mkdirSync(dumpsDir, { recursive: true })
+      }
+      catch (err) {
+        return { error: `failed to create dumps directory: ${(err as Error).message}` }
+      }
+      const filename = `${ctx.sessionId}-${target.id}.jsonl`
+      const fullPath = path.join(dumpsDir, filename)
+      const tmpPath = `${fullPath}.tmp`
+      const content = messages.map(m => JSON.stringify(m)).join('\n') + '\n'
+      try {
+        fs.writeFileSync(tmpPath, content, { encoding: 'utf8' })
+        fs.renameSync(tmpPath, fullPath)
+      }
+      catch (err) {
+        try {
+          fs.unlinkSync(tmpPath)
+        }
+        catch { /* tmp may not exist */ }
+        return { error: `failed to write dump: ${(err as Error).message}` }
+      }
+
+      return {
+        path: fullPath,
+        turn_id: target.id,
+        message_count: messages.length,
+        is_branch_view: isHead && branchRow?.branch_context_json !== null && branchRow?.branch_context_json !== undefined,
+        next_steps: 'Use the Read tool to inspect this dump (one Anthropic message per line). Use Edit to modify any line — keep the {role, content} shape intact. The LAST line MUST remain an assistant-role message; submit_file will reject otherwise. When ready, call `submit_file` with `path` set to this file and `message` set to your new user instruction.',
+      }
+    },
+  })
+
+  // ── submit_file ───────────────────────────────────────────────────────────
+  // Phase 3 (v0.4): reads a JSONL dump (produced by dump_to_file, optionally
+  // AI-edited), validates it, appends `message` as a user-role turn, and
+  // writes to TOBE so the next /v1/messages from claude carries the result.
+  // Same opaque dual-secret + narrow regex as rewind_to. Plus path-traversal
+  // realpath check, JSONL parse-per-line, last-line-must-be-assistant.
+  tools.set('submit_file', {
+    description:
+      'USE WHEN: you have edited a dump file (or want to apply one as-is) and need to make those changes the conversation history going forward. '
+      + 'Reads a JSONL dump from ~/.retcon/dumps/, validates it (each line a message, last line assistant-role), appends your `message` as a new user turn, and queues it as the next /v1/messages. '
+      + 'TWO-STEP CALL: first call WITHOUT a `confirm` token returns rules + a single-use token pair. Pick the token matching your message and re-call. '
+      + 'NEXT STEPS: after a successful submit, WAIT for the next /v1/messages — the result lands there. Do not call further tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to the JSONL dump (must resolve inside ~/.retcon/dumps/).' },
+        message: { type: 'string', description: 'New user message to deliver after the dumped history. Must stand alone (no meta-references).' },
+        confirm: { type: 'string', description: 'Token from this tool\'s prior rules-return call. Pick clean if message stands alone, meta if you spotted a meta-reference.' },
+        allow_meta_refs: { type: 'boolean', description: 'Override the narrow regex backstop. Use only when your message intentionally references content visible in the dumped history.' },
+      },
+      required: ['path', 'message'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const parsed = (args ?? {}) as {
+        path?: unknown
+        message?: unknown
+        confirm?: unknown
+        allow_meta_refs?: boolean
+      }
+
+      // Validate inputs BEFORE consuming a token (same shape as rewind_to).
+      const filePath = typeof parsed.path === 'string' ? parsed.path : null
+      if (!filePath) return { error: '`path` is required (string)' }
+      const message = typeof parsed.message === 'string' ? parsed.message : null
+      if (!message) return { error: '`message` is required (string)' }
+      if (message.trim().length === 0) {
+        return { error: '`message` must contain non-whitespace content' }
+      }
+      if (Buffer.byteLength(message, 'utf8') > MAX_REWIND_MESSAGE_BYTES) {
+        return { error: `message exceeds ${MAX_REWIND_MESSAGE_BYTES} bytes; trim your prompt` }
+      }
+
+      // Path traversal guard: resolve realpath and require it to be inside
+      // the dumps directory. realpathSync follows symlinks and resolves
+      // .. so a `../../etc/passwd`-style path can't escape.
+      const dumpsDir = retconDumpsDir()
+      let resolvedPath: string
+      let resolvedDumpsDir: string
+      try {
+        resolvedPath = fs.realpathSync(filePath)
+      }
+      catch {
+        return { error: `path does not exist or is unreadable: ${filePath}` }
+      }
+      try {
+        resolvedDumpsDir = fs.realpathSync(dumpsDir)
+      }
+      catch {
+        return { error: `dumps directory not initialized at ${dumpsDir}` }
+      }
+      // Ensure resolvedPath is under resolvedDumpsDir (with separator to
+      // avoid prefix-match attacks: /tmp/dumps2/x.jsonl shouldn't pass
+      // when /tmp/dumps is the allowed root).
+      const dumpsWithSep = resolvedDumpsDir.endsWith(path.sep) ? resolvedDumpsDir : resolvedDumpsDir + path.sep
+      if (!resolvedPath.startsWith(dumpsWithSep)) {
+        return { error: `path must resolve inside ${dumpsDir} (got ${resolvedPath})` }
+      }
+
+      // ── Phase 1 of dual-secret flow ───────────────────────────────────────
+      const confirmValue = typeof parsed.confirm === 'string' ? parsed.confirm : ''
+      const matchKind = confirmValue.length > 0
+        ? submitStore.match(ctx.sessionId, confirmValue)
+        : null
+
+      if (matchKind === null) {
+        const tokens = submitStore.generate(ctx.sessionId)
+        return {
+          status: 'rules_returned',
+          rules: submitRulesText(tokens),
+          confirm_clean: tokens.clean,
+          confirm_meta: tokens.meta,
+        }
+      }
+
+      submitStore.consume(ctx.sessionId)
+
+      if (matchKind === 'meta') {
+        const newTokens = submitStore.generate(ctx.sessionId)
+        return submitMetaFlaggedResponse(newTokens)
+      }
+
+      // matchKind === 'clean'. Run regex backstop unless allow_meta_refs.
+      if (parsed.allow_meta_refs !== true) {
+        const matched = detectMetaRef(message)
+        if (matched) {
+          const newTokens = submitStore.generate(ctx.sessionId)
+          return submitRegexRejectedResponse(matched, newTokens)
+        }
+      }
+
+      // ── Phase 2: parse + validate the JSONL ───────────────────────────────
+      let raw: string
+      try {
+        raw = fs.readFileSync(resolvedPath, { encoding: 'utf8' })
+      }
+      catch (err) {
+        return { error: `failed to read dump: ${(err as Error).message}` }
+      }
+
+      const lines = raw.split('\n').filter(l => l.length > 0)
+      if (lines.length === 0) {
+        return { error: 'dump file is empty (no JSONL lines)' }
+      }
+      const messages: Array<{ role: string, content: unknown }> = []
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!
+        let msg: unknown
+        try {
+          msg = JSON.parse(line)
+        }
+        catch (err) {
+          return { error: `dump line ${i + 1} is not valid JSON: ${(err as Error).message}` }
+        }
+        if (typeof msg !== 'object' || msg === null) {
+          return { error: `dump line ${i + 1} is not a JSON object` }
+        }
+        const m = msg as { role?: unknown, content?: unknown }
+        if (typeof m.role !== 'string') {
+          return { error: `dump line ${i + 1} missing string \`role\` field` }
+        }
+        if (m.content === undefined) {
+          return { error: `dump line ${i + 1} missing \`content\` field` }
+        }
+        // Anthropic accepts string content OR an array of content blocks; we
+        // don't validate the array's structure (passes through to Anthropic).
+        messages.push({ role: m.role, content: m.content })
+      }
+
+      // The load-bearing rule (Decision #4): last line MUST be assistant.
+      const lastMsg = messages[messages.length - 1]!
+      if (lastMsg.role !== 'assistant') {
+        return {
+          error: `dump's last line has role="${lastMsg.role}", expected "assistant". The appended user message would create back-to-back user turns. Either drop the trailing user line from the dump, or call rewind_to directly if you don't need the file edits.`,
+        }
+      }
+
+      // Feature gate (mirror rewind_to). Reuse the same env-driven flag —
+      // if rewind is off, submit is off too (both produce a TOBE that the
+      // proxy splices into the next /v1/messages).
+      if (deps.rewindEnabled === false) {
+        return { error: 'submit_file is disabled; proxy running in recording-only mode.' }
+      }
+
+      // ── Phase 3: append message + write TOBE ──────────────────────────────
+      const finalMessages: unknown[] = [...messages, { role: 'user', content: message }]
+      const newMessageBlob = await blobRefFromBytes(
+        Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
+      )
+
+      // Load the session here (we deferred it past the validation/secret
+      // checks since those don't need DB state). Reject orphans the same
+      // way rewind_to does — submit_file produces a TOBE that the proxy
+      // splice consumes, and that splice path requires a properly-bound
+      // session.
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
+      if (sess.harness === 'orphan') {
+        return { error: 'submit_file requires an MCP-initialized session (orphan sessions cannot submit)' }
+      }
+
+      // submit_file needs at least one closed_forkable revision to use as
+      // the fork-point anchor in the emitted fork.back_requested event.
+      // The projector requires a non-null fork_point_revision_id and the
+      // proxy splice attaches the submitted history at the first /v1/
+      // messages call after this — so a session with no history yet can't
+      // meaningfully submit.
+      const headForkable = mostRecentForkableRevision(deps.db, sess.task_id)
+      if (!headForkable) {
+        return {
+          error: 'submit_file requires at least one settled turn in this session — wait for the current turn to close (or send a normal user message first).',
+        }
+      }
+      const targetViewId = generateTraceId()
+
+      deps.tobeStore.write(ctx.sessionId, {
+        messages: finalMessages,
+        fork_point_revision_id: headForkable.id,
+        source_view_id: ctx.sessionId,
+      })
+
+      // Persist as branch context (same as rewind_to) so subsequent turns
+      // continue on the submitted branch.
+      deps.db.prepare(`UPDATE sessions SET branch_context_json = ? WHERE id = ?`)
+        .run(JSON.stringify(finalMessages), ctx.sessionId)
+
+      ctx.producer.emit(
+        'fork.back_requested',
+        {
+          source_view_id: ctx.sessionId,
+          fork_point_revision_id: headForkable.id,
+          new_message_cid: newMessageBlob.cid,
+          target_view_id: targetViewId,
+          task_id: sess.task_id,
+          via: 'submit_file',
+          dump_path: resolvedPath,
+        },
+        ctx.sessionId,
+        [newMessageBlob.ref],
+      )
+
+      return submitScheduledResponse({
+        path: resolvedPath,
+        fork_point: headForkable.id,
+        target_view_id: targetViewId,
+        pending_path: deps.tobeStore.fileFor(ctx.sessionId),
+        message_count: finalMessages.length,
+      })
     },
   })
 

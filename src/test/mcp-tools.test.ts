@@ -7,7 +7,7 @@
 // own dedicated describe block — first call returns rules + tokens, second
 // call (with the matching token) does the rewind work.
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import fs, { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -923,5 +923,437 @@ describe('detectMetaRef + META_REFS', () => {
 
   it('META_REFS list has exactly 4 patterns', () => {
     expect(META_REFS.length).toBe(4)
+  })
+})
+
+// ─── dump_to_file ────────────────────────────────────────────────────────────
+
+describe('dump_to_file', () => {
+  let fx: TestFixture
+  let retconHome: string
+  beforeEach(() => {
+    fx = fixture()
+    // Each test gets its own RETCON_HOME so dumps from one test don't leak
+    // into another. retconDumpsDir() reads process.env.RETCON_HOME at call
+    // time, so we just need to set it before invoking the handler.
+    retconHome = mkdtempSync(path.join(tmpdir(), 'retcon-dumps-home-'))
+    process.env.RETCON_HOME = retconHome
+  })
+  afterEach(() => {
+    delete process.env.RETCON_HOME
+    try {
+      rmSync(retconHome, { recursive: true, force: true })
+    }
+    catch { /* ignore */ }
+    fx.cleanup()
+  })
+
+  it('writes a JSONL dump of the current head and returns the path', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    const res = await call(fx, 'dump_to_file', {}) as {
+      path?: string
+      error?: string
+      turn_id: string
+      message_count: number
+      next_steps: string
+    }
+    if (res.error) throw new Error(`dump_to_file failed: ${res.error}`)
+    expect(res.path!).toContain('dumps')
+    expect(res.message_count).toBeGreaterThan(0)
+    expect(res.next_steps).toMatch(/Read tool/)
+    // File exists and ends with a newline.
+    const content = fs.readFileSync(res.path, { encoding: 'utf8' })
+    expect(content.endsWith('\n')).toBe(true)
+    const lines = content.split('\n').filter(l => l.length > 0)
+    expect(lines.length).toBe(res.message_count)
+    // Each line is valid JSON with role + content.
+    for (const line of lines) {
+      const parsed = JSON.parse(line) as { role: string, content: unknown }
+      expect(typeof parsed.role).toBe('string')
+      expect(parsed.content).toBeDefined()
+    }
+    // Last line is assistant role (load-bearing rule).
+    const lastLine = JSON.parse(lines[lines.length - 1]!) as { role: string }
+    expect(lastLine.role).toBe('assistant')
+  })
+
+  it('dumps a specific turn via turn_id', async () => {
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    const res = await call(fx, 'dump_to_file', { turn_id: t1.id }) as {
+      path: string
+      turn_id: string
+    }
+    expect(res.turn_id).toBe(t1.id)
+    expect(fs.existsSync(res.path)).toBe(true)
+  })
+
+  it('dumps via turn_back_n (matches recall list numbering)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const t2 = emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'second' },
+    ])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'second' },
+      { role: 'assistant', content: 'a2' },
+      { role: 'user', content: 'third' },
+    ])
+    const res = await call(fx, 'dump_to_file', { turn_back_n: 1 }) as {
+      path?: string
+      turn_id?: string
+      error?: string
+    }
+    if (res.error) throw new Error(`dump_to_file failed: ${res.error}`)
+    expect(res.turn_id).toBe(t2.id)
+  })
+
+  it('errors with helpful message when no-args called on a fresh session (only 1 turn)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'dump_to_file', {}) as { error: string }
+    expect(res.error).toMatch(/at least 2 forkable turns|active forked branch/)
+  })
+
+  it('rejects orphan sessions', async () => {
+    const orphan = fixture({ orphan: true })
+    try {
+      const res = await call(orphan, 'dump_to_file', {}) as { error: string }
+      expect(res.error).toMatch(/orphan sessions cannot dump/)
+    }
+    finally {
+      orphan.cleanup()
+    }
+  })
+
+  it('errors when no forkable turn exists (open-only session)', async () => {
+    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
+    const res = await call(fx, 'dump_to_file', {}) as { error: string }
+    // effectiveHead returns undefined when only in_flight/open revs exist.
+    expect(res.error).toMatch(/no settled turns yet|nothing to dump/)
+  })
+
+  it('errors on turn_id from a different session', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'dump_to_file', { turn_id: 'rev-unknown' }) as { error: string }
+    expect(res.error).toMatch(/not found/)
+  })
+
+  it('rejects both turn_id and turn_back_n together', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'dump_to_file', { turn_id: 'x', turn_back_n: 1 }) as { error: string }
+    expect(res.error).toMatch(/not both/)
+  })
+
+  it('uses branch_context_json when on a forked branch (head case)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    // Simulate a forked branch by writing branch_context_json directly.
+    const branchMessages = [
+      { role: 'user', content: 'forked q' },
+      { role: 'assistant', content: 'forked a' },
+    ]
+    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
+      .run(JSON.stringify(branchMessages), fx.sessionId)
+    const res = await call(fx, 'dump_to_file', {}) as {
+      path: string
+      message_count: number
+      is_branch_view: boolean
+    }
+    expect(res.is_branch_view).toBe(true)
+    const content = fs.readFileSync(res.path, { encoding: 'utf8' })
+    const lines = content.split('\n').filter(l => l.length > 0)
+    expect(lines.length).toBe(2)
+    expect(JSON.parse(lines[0]!).content).toBe('forked q')
+    expect(JSON.parse(lines[1]!).content).toBe('forked a')
+  })
+})
+
+// ─── submit_file ─────────────────────────────────────────────────────────────
+
+describe('submit_file (dual-secret + path safety)', () => {
+  let fx: TestFixture
+  let dumpsRoot: string
+  beforeEach(() => {
+    fx = fixture()
+    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'retcon-submit-test-'))
+    process.env.RETCON_HOME = tmpRoot
+    dumpsRoot = path.join(tmpRoot, 'dumps')
+    fs.mkdirSync(dumpsRoot, { recursive: true })
+  })
+  afterEach(() => {
+    const home = process.env.RETCON_HOME
+    delete process.env.RETCON_HOME
+    if (home) {
+      try {
+        rmSync(home, { recursive: true, force: true })
+      }
+      catch { /* ignore */ }
+    }
+    fx.cleanup()
+  })
+
+  /** Helper: write a JSONL file inside dumpsRoot with the given messages. */
+  function writeDump(filename: string, messages: Array<{ role: string, content: unknown }>): string {
+    const content = messages.map(m => JSON.stringify(m)).join('\n') + '\n'
+    const full = path.join(dumpsRoot, filename)
+    fs.writeFileSync(full, content, { encoding: 'utf8' })
+    return full
+  }
+
+  /** Two-step submit_file helper, parallel to rewindTwoStep. */
+  async function submitTwoStep(
+    args: Record<string, unknown>,
+    opts: { tokenChoice?: 'clean' | 'meta', confirmOverride?: string } = {},
+  ): Promise<unknown> {
+    const tokenStore = new ConfirmTokenStore()
+    const tools = createMcpToolsWithTokens(
+      {
+        db: fx.db,
+        tobeStore: fx.tobeStore,
+        storageProvider: fx.storageProvider,
+        rewindEnabled: true,
+      },
+      { rewind: new ConfirmTokenStore(), submit: tokenStore },
+    )
+    const tool = tools.get('submit_file')!
+    const first = await tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer }) as {
+      status: string
+      confirm_clean?: string
+      confirm_meta?: string
+    }
+    if (first.status !== 'rules_returned') return first
+    const choice = opts.tokenChoice ?? 'clean'
+    const confirm = opts.confirmOverride
+      ?? (choice === 'clean' ? first.confirm_clean! : first.confirm_meta!)
+    return tool.handler({ ...args, confirm }, { sessionId: fx.sessionId, producer: fx.producer })
+  }
+
+  it('first call returns rules + token pair (rules mention assistant-must-end)', async () => {
+    const dump = writeDump('test.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    const res = await call(fx, 'submit_file', { path: dump, message: 'X' }) as {
+      status: string
+      rules: string
+      confirm_clean: string
+      confirm_meta: string
+    }
+    expect(res.status).toBe('rules_returned')
+    expect(res.rules).toMatch(/LAST line.*assistant/i)
+    expect(res.confirm_clean).toMatch(/^[A-Za-z0-9]{8}$/)
+  })
+
+  it('clean-token + valid dump → writes TOBE + scheduled response', async () => {
+    // Need at least one forkable revision in the session — submit_file uses
+    // it as the fork-point anchor for the emitted event.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+    ])
+    const res = await submitTwoStep({ path: dump, message: 'continue with X' }) as {
+      status: string
+      message: string
+      message_count: number
+    }
+    expect(res.status).toBe('scheduled')
+    expect(res.message).toMatch(/RETCON ERROR/)
+    expect(res.message_count).toBe(3) // 2 dump + 1 appended user
+    const pending = fx.tobeStore.peek(fx.sessionId)!
+    expect(pending.messages.length).toBe(3)
+    const last = pending.messages[2] as { role: string, content: string }
+    expect(last.role).toBe('user')
+    expect(last.content).toBe('continue with X')
+  })
+
+  it('errors when session has no forkable revision yet', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    // No emitTurn — session has no closed_forkable revisions.
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/at least one settled turn/)
+  })
+
+  it('rejects path traversal outside dumps dir', async () => {
+    // Write a file OUTSIDE the dumps dir.
+    const outside = path.join(tmpdir(), `retcon-outside-${Date.now()}.jsonl`)
+    fs.writeFileSync(outside, '{"role":"assistant","content":"a"}\n')
+    try {
+      const res = await call(fx, 'submit_file', { path: outside, message: 'X' }) as { error: string }
+      expect(res.error).toMatch(/must resolve inside/)
+    }
+    finally {
+      try {
+        fs.unlinkSync(outside)
+      }
+      catch { /* ignore */ }
+    }
+  })
+
+  it('rejects nonexistent path', async () => {
+    const ghost = path.join(dumpsRoot, 'no-such-file.jsonl')
+    const res = await call(fx, 'submit_file', { path: ghost, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/does not exist/)
+  })
+
+  it('rejects malformed JSONL line', async () => {
+    const dump = path.join(dumpsRoot, 'broken.jsonl')
+    fs.writeFileSync(dump, '{"role":"user","content":"q"}\n{not json\n{"role":"assistant","content":"a"}\n')
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/line 2 is not valid JSON/)
+  })
+
+  it('rejects line missing role or content', async () => {
+    const dump = path.join(dumpsRoot, 'missing-role.jsonl')
+    fs.writeFileSync(dump, '{"role":"user","content":"q"}\n{"content":"orphan"}\n')
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/line 2 missing string `role`/)
+  })
+
+  it('rejects last-line-not-assistant (Decision #4 load-bearing rule)', async () => {
+    const dump = writeDump('user-tail.jsonl', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'extra user' }, // BAD: trailing user
+    ])
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/last line has role="user"/)
+  })
+
+  it('rejects empty dump file', async () => {
+    const dump = path.join(dumpsRoot, 'empty.jsonl')
+    fs.writeFileSync(dump, '')
+    const res = await submitTwoStep({ path: dump, message: 'X' }) as { error: string }
+    expect(res.error).toMatch(/empty/)
+  })
+
+  it('rejects whitespace-only message before consuming token', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    const res = await call(fx, 'submit_file', { path: dump, message: '   ' }) as { error: string }
+    expect(res.error).toMatch(/non-whitespace/)
+  })
+
+  it('meta_token → educational rejection + new token pair', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    const res = await submitTwoStep(
+      { path: dump, message: 'see above for context' },
+      { tokenChoice: 'meta' },
+    ) as { status: string, message: string }
+    expect(res.status).toBe('rejected')
+    expect(res.message).toMatch(/Good catch/)
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+  })
+
+  it('clean-token + regex-flagged message → rejection (no TOBE)', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    const res = await submitTwoStep({
+      path: dump,
+      message: 'see above for context',
+    }) as { status: string }
+    expect(res.status).toBe('rejected')
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+  })
+
+  it('clean-token + allow_meta_refs=true bypasses regex', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    const res = await submitTwoStep({
+      path: dump,
+      message: 'see above for the corrected number, then continue',
+      allow_meta_refs: true,
+    }) as { status: string }
+    expect(res.status).toBe('scheduled')
+  })
+
+  it('emits fork.back_requested with via=submit_file', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: 'a' },
+    ])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await submitTwoStep({ path: dump, message: 'continue' })
+    const ev = fx.db.prepare(
+      `SELECT payload FROM events WHERE topic = 'fork.back_requested' AND session_id = ? ORDER BY event_id DESC LIMIT 1`,
+    ).get(fx.sessionId) as { payload: string }
+    const parsed = JSON.parse(ev.payload) as { via?: string, dump_path?: string }
+    expect(parsed.via).toBe('submit_file')
+    expect(parsed.dump_path).toContain('dumps')
+  })
+
+  it('writes branch_context_json so submit persists across turns', async () => {
+    const dump = writeDump('valid.jsonl', [
+      { role: 'user', content: 'historical q' },
+      { role: 'assistant', content: 'historical a' },
+    ])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await submitTwoStep({ path: dump, message: 'continue' })
+    const row = fx.db.prepare('SELECT branch_context_json FROM sessions WHERE id = ?').get(fx.sessionId) as
+      | { branch_context_json: string | null } | undefined
+    expect(row?.branch_context_json).not.toBeNull()
+    const msgs = JSON.parse(row!.branch_context_json!) as Array<{ role: string }>
+    expect(msgs.length).toBe(3) // 2 dump + 1 appended user
+    expect(msgs[2]!.role).toBe('user')
+  })
+})
+
+// ─── gcDumps (daemon GC sweep) ───────────────────────────────────────────────
+
+describe('gcDumps', () => {
+  it('imports as a named export from cli/daemon', async () => {
+    // Indirect import via dynamic require to avoid coupling all the other
+    // tests to daemon module loading order.
+    const { gcDumps } = await import('../cli/daemon.js')
+    expect(typeof gcDumps).toBe('function')
+  })
+
+  it('removes files older than ttlMs, keeps fresh ones', async () => {
+    const { gcDumps } = await import('../cli/daemon.js')
+    const dir = mkdtempSync(path.join(tmpdir(), 'retcon-gc-test-'))
+    try {
+      const oldFile = path.join(dir, 'old.jsonl')
+      const freshFile = path.join(dir, 'fresh.jsonl')
+      fs.writeFileSync(oldFile, '{}')
+      fs.writeFileSync(freshFile, '{}')
+      // Backdate oldFile by 48 hours.
+      const old = Date.now() - 48 * 60 * 60 * 1000
+      fs.utimesSync(oldFile, old / 1000, old / 1000)
+      gcDumps(dir, 24 * 60 * 60 * 1000)
+      expect(fs.existsSync(oldFile)).toBe(false)
+      expect(fs.existsSync(freshFile)).toBe(true)
+    }
+    finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('survives missing directory (returns silently)', async () => {
+    const { gcDumps } = await import('../cli/daemon.js')
+    expect(() => gcDumps('/tmp/this-dir-does-not-exist-xyzzy', 1000)).not.toThrow()
   })
 })

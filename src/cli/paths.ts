@@ -9,7 +9,8 @@
 //   ├── proxy.db-shm       SQLite shared memory (auto-managed by sqlite)
 //   ├── proxy.pid          daemon PID (written on start, removed on clean exit)
 //   ├── daemon.log         daemon stdout+stderr (append-only; rotation deferred to v1.1)
-//   └── tobe/              per-session TOBE pending JSON files
+//   ├── tobe/              per-session TOBE pending JSON files
+//   └── dumps/             AI-edited conversation dumps (dump_to_file output)
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -27,6 +28,10 @@ export function retconTobeDir(): string {
   return path.join(retconHome(), 'tobe')
 }
 
+export function retconDumpsDir(): string {
+  return path.join(retconHome(), 'dumps')
+}
+
 export function retconPidFile(): string {
   return path.join(retconHome(), 'proxy.pid')
 }
@@ -36,7 +41,8 @@ export function retconLogFile(): string {
 }
 
 /**
- * Create ~/.retcon/ + ~/.retcon/tobe/ if missing. Idempotent.
+ * Create ~/.retcon/, ~/.retcon/tobe/, and ~/.retcon/dumps/ if missing.
+ * Idempotent.
  *
  * Throws if the path is unwritable (e.g. read-only HOME, permission denied).
  * Caller is expected to surface the error to the user since retcon can't
@@ -45,4 +51,5 @@ export function retconLogFile(): string {
 export function ensureRetconDirs(): void {
   fs.mkdirSync(retconHome(), { recursive: true })
   fs.mkdirSync(retconTobeDir(), { recursive: true })
+  fs.mkdirSync(retconDumpsDir(), { recursive: true })
 }

@@ -32,6 +32,7 @@
 //          stale and is cleaned up on next ensureDaemon() invocation.
 
 import fs from 'node:fs'
+import path from 'node:path'
 
 import { closeDb, migrate, openDb } from '../db.js'
 import { createMcpTools } from '../mcp-tools.js'
@@ -39,7 +40,7 @@ import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { createDefaultProducer, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
-import { ensureRetconDirs, retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
+import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile, retconTobeDir } from './paths.js'
 
 const SHUTDOWN_DEADLINE_MS = 2000
 
@@ -49,6 +50,14 @@ const SHUTDOWN_DEADLINE_MS = 2000
  * before it made its first /v1/messages call) and swept on boot.
  */
 const PENDING_ACTOR_GC_TTL_MS = 60 * 60 * 1000
+
+/**
+ * TTL for files in ~/.retcon/dumps/. Dumps are AI-edited conversation
+ * snapshots produced by `dump_to_file` and consumed by `submit_file`.
+ * They're scratch space — if the AI didn't submit within a day, the
+ * conversation has moved on and the dump is dead weight.
+ */
+const DUMPS_GC_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
  * Run the daemon body. Blocks until SIGTERM/SIGINT (clean shutdown) or
@@ -75,6 +84,12 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   // launch delay; anything older is abandoned.
   db.prepare('DELETE FROM pending_actors WHERE registered_at < ?')
     .run(Date.now() - PENDING_ACTOR_GC_TTL_MS)
+
+  // Garbage-collect stale dumps. dump_to_file writes JSONL conversation
+  // snapshots that submit_file later reads back; either the AI submits
+  // within the same conversation or the dump is orphaned. 24-hour TTL
+  // is well past any reasonable session length.
+  gcDumps(retconDumpsDir(), DUMPS_GC_TTL_MS)
 
   const producer = createDefaultProducer(db)
   const tobeStore = createTobeStore(retconTobeDir())
@@ -158,5 +173,33 @@ function cleanupPidFile(): void {
   }
   catch {
     /* may already be gone */
+  }
+}
+
+/**
+ * Sweep ~/.retcon/dumps/ for files older than `ttlMs` (by mtime). Best-effort:
+ * a single failed unlink doesn't abort the rest. Errors reading the
+ * directory itself are swallowed since dumps are scratch space and the
+ * daemon must boot regardless. Exported for tests.
+ */
+export function gcDumps(dir: string, ttlMs: number, now: number = Date.now()): void {
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(dir)
+  }
+  catch {
+    return // directory doesn't exist yet — first launch before ensureRetconDirs
+  }
+  const cutoff = now - ttlMs
+  for (const name of entries) {
+    const full = path.join(dir, name)
+    try {
+      const stat = fs.statSync(full)
+      if (!stat.isFile()) continue
+      if (stat.mtimeMs < cutoff) fs.unlinkSync(full)
+    }
+    catch {
+      /* concurrent deletion, permissions, etc. — best effort */
+    }
   }
 }
