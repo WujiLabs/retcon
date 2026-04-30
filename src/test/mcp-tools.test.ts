@@ -165,39 +165,94 @@ describe('recall (list mode)', () => {
   })
   afterEach(() => fx.cleanup())
 
-  it('lists closed_forkable turns in recency order with previews', async () => {
+  it('lists rewindable turns (excludes the head) in recency order with previews', async () => {
+    // Three closed_forkable turns: q1, q3, q4. Plus an open in the middle.
+    // The head (most-recent closed_forkable, q4) is excluded from the list
+    // because rewinding to the current state is a no-op. n_back numbering
+    // matches what rewind_to(turn_back_n=N) would land on.
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // open, should NOT appear
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head — excluded
     const res = await call(fx, 'recall', {}) as {
       total: number
       turns: Array<{ turn_id: string, n_back: number, preview: string, stop_reason: string | null }>
+      current_head_turn_id: string | null
     }
+    // total = rewindable count (3 closed_forkable - 1 head = 2)
     expect(res.total).toBe(2)
+    expect(res.turns.length).toBe(2)
     expect(res.turns.every(v => v.stop_reason === 'end_turn')).toBe(true)
+    // n_back=1 is q3 (one before head); n_back=2 is q1.
     expect(res.turns[0]!.preview).toBe('q3')
     expect(res.turns[1]!.preview).toBe('q1')
     expect(res.turns[0]!.n_back).toBe(1)
     expect(res.turns[1]!.n_back).toBe(2)
+    expect(res.current_head_turn_id).not.toBeNull()
+  })
+
+  it('list mode n_back=N matches rewind_to(turn_back_n=N) target (no off-by-one)', async () => {
+    // Regression guard for the inconsistency between list mode and rewind_to:
+    // calling rewind_to(turn_back_n=K) MUST land on the same revision that
+    // recall list labels n_back=K (turn_id field).
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const t2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }]) // head — excluded
+    const list = await call(fx, 'recall', {}) as {
+      turns: Array<{ turn_id: string, preview: string, n_back: number }>
+    }
+    // n_back=1 = the turn whose `turn_id` rewind_to(turn_back_n=1) lands on.
+    expect(list.turns[0]!.preview).toBe('second')
+    expect(list.turns[0]!.n_back).toBe(1)
+    expect(list.turns[0]!.turn_id).toBe(t2.id)
+    // Now verify rewind_to(turn_back_n=1) targets the n_back=1 entry.
+    const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'X' }) as {
+      status: string
+      fork_point: string
+    }
+    expect(res.status).toBe('scheduled')
+    expect(res.fork_point).toBe(t2.id) // same as list.turns[0].turn_id
+  })
+
+  it('returns empty list when only the head is closed_forkable (single-turn session)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }]) // head, only forkable
+    const res = await call(fx, 'recall', {}) as {
+      total: number
+      turns: unknown[]
+      current_head_turn_id: string | null
+    }
+    expect(res.total).toBe(0) // 1 forkable - 1 head = 0 rewindable
+    expect(res.turns).toEqual([])
+    expect(res.current_head_turn_id).not.toBeNull() // head exists, just not in list
   })
 
   it('returns empty list when no closed_forkable turns exist', async () => {
     emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
-    const res = await call(fx, 'recall', {}) as { total: number, turns: unknown[] }
+    const res = await call(fx, 'recall', {}) as {
+      total: number
+      turns: unknown[]
+      current_head_turn_id: string | null
+    }
     expect(res.total).toBe(0)
     expect(res.turns).toEqual([])
+    expect(res.current_head_turn_id).toBeNull()
   })
 
-  it('respects limit and offset', async () => {
+  it('respects limit and offset (after head exclusion)', async () => {
+    // 5 closed_forkable turns. Head excluded → 4 rewindable.
     for (let i = 0; i < 5; i++) emitTurn(fx, 'end_turn', [{ role: 'user', content: `q${i}` }])
-    const r1 = await call(fx, 'recall', { limit: 2 }) as { turns: unknown[] }
+    const r1 = await call(fx, 'recall', { limit: 2 }) as { turns: unknown[], total: number }
     expect(r1.turns.length).toBe(2)
+    expect(r1.total).toBe(4) // 5 forkable - 1 head
+    // SQL filters head out, so offset/limit count rewindable turns directly.
+    // 4 rewindable - 3 offset = 1 row.
     const r2 = await call(fx, 'recall', { limit: 10, offset: 3 }) as { turns: unknown[] }
-    expect(r2.turns.length).toBe(2)
+    expect(r2.turns.length).toBe(1)
   })
 
   it('lean result hides revision_id / classification / asset_cid by default', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // need 2 so list isn't empty
     const r = await call(fx, 'recall', {}) as { turns: Array<Record<string, unknown>> }
     const t = r.turns[0]!
     expect('classification' in t).toBe(false)
@@ -576,6 +631,15 @@ describe('rewind_to (dual-secret flow)', () => {
   it('CONFIRM_TOKEN_TTL_MS default is 5 minutes', () => {
     expect(CONFIRM_TOKEN_TTL_MS).toBe(5 * 60 * 1000)
   })
+
+  it('clean and meta tokens are always distinct (collision guard)', () => {
+    // Stress: 10k generations should never produce a clean=meta pair.
+    const store = new ConfirmTokenStore()
+    for (let i = 0; i < 10_000; i++) {
+      const pair = store.generate(`session-${i}`)
+      expect(pair.clean).not.toBe(pair.meta)
+    }
+  })
 })
 
 describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', () => {
@@ -620,6 +684,39 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
     finally {
       orphan.cleanup()
     }
+  })
+
+  it('rejects whitespace-only message BEFORE consuming token', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    // Pre-token-check rejection — same as size-cap rejection.
+    const r1 = await call(fx, 'rewind_to', { turn_back_n: 1, message: '   ' }) as { error: string }
+    expect(r1.error).toMatch(/non-whitespace/)
+    const r2 = await call(fx, 'rewind_to', { turn_back_n: 1, message: '\n\n\t' }) as { error: string }
+    expect(r2.error).toMatch(/non-whitespace/)
+  })
+
+  it('cycle-safe: corrupt parent_revision_id self-loop does not hang', async () => {
+    // Seed two closed_forkable revisions, then create a self-loop on the head's
+    // parent. effectiveHead and nthForkableBack used to spin forever on this;
+    // they now bail via the visited-set + RECALL_MAX_DEPTH cap.
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    fx.db.prepare('UPDATE revisions SET parent_revision_id = id WHERE id = ?').run(t1.id)
+    const start = Date.now()
+    // Calling with a high turn_back_n forces the walker to traverse beyond the
+    // cycle. Should fail fast, not hang.
+    const res = await rewindTwoStep(fx, { turn_back_n: 99, message: 'X' }) as {
+      error?: string
+      status?: string
+    }
+    const elapsed = Date.now() - start
+    expect(elapsed).toBeLessThan(2000)
+    expect(res.status).toBeUndefined()
+    expect(res.error).toMatch(/forkable turns available/)
   })
 
   it('rewindEnabled=false emits fork.back_disabled_rejected and errors', async () => {
@@ -809,6 +906,19 @@ describe('detectMetaRef + META_REFS', () => {
     expect(detectMetaRef('as I mentioned earlier in the doc')).toBeNull()
     expect(detectMetaRef('my last response time was 200ms')).toBeNull()
     expect(detectMetaRef('format the same as before in the schema')).toBeNull()
+  })
+
+  it('does NOT false-positive on "saw above N%" data narratives (regression guard)', () => {
+    // The (?!\s*\d) lookahead in pattern 1 skips numeric-comparison phrasings
+    // common in data discussion. Without it, "saw above 90%" falsely matched
+    // the meta-reference pattern.
+    expect(detectMetaRef('we saw above 90% accuracy')).toBeNull()
+    expect(detectMetaRef('the rate read above 7000 RPM')).toBeNull()
+    expect(detectMetaRef('see above 1000 ms latency')).toBeNull()
+    // But still catches genuine meta-references with non-digit follow-ups.
+    expect(detectMetaRef('see above for context')).toBeTruthy()
+    expect(detectMetaRef('see above.')).toBeTruthy()
+    expect(detectMetaRef('please read above and revise')).toBeTruthy()
   })
 
   it('META_REFS list has exactly 4 patterns', () => {

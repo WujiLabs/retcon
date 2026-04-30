@@ -146,15 +146,21 @@ function firstChild(db: DB, parentRevisionId: string): RevisionRow | undefined {
  * to find the nearest settled (non-in-flight) ancestor. This is the F4 guard
  * extracted into a helper so both `recall` and `rewind_to` can reuse it.
  *
- * Returns undefined if no settled revision is reachable.
+ * Returns undefined if no settled revision is reachable. Cycle-safe: a
+ * corrupt parent_revision_id chain (e.g., self-loop or A→B→A) terminates
+ * via the visited set and depth cap rather than spinning forever.
  */
 function effectiveHead(db: DB, taskId: string): RevisionRow | undefined {
   let head: RevisionRow | undefined = mostRecentRevision(db, taskId)
-  while (head && (head.classification === 'open' || head.classification === 'in_flight')) {
+  const visited = new Set<string>()
+  for (let i = 0; i < RECALL_MAX_DEPTH; i++) {
+    if (!head || (head.classification !== 'open' && head.classification !== 'in_flight')) return head
+    if (visited.has(head.id)) return undefined
+    visited.add(head.id)
     if (!head.parent_revision_id) return undefined
     head = loadRevision(db, head.parent_revision_id)
   }
-  return head
+  return undefined
 }
 
 /**
@@ -163,12 +169,18 @@ function effectiveHead(db: DB, taskId: string): RevisionRow | undefined {
  * The returned revision is the FORK POINT for rewind_to.
  *
  * `start` itself is "where we are" — it is NOT counted, even if it's closed_forkable.
+ *
+ * Cycle-safe: walks at most RECALL_MAX_DEPTH steps, tracking visited ids.
  */
 function nthForkableBack(db: DB, start: RevisionRow, n: number): RevisionRow | undefined {
   let walked = 0
   let cursor: string | null = start.parent_revision_id
   let target: RevisionRow | undefined
-  while (walked < n && cursor) {
+  const visited = new Set<string>([start.id])
+  for (let i = 0; i < RECALL_MAX_DEPTH; i++) {
+    if (walked >= n || !cursor) break
+    if (visited.has(cursor)) break
+    visited.add(cursor)
     const rev = loadRevision(db, cursor)
     if (!rev) break
     if (rev.classification === 'closed_forkable') {
@@ -180,6 +192,27 @@ function nthForkableBack(db: DB, start: RevisionRow, n: number): RevisionRow | u
   }
   if (walked < n) return undefined
   return target
+}
+
+/**
+ * Count how many closed_forkable revisions are reachable backward from
+ * `start` (exclusive). Used to produce a helpful error message when
+ * `nthForkableBack` returns undefined. Cycle-safe like its siblings.
+ */
+function countForkableBack(db: DB, start: RevisionRow): number {
+  let count = 0
+  let cursor: string | null = start.parent_revision_id
+  const visited = new Set<string>([start.id])
+  for (let i = 0; i < RECALL_MAX_DEPTH; i++) {
+    if (!cursor) break
+    if (visited.has(cursor)) break
+    visited.add(cursor)
+    const rev = loadRevision(db, cursor)
+    if (!rev) break
+    if (rev.classification === 'closed_forkable') count++
+    cursor = rev.parent_revision_id
+  }
+  return count
 }
 
 /**
@@ -260,11 +293,17 @@ export class ConfirmTokenStore {
   }
 
   generate(sessionId: string, now: number = Date.now()): ConfirmTokenPair {
-    const pair: ConfirmTokenPair = {
-      clean: opaqueToken(),
-      meta: opaqueToken(),
-      expiresAt: now + this.ttlMs,
+    // Loop until clean !== meta. Collision probability is ~5e-15 per attempt
+    // with 8-char alphanumeric tokens; this loop almost always exits on the
+    // first iteration. The check matters because if the two tokens collide,
+    // a meta-flagged confirm would route to the clean path (match() returns
+    // 'clean' first), denying the AI's self-flag.
+    const clean = opaqueToken()
+    let meta = opaqueToken()
+    while (clean === meta) {
+      meta = opaqueToken()
     }
+    const pair: ConfirmTokenPair = { clean, meta, expiresAt: now + this.ttlMs }
     this.map.set(sessionId, pair)
     return pair
   }
@@ -298,21 +337,28 @@ export class ConfirmTokenStore {
 
 /**
  * 8-char alphanumeric token. Opaque by design (no semantic prefix). Drawn
- * from a 62-char alphabet → 62^8 ≈ 2.18×10^14 possible values — collision
- * is statistically negligible for the per-session use case.
+ * uniformly from a 62-char alphabet → 62^8 ≈ 2.18×10^14 possible values.
+ * Collision is statistically negligible for the per-session use case.
  *
- * Avoids common confusables intentionally? No — we want full entropy.
- * The AI doesn't read tokens letter-by-letter; it copies them verbatim from
- * the rules text into the next call.
+ * Uses rejection sampling on the random bytes to avoid the modulo-bias of
+ * the naïve `bytes[i] % 62` approach (256 % 62 = 8, so the first 8 alphabet
+ * chars would be ~25% over-represented). We oversample by 2x and discard
+ * values >= 248 (the largest multiple of 62 that fits in a byte). The retry
+ * path is rare; if 16 bytes still doesn't yield 8 unbiased samples we
+ * recurse, but in practice this never recurses more than once.
  */
 function opaqueToken(): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  const bytes = randomBytes(8)
-  let out = ''
-  for (let i = 0; i < 8; i++) {
-    out += alphabet[bytes[i]! % alphabet.length]
+  const limit = Math.floor(256 / alphabet.length) * alphabet.length // 248
+  const out: string[] = []
+  while (out.length < 8) {
+    const bytes = randomBytes(16)
+    for (let i = 0; i < bytes.length && out.length < 8; i++) {
+      const b = bytes[i]!
+      if (b < limit) out.push(alphabet[b % alphabet.length]!)
+    }
   }
-  return out
+  return out.join('')
 }
 
 // ─── Narrow META_REFS regex backstop (Decision #6) ───────────────────────────
@@ -329,7 +375,10 @@ function opaqueToken(): string {
  * Tunable. Phase 4 A/B harness data drives any future widening or narrowing.
  */
 export const META_REFS: readonly RegExp[] = [
-  /\b(see|saw|read) above\b/i,
+  // (?!\s*\d) negative lookahead skips data-narrative phrasings like "we saw
+  // above 90%" while still catching meta-references like "see above for
+  // context", "see above.", "read above and revise".
+  /\b(see|saw|read) above\b(?!\s*\d)/i,
   /\bcontinue from (here|where we left off)\b/i,
   /\bredo (your|my) (last|previous) (answer|response|message|reply)\b/i,
   /\bthe (last|previous) (question|answer|message|response) I (asked|gave|sent)\b/i,
@@ -588,32 +637,57 @@ export function createMcpToolsWithTokens(
       }
 
       // List mode.
+      //
+      // Numbering aligns with rewind_to: n_back=1 is the turn that
+      // rewind_to(turn_back_n=1) would land on. That means the most recent
+      // closed_forkable (the "current head" — what you're already at) is
+      // EXCLUDED from the list. Rewinding to it would be a no-op, and
+      // including it caused a numbering inconsistency where the AI saw
+      // n_back=1 in the list but landed one turn earlier when calling
+      // rewind_to(turn_back_n=1).
+      //
+      // Implementation: filter the head out at the SQL level so offset/limit
+      // count rewindable turns directly (no fetch+slice gymnastics). The
+      // head id is exposed separately as `current_head_turn_id` so the AI
+      // knows where it is.
       const limit = Math.min(Math.max(parsed.limit ?? 20, 1), 200)
       const offset = Math.max(parsed.offset ?? 0, 0)
 
-      const rows = deps.db.prepare(`
-        SELECT id, stop_reason, sealed_at, created_at
-          FROM revisions
-         WHERE task_id = ? AND classification = 'closed_forkable'
-         ORDER BY sealed_at DESC, id DESC
-         LIMIT ? OFFSET ?
-      `).all(sess.task_id, limit, offset) as Array<{
-        id: string
-        stop_reason: string | null
-        sealed_at: number | null
-        created_at: number
-      }>
+      const headRow = mostRecentForkableRevision(deps.db, sess.task_id)
+      const headId = headRow?.id ?? null
 
-      const total = (deps.db.prepare(`
-        SELECT COUNT(*) AS n FROM revisions
-         WHERE task_id = ? AND classification = 'closed_forkable'
-      `).get(sess.task_id) as { n: number }).n
+      const rows = headId
+        ? deps.db.prepare(`
+            SELECT id, stop_reason, sealed_at, created_at
+              FROM revisions
+             WHERE task_id = ? AND classification = 'closed_forkable' AND id != ?
+             ORDER BY sealed_at DESC, id DESC
+             LIMIT ? OFFSET ?
+          `).all(sess.task_id, headId, limit, offset) as Array<{
+          id: string
+          stop_reason: string | null
+          sealed_at: number | null
+          created_at: number
+        }>
+        : ([] as Array<{
+            id: string
+            stop_reason: string | null
+            sealed_at: number | null
+            created_at: number
+          }>)
+
+      const total = headId
+        ? (deps.db.prepare(`
+            SELECT COUNT(*) AS n FROM revisions
+             WHERE task_id = ? AND classification = 'closed_forkable' AND id != ?
+          `).get(sess.task_id, headId) as { n: number }).n
+        : 0
 
       const turns = await Promise.all(rows.map(async (r, idx) => {
         const preview = await turnPreview(deps, r.id)
         const lean = {
           turn_id: r.id,
-          n_back: offset + idx + 1,
+          n_back: offset + idx + 1, // matches rewind_to(turn_back_n=N)
           preview,
           stop_reason: r.stop_reason,
           sealed_at: r.sealed_at,
@@ -622,7 +696,7 @@ export function createMcpToolsWithTokens(
         return { ...lean, created_at: r.created_at }
       }))
 
-      return { total, turns }
+      return { total, turns, current_head_turn_id: headId }
     },
   })
 
@@ -656,6 +730,9 @@ export function createMcpToolsWithTokens(
       }
       const message = typeof parsed.message === 'string' ? parsed.message : null
       if (!message) return { error: '`message` is required' }
+      if (message.trim().length === 0) {
+        return { error: '`message` must contain non-whitespace content (a whitespace-only message has nothing for the receiving AI to act on)' }
+      }
       if (Buffer.byteLength(message, 'utf8') > MAX_REWIND_MESSAGE_BYTES) {
         return { error: `message exceeds ${MAX_REWIND_MESSAGE_BYTES} bytes; trim your prompt` }
       }
@@ -744,16 +821,10 @@ export function createMcpToolsWithTokens(
         }
         target = nthForkableBack(deps.db, head, n)
         if (!target) {
-          // Count what was available for the error message.
-          let walked = 0
-          let cursor: string | null = head.parent_revision_id
-          while (cursor) {
-            const r = loadRevision(deps.db, cursor)
-            if (!r) break
-            if (r.classification === 'closed_forkable') walked++
-            cursor = r.parent_revision_id
-          }
-          return { error: `only ${walked} forkable turns available; cannot go back ${n}` }
+          // Use the cycle-safe helper so a corrupt parent chain doesn't hang
+          // the error path on top of failing the happy path.
+          const available = countForkableBack(deps.db, head)
+          return { error: `only ${available} forkable turns available; cannot go back ${n}` }
         }
       }
 
