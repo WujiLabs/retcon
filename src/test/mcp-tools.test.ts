@@ -372,6 +372,174 @@ describe('bookmark', () => {
   })
 })
 
+// ─── delete_bookmark ────────────────────────────────────────────────────────
+//
+// Phase 1 of the bookmark management plan (v0.4.4): delete_bookmark resolves
+// id-or-label, emits fork.bookmark_deleted, projector deletes the row.
+// 9 tests pin happy paths + every error/edge case identified in the plan.
+
+describe('delete_bookmark', () => {
+  let fx: TestFixture
+  beforeEach(() => {
+    fx = fixture()
+  })
+  afterEach(() => fx.cleanup())
+
+  /** Seed an explicit user bookmark on the latest forkable turn. */
+  async function seedBookmark(label: string | null): Promise<{ view_id: string, head_id: string }> {
+    const args = label === null ? {} : { label }
+    const res = await call(fx, 'bookmark', args) as {
+      view_id: string
+      head_revision_id: string
+    }
+    return { view_id: res.view_id, head_id: res.head_revision_id }
+  }
+
+  /** Seed an auto fork-point view by emitting a fork.back_requested event. */
+  function seedForkPoint(forkPointRevId: string): string {
+    const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
+    fx.producer.emit(
+      'fork.back_requested',
+      {
+        target_view_id: viewId,
+        source_view_id: 'src',
+        fork_point_revision_id: forkPointRevId,
+        new_message_cid: 'cid',
+        task_id: fx.taskId,
+      },
+      fx.sessionId,
+    )
+    return viewId
+  }
+
+  it('1: deletes by view_id (happy path)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id, head_id } = await seedBookmark('v1')
+    const res = await call(fx, 'delete_bookmark', { id_or_label: view_id }) as {
+      deleted: { view_id: string, kind: string, label: string, head_turn_id_at_delete: string }
+    }
+    expect(res.deleted.view_id).toBe(view_id)
+    expect(res.deleted.kind).toBe('bookmark')
+    expect(res.deleted.label).toBe('v1')
+    expect(res.deleted.head_turn_id_at_delete).toBe(head_id)
+    const row = fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)
+    expect(row).toBeUndefined()
+  })
+
+  it('2: deletes by unique label (happy path)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id } = await seedBookmark('v1')
+    const res = await call(fx, 'delete_bookmark', { id_or_label: 'v1' }) as {
+      deleted: { view_id: string }
+    }
+    expect(res.deleted.view_id).toBe(view_id)
+    const row = fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)
+    expect(row).toBeUndefined()
+  })
+
+  it('3: rejects ambiguous label with view_ids list', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id: a } = await seedBookmark('dup')
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'user', content: 'q2' }])
+    const { view_id: b } = await seedBookmark('dup')
+    const res = await call(fx, 'delete_bookmark', { id_or_label: 'dup' }) as {
+      error: string
+      ambiguous_view_ids: string[]
+    }
+    expect(res.error).toMatch(/matches 2 views/)
+    expect(res.ambiguous_view_ids.sort()).toEqual([a, b].sort())
+    // Both still exist.
+    expect(fx.db.prepare('SELECT COUNT(*) AS n FROM branch_views').get()).toEqual({ n: 2 })
+  })
+
+  it('4: rejects when no view matches id or label', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await seedBookmark('v1')
+    const res = await call(fx, 'delete_bookmark', { id_or_label: 'nonexistent' }) as { error: string }
+    expect(res.error).toMatch(/no branch_view with id or label 'nonexistent'/)
+  })
+
+  it('5: rejects cross-session delete (id from another session does not match)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id } = await seedBookmark('v1')
+
+    // Spin up a second session with its own task.
+    const otherSession = 'sess-other'
+    fx.producer.emit('mcp.session_initialized', { mcp_session_id: 'm2', harness: 'claude-code' }, otherSession)
+
+    // Try to delete the FIRST session's view from inside the SECOND session's context.
+    const tools = createMcpTools({
+      db: fx.db,
+      tobeStore: fx.tobeStore,
+      storageProvider: fx.storageProvider,
+      rewindEnabled: true,
+    })
+    const res = await tools.get('delete_bookmark')!.handler(
+      { id_or_label: view_id },
+      { sessionId: otherSession, producer: fx.producer },
+    ) as { error: string }
+    expect(res.error).toMatch(/no branch_view/)
+    // First session's view is still there.
+    expect(fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)).toBeTruthy()
+  })
+
+  it('6: rejects label match against an auto fork-point (label=NULL never matches)', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    seedForkPoint(turn.id)
+    // The fork_point's label IS NULL. Even if the user passes any string,
+    // the SELECT WHERE label = ? excludes NULL, so the resolver finds no
+    // match and rejects.
+    const res = await call(fx, 'delete_bookmark', { id_or_label: 'anything' }) as { error: string }
+    expect(res.error).toMatch(/no branch_view with id or label/)
+  })
+
+  it('7: delete-by-label-ignores-fork-points (label collision skips NULL-label rows)', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    seedForkPoint(turn.id) // fork_point with label=NULL
+    const { view_id: bookmarkId } = await seedBookmark('shared') // explicit bookmark with label='shared'
+    // The resolver's label query filters to label='shared' which excludes the
+    // NULL-label fork_point. Only one match: the explicit bookmark.
+    const res = await call(fx, 'delete_bookmark', { id_or_label: 'shared' }) as {
+      deleted: { view_id: string, kind: string }
+    }
+    expect(res.deleted.view_id).toBe(bookmarkId)
+    expect(res.deleted.kind).toBe('bookmark')
+    // fork_point survives.
+    expect(fx.db.prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE label IS NULL`).get()).toEqual({ n: 1 })
+  })
+
+  it('8: idempotent delete — second call against an already-deleted view returns "not found"', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id } = await seedBookmark('v1')
+    await call(fx, 'delete_bookmark', { id_or_label: view_id })
+    const second = await call(fx, 'delete_bookmark', { id_or_label: view_id }) as { error: string }
+    expect(second.error).toMatch(/no branch_view/)
+  })
+
+  it('9: projector silently skips on task_id mismatch (no throw)', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id } = await seedBookmark('v1')
+    // Emit a delete event with a wrong task_id directly to bypass the
+    // resolver. The projector handler should run DELETE WHERE id=? AND
+    // task_id=? — no match, no throw, row remains.
+    expect(() => {
+      fx.producer.emit(
+        'fork.bookmark_deleted',
+        { view_id, task_id: 'wrong-task' },
+        fx.sessionId,
+      )
+    }).not.toThrow()
+    expect(fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)).toBeTruthy()
+    // Sanity: the right task_id deletes correctly.
+    fx.producer.emit(
+      'fork.bookmark_deleted',
+      { view_id, task_id: turn ? fx.taskId : '' },
+      fx.sessionId,
+    )
+    expect(fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)).toBeUndefined()
+  })
+})
+
 // ─── rewind_to ───────────────────────────────────────────────────────────────
 
 describe('rewind_to (dual-secret flow)', () => {

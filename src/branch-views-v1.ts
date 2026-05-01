@@ -35,6 +35,11 @@ interface LabelUpdatedPayload {
   label: string | null
 }
 
+interface BookmarkDeletedPayload {
+  view_id: string
+  task_id: string
+}
+
 interface ResponseCompletedPayload {
   request_event_id: string
 }
@@ -45,6 +50,7 @@ export class BranchViewsV1Projector implements Projection {
     'fork.bookmark_created',
     'fork.back_requested',
     'fork.label_updated',
+    'fork.bookmark_deleted',
     'proxy.response_completed',
   ]
 
@@ -58,6 +64,9 @@ export class BranchViewsV1Projector implements Projection {
         return
       case 'fork.label_updated':
         this.onLabelUpdated(event as Event<LabelUpdatedPayload>, tx)
+        return
+      case 'fork.bookmark_deleted':
+        this.onBookmarkDeleted(event as Event<BookmarkDeletedPayload>, tx)
         return
       case 'proxy.response_completed':
         this.onResponseCompleted(event as Event<ResponseCompletedPayload>, tx)
@@ -87,6 +96,15 @@ export class BranchViewsV1Projector implements Projection {
   private onLabelUpdated(event: Event<LabelUpdatedPayload>, tx: DB): void {
     tx.prepare(`UPDATE branch_views SET label = ?, updated_at = ? WHERE id = ?`)
       .run(event.payload.label, event.createdAt, event.payload.view_id)
+  }
+
+  private onBookmarkDeleted(event: Event<BookmarkDeletedPayload>, tx: DB): void {
+    // task_id guards against cross-session deletes. SQLite DELETE is idempotent,
+    // so a missing row (already deleted, or task_id mismatch) is a silent no-op.
+    // The MCP tool's resolver does the user-visible "not found" rejection; by
+    // the time an event lands here it's authoritative.
+    tx.prepare(`DELETE FROM branch_views WHERE id = ? AND task_id = ?`)
+      .run(event.payload.view_id, event.payload.task_id)
   }
 
   private onResponseCompleted(event: Event<ResponseCompletedPayload>, tx: DB): void {

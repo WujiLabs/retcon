@@ -1092,6 +1092,91 @@ export function createMcpToolsWithTokens(
     },
   })
 
+  // ── delete_bookmark ───────────────────────────────────────────────────────
+  // Resolves an id-or-label to a single branch_view row in the current session,
+  // emits fork.bookmark_deleted, projector deletes. Auto fork-point views (from
+  // rewind_to) are stored as branch_views too — they CAN be deleted by view_id
+  // but NOT by label, since their `label` field is NULL (and the resolver only
+  // matches non-NULL labels to avoid accidental deletion of the most recent
+  // fork-point when the user says "delete the bookmark with no label").
+  tools.set('delete_bookmark', {
+    description:
+      'USE WHEN: the user wants to remove a saved spot. '
+      + 'Deletes a single branch_view by its view_id or unique label. Auto fork-point views (created when you rewind_to elsewhere) can only be deleted by view_id since their label is NULL. Errors if the label matches multiple views. The deletion is recorded in the event log; replay reconstructs branch_views before the deletion. '
+      + 'NEXT STEPS: call `list_branches` to see what remains.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id_or_label: { type: 'string', description: 'view_id (e.g., "01...") OR unique label of the branch_view to delete. Errors if a label matches >1 view.' },
+      },
+      required: ['id_or_label'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const parsed = (args ?? {}) as { id_or_label?: unknown }
+
+      if (typeof parsed.id_or_label !== 'string' || parsed.id_or_label.length === 0) {
+        return { error: 'id_or_label is required and must be a non-empty string' }
+      }
+      const idOrLabel = parsed.id_or_label
+
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
+
+      // Try id match first (fast path, exact). Then label match scoped to this
+      // session's task. Label match deliberately excludes NULL-label rows so
+      // a label query never accidentally targets a fork_point.
+      const byId = deps.db
+        .prepare(`SELECT id, task_id, label, head_revision_id, auto_label FROM branch_views WHERE id = ? AND task_id = ?`)
+        .get(idOrLabel, sess.task_id) as
+        | { id: string, task_id: string, label: string | null, head_revision_id: string, auto_label: string }
+        | undefined
+
+      let target: typeof byId
+      if (byId) {
+        target = byId
+      }
+      else {
+        const byLabel = deps.db
+          .prepare(`SELECT id, task_id, label, head_revision_id, auto_label FROM branch_views WHERE task_id = ? AND label = ?`)
+          .all(sess.task_id, idOrLabel) as Array<{
+          id: string
+          task_id: string
+          label: string | null
+          head_revision_id: string
+          auto_label: string
+        }>
+        if (byLabel.length === 0) {
+          return { error: `no branch_view with id or label '${idOrLabel}' in this session` }
+        }
+        if (byLabel.length > 1) {
+          return {
+            error: `label '${idOrLabel}' matches ${byLabel.length} views — pass view_id instead`,
+            ambiguous_view_ids: byLabel.map(r => r.id),
+          }
+        }
+        target = byLabel[0]
+      }
+
+      ctx.producer.emit(
+        'fork.bookmark_deleted',
+        { view_id: target!.id, task_id: target!.task_id },
+        ctx.sessionId,
+      )
+      // Determine kind from auto_label prefix (matches list_branches semantics).
+      const kind = target!.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark'
+      return {
+        deleted: {
+          view_id: target!.id,
+          kind,
+          label: target!.label,
+          head_turn_id_at_delete: target!.head_revision_id,
+        },
+        next_steps: 'Branch view removed. Call `list_branches` to see what remains.',
+      }
+    },
+  })
+
   // ── dump_to_file ──────────────────────────────────────────────────────────
   // Phase 3 (v0.4): writes the conversation history through and including a
   // target turn's assistant response to ~/.retcon/dumps/<sid>-<rev>.jsonl.
