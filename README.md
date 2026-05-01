@@ -1,6 +1,6 @@
 # @playtiss/retcon
 
-**Alpha.** Retcon for AI conversations. Edit any past turn in your Claude Code session and replay everything downstream. The canonical Observer Actor instantiation of the Collaboration Protocol.
+**Alpha.** retcon for AI conversations. The AI recontextualizes its own past — that's the verb the tool is named for: introducing new information that reshapes what came before. recall any turn, rewind to one, bookmark spots, dump and re-submit edited transcripts. The canonical Observer Actor instantiation of the Collaboration Protocol.
 
 One HTTP server: `/v1/*` proxies to your Anthropic-compatible upstream, `/mcp` serves the Model Context Protocol (Streamable HTTP) for the rewind tools, `/hooks/session-start` learns claude's session id post-resume, `/health` reports daemon identity.
 
