@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer, createEventProducer, type EventProducer } from '../events.js'
-import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER } from '../proxy-handler.js'
+import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER, stripTtlViolations } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
 import { defaultProjectors } from '../server.js'
 import { type ServerHandle, startServer } from '../server.js'
@@ -761,5 +761,195 @@ describe('capCacheControlBlocks', () => {
     expect(capCacheControlBlocks({})).toBe(0)
     expect(capCacheControlBlocks({ messages: [] })).toBe(0)
     expect(capCacheControlBlocks({ system: undefined, tools: null })).toBe(0)
+  })
+})
+
+// ─── stripTtlViolations (TTL ordering pre-pass) ─────────────────────────────
+//
+// Anthropic forbids `ttl='1h'` from coming after `ttl='5m'` in processing
+// order (`tools` → `system` → `messages`). These tests pin our pre-pass
+// behavior. Field shape mirrors a real Anthropic body.
+
+describe('stripTtlViolations', () => {
+  const ccm = (ttl?: '5m' | '1h') => ({ type: 'ephemeral', ...(ttl ? { ttl } : {}) })
+
+  it('returns 0 when no markers present', () => {
+    expect(stripTtlViolations({})).toBe(0)
+    expect(stripTtlViolations({ messages: [] })).toBe(0)
+  })
+
+  it('returns 0 when all markers are 1h (no 5m to strip)', () => {
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: ccm('1h') }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(0)
+    expect(body.system[0].cache_control).toBeDefined()
+  })
+
+  it('returns 0 when all markers are 5m (no 1h triggers a strip)', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'a', cache_control: ccm('5m') }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'b', cache_control: ccm('5m') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(0)
+    expect(body.messages[0].content[0].cache_control).toBeDefined()
+    expect(body.messages[1].content[0].cache_control).toBeDefined()
+  })
+
+  it('returns 0 when markers are already in valid order (1h then 5m)', () => {
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: ccm('1h') }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: ccm('5m') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(0)
+    expect(body.system[0].cache_control).toBeDefined()
+    expect(body.messages[0].content[0].cache_control).toBeDefined()
+  })
+
+  it('strips a 5m followed by a 1h within messages (the b17275fb evt 0090 case)', () => {
+    // Recreates the failing body shape:
+    //   system[1]=1h, system[2]=1h, messages[110]=5m, messages[113]=1h
+    const body = {
+      system: [
+        { type: 'text', text: 's0' }, // no marker
+        { type: 'text', text: 's1', cache_control: ccm('1h') },
+        { type: 'text', text: 's2', cache_control: ccm('1h') },
+      ],
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'old', cache_control: ccm('5m') }] },
+        { role: 'user', content: [{ type: 'text', text: 'new', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(1)
+    // The 5m on the old assistant turn is gone; everything else is intact.
+    expect(body.messages[0].content[0].cache_control).toBeUndefined()
+    expect(body.messages[1].content[0].cache_control).toBeDefined()
+    expect(body.system[1].cache_control).toBeDefined()
+    expect(body.system[2].cache_control).toBeDefined()
+  })
+
+  it('strips system-level 5m when a later messages-level 1h exists (b17275fb evt 00ae case)', () => {
+    // Failing body:
+    //   system[1]=5m, system[2]=5m, messages[131]=1h, messages[132]=5m
+    const body = {
+      system: [
+        { type: 'text', text: 's0' },
+        { type: 'text', text: 's1', cache_control: ccm('5m') },
+        { type: 'text', text: 's2', cache_control: ccm('5m') },
+      ],
+      messages: [
+        { role: 'user', content: [{ type: 'tool_result', content: 'r', cache_control: ccm('1h') }] },
+        { role: 'assistant', content: [
+          { type: 'text', text: 'preamble' },
+          { type: 'text', text: 'tail', cache_control: ccm('5m') },
+        ] },
+      ],
+    }
+    // Both system 5m's strip (they're earlier than the messages[0] 1h).
+    // The trailing messages[1] 5m stays — it's after the last 1h.
+    expect(stripTtlViolations(body)).toBe(2)
+    expect(body.system[1].cache_control).toBeUndefined()
+    expect(body.system[2].cache_control).toBeUndefined()
+    expect(body.messages[0].content[0].cache_control).toBeDefined()
+    expect(body.messages[1].content[1].cache_control).toBeDefined()
+  })
+
+  it('only strips up to the LAST 1h marker — trailing 5m markers survive', () => {
+    const body = {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'a', cache_control: ccm('5m') }] }, // strip
+        { role: 'assistant', content: [{ type: 'text', text: 'b', cache_control: ccm('1h') }] },
+        { role: 'user', content: [{ type: 'text', text: 'c', cache_control: ccm('5m') }] }, // strip
+        { role: 'assistant', content: [{ type: 'text', text: 'd', cache_control: ccm('1h') }] }, // last 1h
+        { role: 'user', content: [{ type: 'text', text: 'e', cache_control: ccm('5m') }] }, // KEEP — after last 1h
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(2)
+    expect(body.messages[0].content[0].cache_control).toBeUndefined()
+    expect(body.messages[1].content[0].cache_control).toBeDefined()
+    expect(body.messages[2].content[0].cache_control).toBeUndefined()
+    expect(body.messages[3].content[0].cache_control).toBeDefined()
+    expect(body.messages[4].content[0].cache_control).toBeDefined()
+  })
+
+  it('treats missing ttl as 5m (Anthropic default) and strips it before a 1h', () => {
+    const body = {
+      system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(1)
+    expect(body.system[0].cache_control).toBeUndefined()
+  })
+
+  it('processes order is tools → system → messages, not array-of-arrays order', () => {
+    // 1h on tools[0] should mean any earlier 5m in tools[*] before it strips,
+    // but a 5m in system that comes AFTER tools[0]=1h… wait, tools always
+    // come BEFORE system in processing order. So system 5m IS after tools 1h
+    // in the stream → triggers nothing because 5m-after-1h is fine. We're
+    // testing the asymmetry: system markers don't get stripped just because
+    // tools has a later 1h, because system PRECEDES tools? No — the rule is
+    // tools→system→messages, so tools EARLIER than system. system 5m comes
+    // AFTER tools 1h. That's `1h then 5m` — valid, no strip.
+    const body = {
+      tools: [{ name: 't', description: 'd', cache_control: ccm('1h') }],
+      system: [{ type: 'text', text: 's', cache_control: ccm('5m') }],
+      messages: [],
+    }
+    expect(stripTtlViolations(body)).toBe(0)
+    expect(body.tools[0].cache_control).toBeDefined()
+    expect(body.system[0].cache_control).toBeDefined()
+  })
+
+  it('strips a 5m in tools that precedes a 1h in messages (cross-section)', () => {
+    const body = {
+      tools: [{ name: 't', description: 'd', cache_control: ccm('5m') }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(1)
+    expect((body.tools[0] as { cache_control?: unknown }).cache_control).toBeUndefined()
+  })
+
+  it('null cache_control is not counted (matches capCacheControlBlocks semantics)', () => {
+    const body = {
+      messages: [
+        // null marker — should be ignored (not a 5m, not a 1h)
+        { role: 'user', content: [{ type: 'text', text: 'a', cache_control: null }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'b', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(0)
+    expect(body.messages[1].content[0].cache_control).toBeDefined()
+  })
+
+  it('runs cleanly alongside capCacheControlBlocks (TTL fix first, then count cap)', () => {
+    // Build a body where TTL fix removes redundant 5m markers and the count
+    // cap doesn't need to fire afterward.
+    const body = {
+      system: [
+        { type: 'text', text: 's1', cache_control: ccm('1h') },
+        { type: 'text', text: 's2', cache_control: ccm('1h') },
+      ],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'q1', cache_control: ccm('5m') }] }, // strip
+        { role: 'assistant', content: [{ type: 'text', text: 'a1', cache_control: ccm('5m') }] }, // strip
+        { role: 'user', content: [{ type: 'text', text: 'q2', cache_control: ccm('1h') }] },
+      ],
+    }
+    expect(stripTtlViolations(body)).toBe(2)
+    expect(capCacheControlBlocks(body)).toBe(0) // 3 left, ≤ 4
+    expect(body.messages[0].content[0].cache_control).toBeUndefined()
+    expect(body.messages[1].content[0].cache_control).toBeUndefined()
+    expect(body.messages[2].content[0].cache_control).toBeDefined()
   })
 })

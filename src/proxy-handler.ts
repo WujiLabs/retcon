@@ -193,6 +193,34 @@ export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
  */
 export const MAX_CACHE_CONTROL_BLOCKS = 4
 
+/**
+ * Anthropic enforces a TTL ordering invariant on cache_control markers in
+ * addition to the count cap: a `ttl='1h'` block must NOT come after a
+ * `ttl='5m'` block in the processing order (`tools` → `system` → `messages`).
+ * Violation produces a 400 like:
+ *
+ *   messages.130.content.0.cache_control.ttl: a ttl='1h' cache_control block
+ *   must not come after a ttl='5m' cache_control block.
+ *
+ * Empirically observed when claude assembled a body with a stale 5m marker
+ * earlier in `messages` and a fresh 1h marker on the latest user turn — the
+ * exact case b17275fb hit twice on 2026-05-01 after a `/compact` that ran
+ * inside a forked branch (so the compact summary itself carries cache markers
+ * inherited from the rewound history, even though branch_context_json was
+ * NULL'd by /compact's release).
+ *
+ * Fix: any earlier 5m marker is REDUNDANT once a later 1h marker exists,
+ * because Anthropic's prefix-lookback caches the same content the 5m marker
+ * would have anchored, plus more, for longer. Stripping the earlier 5m
+ * loses no useful caching.
+ *
+ * `stripTtlViolations` walks markers in processing order and strips every
+ * 5m that has a 1h after it. Run BEFORE `capCacheControlBlocks` so the
+ * count cap doesn't waste a slot on a redundant 5m. Returns the number of
+ * markers stripped; the proxy emits `proxy.cache_control_ttl_violation_fixed`
+ * when > 0 so we can track how often this happens.
+ */
+
 export interface BranchContextRewriteResult {
   /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
   body: Buffer
@@ -421,6 +449,90 @@ export function capCacheControlBlocks(
   return stripped
 }
 
+/**
+ * See the doc on the export above for the full motivation. Strip every
+ * `ttl='5m'` (or default-TTL, which Anthropic defines as 5m) marker that is
+ * followed in processing order by a `ttl='1h'` marker. Run before
+ * `capCacheControlBlocks` so we don't waste a count-cap slot on a marker
+ * that's about to be invalidated anyway.
+ *
+ * Mutates `parsedBody` in-place. Returns the number of markers removed;
+ * 0 means no change. Caller is responsible for re-serializing.
+ *
+ * Exported for unit testing.
+ */
+export function stripTtlViolations(
+  parsedBody: { system?: unknown, tools?: unknown, messages?: unknown },
+): number {
+  // Same hasMarker semantics as capCacheControlBlocks: only truthy-object
+  // cache_control values count. null / undefined are no-op markers.
+  const hasMarker = (x: unknown): x is { cache_control: { ttl?: unknown } } =>
+    !!x && typeof x === 'object' && 'cache_control' in x
+    && !!(x as { cache_control?: unknown }).cache_control
+    && typeof (x as { cache_control?: unknown }).cache_control === 'object'
+
+  // Walk markers in Anthropic's processing order: tools → system → messages.
+  // `ttlOf` returns the effective TTL string ("5m" or "1h"); Anthropic's
+  // default when `ttl` is absent is "5m".
+  const ttlOf = (marker: { cache_control: { ttl?: unknown } }): string => {
+    const t = marker.cache_control.ttl
+    return typeof t === 'string' ? t : '5m'
+  }
+
+  type Entry = { ttl: string, strip: () => void }
+  const all: Entry[] = []
+
+  const stripFn = (host: { cache_control?: unknown }) => () => {
+    delete host.cache_control
+  }
+  if (Array.isArray(parsedBody.tools)) {
+    for (const tool of parsedBody.tools) {
+      if (hasMarker(tool)) {
+        all.push({ ttl: ttlOf(tool), strip: stripFn(tool as { cache_control?: unknown }) })
+      }
+    }
+  }
+  if (Array.isArray(parsedBody.system)) {
+    for (const block of parsedBody.system) {
+      if (hasMarker(block)) {
+        all.push({ ttl: ttlOf(block), strip: stripFn(block as { cache_control?: unknown }) })
+      }
+    }
+  }
+  if (Array.isArray(parsedBody.messages)) {
+    for (const msg of parsedBody.messages) {
+      if (!msg || typeof msg !== 'object') continue
+      const content = (msg as { content?: unknown }).content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (hasMarker(block)) {
+          all.push({ ttl: ttlOf(block), strip: stripFn(block as { cache_control?: unknown }) })
+        }
+      }
+    }
+  }
+
+  // Find the LAST 1h marker. Anything earlier than it that's 5m is a
+  // violation. If no 1h exists, or it's at position 0, nothing to do.
+  let lastOneHour = -1
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (all[i]!.ttl === '1h') {
+      lastOneHour = i
+      break
+    }
+  }
+  if (lastOneHour <= 0) return 0
+
+  let removed = 0
+  for (let i = 0; i < lastOneHour; i++) {
+    if (all[i]!.ttl === '5m') {
+      all[i]!.strip()
+      removed++
+    }
+  }
+  return removed
+}
+
 async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Promise<Buffer> {
   if (!encoding || encoding === 'identity') return buf
   const enc = encoding.toLowerCase()
@@ -544,14 +656,28 @@ async function dispatch(
         tools?: unknown
         messages?: unknown
       }
+      // TTL ordering pre-pass FIRST. Removes any 5m marker that's followed by
+      // a later 1h marker — Anthropic 400s when 1h appears after 5m, and the
+      // earlier 5m is redundant once a later 1h exists (the 1h covers the
+      // same prefix and more).
+      const ttlFixed = stripTtlViolations(parsed)
       const stripped = capCacheControlBlocks(parsed, MAX_CACHE_CONTROL_BLOCKS)
+      if (ttlFixed > 0) {
+        ctx.producer.emit(
+          'proxy.cache_control_ttl_violation_fixed',
+          { session_id: sessionId, removed: ttlFixed },
+          sessionId,
+        )
+      }
       if (stripped > 0) {
-        bodyToForward = Buffer.from(JSON.stringify(parsed), 'utf8')
         ctx.producer.emit(
           'proxy.cache_control_capped',
           { session_id: sessionId, removed: stripped, max: MAX_CACHE_CONTROL_BLOCKS },
           sessionId,
         )
+      }
+      if (ttlFixed > 0 || stripped > 0) {
+        bodyToForward = Buffer.from(JSON.stringify(parsed), 'utf8')
       }
     }
     catch {

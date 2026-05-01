@@ -1,6 +1,6 @@
 {
   "name": "@playtiss/retcon",
-  "version": "0.4.2-alpha.0",
+  "version": "0.4.3-alpha.0",
   "type": "module",
   "description": "Retcon for AI conversations. Edit any past turn and replay everything downstream. Recording + replay HTTP proxy + MCP fork tools for Claude Code, the canonical Observer Actor instantiation of the Playtiss Collaboration Protocol.",
   "license": "MIT",

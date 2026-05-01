@@ -2,6 +2,23 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.4.3-alpha.0] - 2026-05-01
+
+User hit a 400 from Anthropic mid-conversation: `messages.112.content.0.cache_control.ttl: a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block`. We had the count cap (4 markers max, 0.4.1) but not the TTL ordering invariant. This release adds a pre-pass that strips redundant earlier 5m markers when a later 1h marker is present — Anthropic's prefix-lookback already covers everything the earlier 5m would have anchored. Caught the b17275fb session's specific 400s in forensic dry-run; both bodies are valid post-fix.
+
+The wrinkle: this was after a `/compact` that ran inside a forked branch. branch_context_json was NULL'd at compact-release time, but the compact summary itself was generated through the forked branch — so the message history claude is now sending carries marker placement inherited from the rewound conversation. Not 100% claude's fault, not 100% retcon's: an edge case at the boundary.
+
+### Added
+
+- **`stripTtlViolations(parsedBody)` helper in `proxy-handler.ts`.** Walks markers in Anthropic's processing order (`tools` → `system` → `messages`), finds the index of the last `ttl='1h'` marker, and strips every `ttl='5m'` marker before it. Default-TTL (no `ttl` field) is treated as `5m` per Anthropic's spec. Mutates in-place; returns the count of markers removed. Same `hasMarker` semantics as `capCacheControlBlocks` (null/undefined cache_control values are no-ops, not slot consumers).
+- **`proxy.cache_control_ttl_violation_fixed` audit event.** Fires when `stripTtlViolations` strips at least one marker. Payload `{session_id, removed}`. Lets you see how often claude's marker placement violates Anthropic's ordering rule and how aggressively retcon is rewriting.
+- **12 unit tests for `stripTtlViolations`** covering: no-markers no-op, all-1h no-op, all-5m no-op, valid-order no-op, both real failing-body shapes from b17275fb (5m-in-messages-before-1h, 5m-in-system-before-1h-in-messages), trailing-5m-after-last-1h-survives, default-TTL-treated-as-5m, tools→system→messages ordering, cross-section strips (tools 5m before messages 1h), null-cache_control-not-counted, runs-cleanly-alongside-capCacheControlBlocks.
+
+### Changed
+
+- **Request handler runs `stripTtlViolations` BEFORE `capCacheControlBlocks`.** The TTL pre-pass removes redundant 5m markers first so the count cap doesn't waste a slot on a marker that's about to be invalidated anyway. Re-serializes the body if either step modified anything.
+- **`scripts/audit-cc.mjs` forensic tool.** Now bundled with the repo (was untracked, used during 0.4.3 investigation). Reads `~/.retcon/proxy.db` and prints a request body's cache_control marker layout in processing order. Pass `--fix` to dry-run `stripTtlViolations` against a real body and print before/after — useful when triaging a future 400.
+
 ## [0.4.2-alpha.0] - 2026-04-29
 
 End of the "schema bump wipes your DB" era. retcon's first real user is starting to depend on the event log surviving across upgrades, and silently dropping every table on a schema mismatch is unacceptable for that. This release replaces the nuke-and-reinit shortcut with a backup + per-version migration registry. Empty registry for now (v5 is the only release in the wild and the only entry path is fresh-install), but the framework is in place so the next schema bump has somewhere to land.

@@ -100,6 +100,8 @@ Anthropic caps a `/v1/messages` request at 4 ephemeral `cache_control` markers (
 
 `capCacheControlBlocks` (proxy-handler.ts) protects `system` + `tools` markers and strips the **earliest** `messages` markers first. This mirrors what claude already does turn-to-turn: the cached frontier rides at the tail (latest stable block), so the next turn's lookback finds it; older message markers age out naturally. retcon's cap just enforces the same discipline when stale markers accumulate. Each cap emits `proxy.cache_control_capped`.
 
+Anthropic also forbids a `ttl='1h'` marker from following a `ttl='5m'` marker in processing order (`tools` → `system` → `messages`). `stripTtlViolations` runs first and strips any 5m marker that has a 1h marker after it — a later 1h covers everything the earlier 5m would have, plus more, so removing the 5m loses no caching. Each strip emits `proxy.cache_control_ttl_violation_fixed`. The case we observed: a `/compact` that ran while a forked branch was active produces a summary whose marker placement inherits from the rewound history, leaving a stale 5m sitting in front of claude's fresh 1h on the next turn.
+
 ## Assumptions we make about the harness
 
 Each item below is a property of claude that retcon depends on. They're codified in `cli-tmux-assumptions.test.ts` (gated behind `RETCON_TEST_ASSUMPTIONS=1`, run weekly).
