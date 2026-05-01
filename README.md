@@ -48,9 +48,11 @@ This is destructive of the event log (the source-of-truth append-only history) f
 
 Available to claude inside the session via the MCP server retcon auto-registers as `mcp__retcon__*`:
 
-- `recall` — list recent forkable turns (no args) OR inspect one (`turn_back_n: N` for the Nth turn back, `turn_id: "..."` for a specific id). Returns content previews so you can pick a target without dumping the full conversation.
+- `recall` — list recent forkable turns (no args, also surfaces `rewind_events` so you can see "a rewind happened here") OR inspect one (`turn_back_n: N`, `turn_id: "..."`, or `view_id: "..."`). `surrounding: N` (0-10) on inspect adds N forkable turns on each side. Detail mode also lists `branch_views_at_turn` — every saved spot pointing at the inspected turn.
 - `rewind_to` — roll the conversation back to a chosen turn and replace the next message. **Two-step call**: the first call returns rules + a single-use `confirm_clean`/`confirm_meta` token pair; the AI classifies its own message (does it stand alone, or does it contain a meta-reference to cut-off content?) and re-calls with the matching token. Catches the AI before it sends a `"redo your last answer"`-style message that would confuse the post-rewind context.
-- `bookmark` — pin the latest forkable turn with an optional human label so you can return to it via `recall` later.
+- `bookmark` — pin the latest forkable turn with an optional human label. **Behaves like a git branch, not a git tag**: its head auto-advances as new turns close on this branch. When you fork via `rewind_to`, the bookmark stays on the original branch and a new auto fork-point view is created at the fork point.
+- `list_branches` — return every saved navigation point in this session. Both explicit bookmarks AND the auto fork-point views created by `rewind_to`. Each entry has a `kind` field (`"bookmark"` or `"fork_point"`) and `n_back_of_head` (0 = currently tracking head, N>0 = N forkable turns back, null = head not in the closed_forkable sequence). This is the only way to see and navigate to branches you've forked away from.
+- `delete_bookmark` — remove a saved spot by `id_or_label`. Auto fork-point views can only be deleted by `view_id` since their label is NULL. Errors if the label matches multiple views.
 - `dump_to_file` — write the conversation through a chosen turn to `~/.retcon/dumps/<id>.jsonl` (one Anthropic message per line). retcon's CLI pre-allows `Read`/`Edit`/`Write`/`Glob`/`Grep` over `~/.retcon/dumps/**` in the spawned claude's permissions, so the AI can inspect and modify the file without prompting you. No args = dump current state; `turn_id` or `turn_back_n` = dump through that turn.
 - `submit_file` — read a JSONL dump back, validate it (each line a well-formed Anthropic message, last line must be assistant-role), append your `message` arg as a new user turn, and queue it as the next /v1/messages from claude. Same **two-step token flow** as `rewind_to`. Pairs with `dump_to_file` for the "let me actually edit a few past turns before continuing" use case that pure `rewind_to` can't express.
 
@@ -59,10 +61,13 @@ Available to claude inside the session via the MCP server retcon auto-registers 
 | You want to... | Tool |
 |---|---|
 | See what turns you can rewind to | `recall` (no args) |
-| Inspect a specific turn before rewinding | `recall` with `turn_id` or `turn_back_n` |
+| See what saved spots and forks exist | `list_branches` |
+| Inspect a specific turn before rewinding | `recall` with `turn_id`, `turn_back_n`, or `view_id` |
+| See N turns around a turn or saved spot | `recall` with `surrounding: N` |
 | Actually rewind (replace the next turn only) | `rewind_to` (two-step: first call returns rules + tokens, second call applies) |
 | Edit several past turns before continuing | `dump_to_file` → `Read`/`Edit` the JSONL → `submit_file` |
 | Save a spot to return to later | `bookmark` |
+| Remove a saved spot or stale fork-point view | `delete_bookmark` |
 
 Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets.
 

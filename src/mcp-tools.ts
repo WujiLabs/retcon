@@ -1210,8 +1210,8 @@ export function createMcpToolsWithTokens(
   tools.set('bookmark', {
     description:
       'USE WHEN: the user wants to save the current spot in the conversation so they can return to it later. '
-      + 'Bookmarks the most recent forkable turn with an optional human label. The bookmark survives /clear, /compact, and resume — call `recall` later to find it. '
-      + 'NEXT STEPS: to revisit a bookmarked turn, call `recall` (which lists turn ids) followed by `rewind_to`.',
+      + 'Bookmarks the most recent forkable turn with an optional human label. The bookmark behaves like a git branch (not a tag): its head auto-advances as new turns close on this branch, until you fork via `rewind_to` (which leaves this bookmark on the original branch and creates a new auto fork-point view at the fork point). The bookmark survives /clear, /compact, and resume — call `list_branches` later to find it. '
+      + 'NEXT STEPS: to see saved spots, call `list_branches`. To revisit one: `recall({view_id})` then `rewind_to({turn_id})`. To remove a bookmark, call `delete_bookmark`.',
     inputSchema: {
       type: 'object',
       properties: {

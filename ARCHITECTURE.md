@@ -15,11 +15,24 @@ There is no "retcon mode" inside claude. claude doesn't know it's running under 
 
 ## How the AI sees its past, and why it gets to fork
 
-`recall`, `rewind_to`, `bookmark`, `dump_to_file`, and `submit_file` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains five entries in `tools/list`.
+`recall`, `rewind_to`, `bookmark`, `list_branches`, `delete_bookmark`, `dump_to_file`, and `submit_file` are exposed as MCP tools. claude calls them via the same protocol it calls any other tool. The model's "world" doesn't change shape when retcon is present — it gains seven entries in `tools/list`.
 
-The names are intent-aligned, not protocol-aligned. The earlier surface (`fork_list`, `fork_show`, `fork_back`, `fork_bookmark`) was technically correct but pulled the model into protocol-thinking. The empirical signal: Sonnet didn't reach for `fork_back` even when explicitly asked to rewind. We renamed in v0.4 (hard cut, no aliases) and rewrote descriptions in `USE WHEN: <intent sentence>` form. "fork" is engineer jargon; "rewind" is what the user means.
+The names are intent-aligned, not protocol-aligned. The earlier surface (`fork_list`, `fork_show`, `fork_back`, `fork_bookmark`) was technically correct but pulled the model into protocol-thinking. The empirical signal: Sonnet didn't reach for `fork_back` even when explicitly asked to rewind. We renamed in v0.4 (hard cut, no aliases) and rewrote descriptions in `USE WHEN: <intent sentence>` form. "fork" is engineer jargon; "rewind" is what the user means. The v0.4.4 split (`list_branches`, `delete_bookmark` separate from `bookmark`) follows the same logic — each tool has one verb the model can match against intent without parsing arg combos.
+
+The read/write split is deliberate. **Read side:** `recall` (turns + rewind boundaries + branch_views_at_turn) and `list_branches` (saved spots + fork-point views). **Write side:** `bookmark` (create), `delete_bookmark` (remove), `rewind_to` (act). This keeps the navigate-then-act pipeline coherent: the AI inspects with `recall({view_id})` BEFORE calling `rewind_to({turn_id})`. Two calls is the design — friction-as-safety. A single-call `rewind_to({view_id})` shortcut would let the AI rewind based on label alone, missing stale labels and AI confusion about which view is which.
 
 This is also a deliberate architectural choice. Rewind could have been a CLI command or a slash-command UI; it's a tool instead so the AI itself can decide to rewind. A model that recognizes its current path is going off the rails can call `rewind_to(turn_back_n=2, ...)` without the user pulling a lever. retcon's model isn't "user rewinds the model"; it's "the AI has agency over its own past."
+
+### Branches are git-branch-like, not git-tag-like
+
+`branch_views` rows hold pointers into the Revision DAG. Two kinds, both stored in the same table:
+
+- **Explicit bookmarks** (`fork.bookmark_created`): user-created via `bookmark()`. `auto_label` starts with `bookmark@`.
+- **Auto fork-point views** (`fork.back_requested`): created automatically when you `rewind_to` somewhere. `auto_label` starts with `fork@`. These are the only handle on the pre-rewind branch — without them, branches you've forked away from would be unreachable from the current head's ancestor walk.
+
+Both kinds **auto-advance**: when a new turn closes whose parent is a view's current `head_revision_id`, the view advances to the new turn. This is git-branch-like behavior. A view stops advancing only when the user forks elsewhere (the new branch's tail has parent=fork_point, not parent=view's-head, so the view stays put).
+
+The implication: `view_id` resolution is LIVE. `recall({view_id})` returns the current head, not a snapshot. If the AI calls `list_branches` at t=0 and sees view X at turn_5, then a turn closes at t=1, then `recall({view_id: X})` at t=2 returns turn_6 detail, not turn_5. Documented in `bookmark` and `list_branches` tool descriptions.
 
 ## The rewind_to trick: why the rewind doesn't replace the in-flight turn
 

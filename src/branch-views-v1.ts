@@ -107,18 +107,31 @@ export class BranchViewsV1Projector implements Projection {
       .run(event.payload.view_id, event.payload.task_id)
   }
 
+  // Auto-advance: branch_views are git-branch-like, not git-tag-like.
+  //
+  //   BEFORE turn N+1:        AFTER turn N+1 closes (parent=R_N):
+  //
+  //     R_N <─ view_X            R_N+1 <─ view_X    (advanced; head was R_N)
+  //                                 │
+  //     R_M <─ view_Y            R_N <──┘
+  //                                 │
+  //                              R_M <─ view_Y      (unchanged; head was R_M)
+  //
+  //   Multiple views at the same revision advance in lockstep. A view only
+  //   stops advancing when the user forks elsewhere (rewind_to creates a NEW
+  //   branch whose tail has parent=fork_point, not parent=view's-head, so
+  //   the original view stays put while the new fork-point view tracks the
+  //   new branch).
+  //
+  // KNOWN LIMITATION (KL-2 in the plan, adversarial finding A-WR4): the
+  // UPDATE matches ALL views with head=parent, so two views sitting at the
+  // same Revision advance in lock-step forever. In the v1 UX this is actually
+  // the desired behavior — `bookmark` creates a view at the current head
+  // alongside any existing view, and they track together until the user
+  // forks. True branch divergence without fork_back is a v1.1 concern; fixed
+  // when per-request branch context is plumbed through (see revisions-v1.ts
+  // KL-1 comment).
   private onResponseCompleted(event: Event<ResponseCompletedPayload>, tx: DB): void {
-    // Advance any branch_view whose head was the parent of this newly-sealed
-    // Revision. revisions_v1 has already set parent_revision_id in this same tx.
-    //
-    // KNOWN LIMITATION (KL-2 in the plan, adversarial finding A-WR4): the
-    // UPDATE matches ALL views with head=parent, so two views sitting at the
-    // same Revision advance in lock-step forever. In the v1 UX this is actually
-    // the desired behavior — `fork_bookmark` creates a view at the current
-    // head alongside any existing view, and they track together until the user
-    // forks. True branch divergence without fork_back is a v1.1 concern; fixed
-    // when per-request branch context is plumbed through (see revisions-v1.ts
-    // KL-1 comment).
     const rev = tx.prepare(
       `SELECT id, task_id, parent_revision_id FROM revisions WHERE id = ?`,
     ).get(event.payload.request_event_id) as
