@@ -422,34 +422,89 @@ describe('recall (Phase 3 extensions)', () => {
     expect(res.surrounding_turns.every(t => t.relative_to_target < 0)).toBe(true)
   })
 
-  it('5: list-mode-rewind_events-populated — fork.back_requested events surface inline', async () => {
+  it('5: list-mode-rewind_events-populated — fork.back_requested events surface inline (real rewind_to flow)', async () => {
+    // Use the ACTUAL rewind_to flow rather than a synthetic event, so this
+    // test verifies the production payload contract — including that the
+    // emitter writes `head_revision_id` so recall can populate from_turn_id.
+    // (Initial v0.4.4 implementation had this field empty; caught in /review.)
     const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    const turn2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }])
-    // Emit a synthetic rewind event.
+    const turn2 = emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    // Drive rewind_to via the two-step token flow.
+    await rewindTwoStep(fx, { turn_back_n: 1, message: 'rewind here' })
+    const res = await call(fx, 'recall', {}) as {
+      rewind_events: Array<{ from_turn_id: string | null, to_turn_id: string, view_id: string }>
+    }
+    expect(res.rewind_events.length).toBe(1)
+    // turn_back_n=1 from head=turn2 lands at turn1 (the only forkable older
+    // than head). from_turn_id is the head at the moment of rewind = turn2.
+    expect(res.rewind_events[0]!.to_turn_id).toBe(turn1.id)
+    expect(res.rewind_events[0]!.from_turn_id).toBe(turn2.id)
+    expect(typeof res.rewind_events[0]!.view_id).toBe('string')
+  })
+
+  it('5b: list-mode-rewind_events surfaces from_turn_id=null for legacy events without head_revision_id', async () => {
+    // Simulate a pre-v0.4.4 event (lacks head_revision_id field) to verify
+    // graceful degradation. New code surfaces null, not "" — explicit absence.
+    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     fx.producer.emit(
       'fork.back_requested',
       {
-        target_view_id: 'view_rewind1',
+        target_view_id: 'view_legacy',
         source_view_id: 'src',
         fork_point_revision_id: turn1.id,
         new_message_cid: 'cid',
         task_id: fx.taskId,
-        head_revision_id: turn2.id,
       },
       fx.sessionId,
     )
     const res = await call(fx, 'recall', {}) as {
-      rewind_events: Array<{ from_turn_id: string, to_turn_id: string, view_id: string }>
+      rewind_events: Array<{ from_turn_id: string | null, view_id: string }>
     }
-    expect(res.rewind_events.length).toBe(1)
-    expect(res.rewind_events[0]!.to_turn_id).toBe(turn1.id)
-    expect(res.rewind_events[0]!.view_id).toBe('view_rewind1')
+    const legacy = res.rewind_events.find(e => e.view_id === 'view_legacy')
+    expect(legacy).toBeDefined()
+    expect(legacy!.from_turn_id).toBeNull()
   })
 
-  it('6: list-mode-no-rewinds — empty rewind_events array', async () => {
+  it('6: list-mode-no-rewinds — empty rewind_events array + total=0 + not truncated', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const res = await call(fx, 'recall', {}) as { rewind_events: unknown[] }
+    const res = await call(fx, 'recall', {}) as {
+      rewind_events: unknown[]
+      rewind_events_total: number
+      rewind_events_truncated: boolean
+    }
     expect(res.rewind_events).toEqual([])
+    expect(res.rewind_events_total).toBe(0)
+    expect(res.rewind_events_truncated).toBe(false)
+  })
+
+  it('6b: list-mode rewind_events_truncated=true when more than 50 events exist', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    // Seed 51 synthetic fork.back_requested events.
+    for (let i = 0; i < 51; i++) {
+      fx.producer.emit(
+        'fork.back_requested',
+        {
+          target_view_id: `view_${i}`,
+          source_view_id: 'src',
+          fork_point_revision_id: `rev_${i}`,
+          new_message_cid: 'cid',
+          task_id: fx.taskId,
+        },
+        fx.sessionId,
+      )
+    }
+    const res = await call(fx, 'recall', {}) as {
+      rewind_events: unknown[]
+      rewind_events_total: number
+      rewind_events_truncated: boolean
+    }
+    expect(res.rewind_events.length).toBe(50)
+    expect(res.rewind_events_total).toBe(51)
+    expect(res.rewind_events_truncated).toBe(true)
   })
 
   it('7: detail-mode-branch_views_at_turn — surfaces every view pointing at this turn', async () => {
@@ -468,7 +523,7 @@ describe('recall (Phase 3 extensions)', () => {
   it('8: view_id-pointing-at-deleted-view — clean "view not found" error', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const bm = await call(fx, 'bookmark', { label: 'v1' }) as { view_id: string }
-    await call(fx, 'delete_bookmark', { id_or_label: bm.view_id })
+    await call(fx, 'delete_bookmark', { label: 'v1' })
     const res = await call(fx, 'recall', { view_id: bm.view_id }) as { error: string }
     expect(res.error).toMatch(/view not found/)
   })
@@ -480,6 +535,35 @@ describe('recall (Phase 3 extensions)', () => {
     // Same when omitted.
     const res2 = await call(fx, 'recall', { turn_id: turn.id }) as Record<string, unknown>
     expect('surrounding_turns' in res2).toBe(false)
+  })
+
+  it('10: surrounding>0 with target.sealed_at=null returns empty array + surrounding_skipped warning', async () => {
+    // Adversarial-review finding: previously, target.sealed_at IS NULL silently
+    // dropped surrounding_turns even when explicitly requested. Now it surfaces
+    // an empty list AND a `surrounding_skipped` reason.
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    fx.db.prepare(`UPDATE revisions SET sealed_at = NULL, classification = 'open' WHERE id = ?`).run(turn.id)
+    const res = await call(fx, 'recall', { turn_id: turn.id, surrounding: 3 }) as {
+      surrounding_turns?: unknown[]
+      surrounding_skipped?: string
+    }
+    expect(res.surrounding_turns).toEqual([])
+    expect(res.surrounding_skipped).toMatch(/no sealed_at/)
+  })
+
+  it('11: recall(view_id) for non-forkable head returns warning', async () => {
+    // Adversarial-review finding: previously, recall(view_id) on a view whose
+    // head was reclassified would silently succeed and return next_steps text
+    // saying "call rewind_to" — but rewind_to rejects non-forkable turns. Add
+    // an explicit warning.
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const bm = await call(fx, 'bookmark', { label: 'orphan' }) as { view_id: string }
+    fx.db.prepare(`UPDATE revisions SET classification = 'dangling_unforkable' WHERE id = ?`).run(turn.id)
+    const res = await call(fx, 'recall', { view_id: bm.view_id }) as {
+      warning?: string
+    }
+    expect(res.warning).toMatch(/non-forkable/)
+    expect(res.warning).toMatch(/rewind_to will reject/)
   })
 })
 
@@ -511,13 +595,43 @@ describe('bookmark', () => {
     const res = await call(fx, 'bookmark', { label: 'x' }) as { error: string }
     expect(res.error).toMatch(/no forkable turn yet/)
   })
+
+  it('rejects label exceeding the byte cap (256)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const longLabel = 'x'.repeat(257)
+    const res = await call(fx, 'bookmark', { label: longLabel }) as { error: string }
+    expect(res.error).toMatch(/exceeds 256-byte cap/)
+  })
+
+  it('strips ASCII control chars from label, preserves printable text + emoji', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    // Label has newline, NUL, DEL, plus printable + emoji.
+    const dirty = 'v1\nbase\x00line\x7f 🚀'
+    const res = await call(fx, 'bookmark', { label: dirty }) as {
+      label: string | null
+      view_id: string
+    }
+    expect(res.label).toBe('v1baseline 🚀')
+    // Persisted shape matches the response.
+    const row = fx.db.prepare('SELECT label FROM branch_views WHERE id = ?').get(res.view_id) as
+      | { label: string } | undefined
+    expect(row?.label).toBe('v1baseline 🚀')
+  })
+
+  it('rejects label that is entirely control characters', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'bookmark', { label: '\n\t\x00' }) as { error: string }
+    expect(res.error).toMatch(/control characters/)
+  })
 })
 
 // ─── delete_bookmark ────────────────────────────────────────────────────────
 //
-// Phase 1 of the bookmark management plan (v0.4.4): delete_bookmark resolves
-// id-or-label, emits fork.bookmark_deleted, projector deletes the row.
-// 9 tests pin happy paths + every error/edge case identified in the plan.
+// Phase 1 of the bookmark management plan (v0.4.4), redesigned post-/review
+// to LABEL-ONLY. Deleting by view_id was an implementation leak — the user's
+// mental model is "the bookmark I named X". So this tool accepts only `label`.
+// Implications: unlabeled bookmarks and auto fork-points are not deletable
+// via this tool (system-managed; reaped on `retcon clean --actor X`).
 
 describe('delete_bookmark', () => {
   let fx: TestFixture
@@ -553,10 +667,10 @@ describe('delete_bookmark', () => {
     return viewId
   }
 
-  it('1: deletes by view_id (happy path)', async () => {
+  it('1: deletes by unique label (happy path)', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id, head_id } = await seedBookmark('v1')
-    const res = await call(fx, 'delete_bookmark', { id_or_label: view_id }) as {
+    const res = await call(fx, 'delete_bookmark', { label: 'v1' }) as {
       deleted: { view_id: string, kind: string, label: string, head_turn_id_at_delete: string }
     }
     expect(res.deleted.view_id).toBe(view_id)
@@ -567,48 +681,51 @@ describe('delete_bookmark', () => {
     expect(row).toBeUndefined()
   })
 
-  it('2: deletes by unique label (happy path)', async () => {
+  it('2: rejects when label is missing or empty', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const { view_id } = await seedBookmark('v1')
-    const res = await call(fx, 'delete_bookmark', { id_or_label: 'v1' }) as {
-      deleted: { view_id: string }
-    }
-    expect(res.deleted.view_id).toBe(view_id)
-    const row = fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)
-    expect(row).toBeUndefined()
+    const r1 = await call(fx, 'delete_bookmark', {}) as { error: string }
+    expect(r1.error).toMatch(/label is required/)
+    const r2 = await call(fx, 'delete_bookmark', { label: '' }) as { error: string }
+    expect(r2.error).toMatch(/label is required/)
   })
 
-  it('3: rejects ambiguous label with view_ids list', async () => {
+  it('3: rejects ambiguous label with ambiguous_views list', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id: a } = await seedBookmark('dup')
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'user', content: 'q2' }])
     const { view_id: b } = await seedBookmark('dup')
-    const res = await call(fx, 'delete_bookmark', { id_or_label: 'dup' }) as {
+    const res = await call(fx, 'delete_bookmark', { label: 'dup' }) as {
       error: string
-      ambiguous_view_ids: string[]
+      ambiguous_views: Array<{ view_id: string, kind: string, label: string | null, head_turn_id: string }>
     }
-    expect(res.error).toMatch(/matches 2 views/)
-    expect(res.ambiguous_view_ids.sort()).toEqual([a, b].sort())
+    expect(res.error).toMatch(/matches 2 bookmarks/)
+    const ids = res.ambiguous_views.map(v => v.view_id).sort()
+    expect(ids).toEqual([a, b].sort())
+    for (const v of res.ambiguous_views) {
+      expect(v.kind).toBe('bookmark')
+      expect(v.label).toBe('dup')
+      expect(typeof v.head_turn_id).toBe('string')
+    }
     // Both still exist.
     expect(fx.db.prepare('SELECT COUNT(*) AS n FROM branch_views').get()).toEqual({ n: 2 })
   })
 
-  it('4: rejects when no view matches id or label', async () => {
+  it('4: rejects when no bookmark has that label', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     await seedBookmark('v1')
-    const res = await call(fx, 'delete_bookmark', { id_or_label: 'nonexistent' }) as { error: string }
-    expect(res.error).toMatch(/no branch_view with id or label 'nonexistent'/)
+    const res = await call(fx, 'delete_bookmark', { label: 'nonexistent' }) as { error: string }
+    expect(res.error).toMatch(/no bookmark with label 'nonexistent'/)
   })
 
-  it('5: rejects cross-session delete (id from another session does not match)', async () => {
+  it('5: rejects cross-session delete (label from another session\'s task does not match)', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const { view_id } = await seedBookmark('v1')
+    await seedBookmark('cross-session-v1')
 
     // Spin up a second session with its own task.
     const otherSession = 'sess-other'
     fx.producer.emit('mcp.session_initialized', { mcp_session_id: 'm2', harness: 'claude-code' }, otherSession)
 
-    // Try to delete the FIRST session's view from inside the SECOND session's context.
+    // Try to delete the FIRST session's bookmark from inside the SECOND session's context.
     const tools = createMcpTools({
       db: fx.db,
       tobeStore: fx.tobeStore,
@@ -616,45 +733,44 @@ describe('delete_bookmark', () => {
       rewindEnabled: true,
     })
     const res = await tools.get('delete_bookmark')!.handler(
-      { id_or_label: view_id },
+      { label: 'cross-session-v1' },
       { sessionId: otherSession, producer: fx.producer },
     ) as { error: string }
-    expect(res.error).toMatch(/no branch_view/)
-    // First session's view is still there.
-    expect(fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)).toBeTruthy()
+    expect(res.error).toMatch(/no bookmark/)
+    // First session's bookmark is still there.
+    expect(fx.db.prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE label = ?`).get('cross-session-v1'))
+      .toEqual({ n: 1 })
   })
 
-  it('6: rejects label match against an auto fork-point (label=NULL never matches)', async () => {
+  it('6: cannot delete fork_points (label=NULL never matches any string label)', async () => {
     const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     seedForkPoint(turn.id)
-    // The fork_point's label IS NULL. Even if the user passes any string,
-    // the SELECT WHERE label = ? excludes NULL, so the resolver finds no
-    // match and rejects.
-    const res = await call(fx, 'delete_bookmark', { id_or_label: 'anything' }) as { error: string }
-    expect(res.error).toMatch(/no branch_view with id or label/)
-  })
-
-  it('7: delete-by-label-ignores-fork-points (label collision skips NULL-label rows)', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    seedForkPoint(turn.id) // fork_point with label=NULL
-    const { view_id: bookmarkId } = await seedBookmark('shared') // explicit bookmark with label='shared'
-    // The resolver's label query filters to label='shared' which excludes the
-    // NULL-label fork_point. Only one match: the explicit bookmark.
-    const res = await call(fx, 'delete_bookmark', { id_or_label: 'shared' }) as {
-      deleted: { view_id: string, kind: string }
-    }
-    expect(res.deleted.view_id).toBe(bookmarkId)
-    expect(res.deleted.kind).toBe('bookmark')
+    // Even if you guess the auto_label string, label-only resolver compares
+    // against the `label` field which is NULL — the SQL `label = ?` excludes
+    // NULL rows.
+    const res = await call(fx, 'delete_bookmark', { label: 'anything' }) as { error: string }
+    expect(res.error).toMatch(/no bookmark with label/)
     // fork_point survives.
-    expect(fx.db.prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE label IS NULL`).get()).toEqual({ n: 1 })
+    expect(fx.db.prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE label IS NULL`).get())
+      .toEqual({ n: 1 })
   })
 
-  it('8: idempotent delete — second call against an already-deleted view returns "not found"', async () => {
+  it('7: cannot delete unlabeled bookmarks (bookmark() with no args)', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const { view_id } = await seedBookmark('v1')
-    await call(fx, 'delete_bookmark', { id_or_label: view_id })
-    const second = await call(fx, 'delete_bookmark', { id_or_label: view_id }) as { error: string }
-    expect(second.error).toMatch(/no branch_view/)
+    await seedBookmark(null) // label=NULL
+    // No string label can resolve a NULL-label row.
+    const res = await call(fx, 'delete_bookmark', { label: '' }) as { error: string }
+    expect(res.error).toMatch(/label is required/)
+    expect(fx.db.prepare(`SELECT COUNT(*) AS n FROM branch_views WHERE label IS NULL`).get())
+      .toEqual({ n: 1 })
+  })
+
+  it('8: idempotent — second call against an already-deleted bookmark returns "not found"', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await seedBookmark('v1')
+    await call(fx, 'delete_bookmark', { label: 'v1' })
+    const second = await call(fx, 'delete_bookmark', { label: 'v1' }) as { error: string }
+    expect(second.error).toMatch(/no bookmark with label/)
   })
 
   it('9: projector silently skips on task_id mismatch (no throw)', async () => {

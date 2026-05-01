@@ -28,6 +28,11 @@ interface BackRequestedPayload {
   new_message_cid: string
   target_view_id: string
   task_id: string
+  /** The closed_forkable head at the moment of fork — i.e., the "from" turn
+   *  the user is rewinding away from. Optional for backward compatibility
+   *  with events emitted before v0.4.4 (those will surface as from_turn_id=null
+   *  in recall's rewind_events output). v0.4.4+ emit always includes this. */
+  head_revision_id?: string
 }
 
 interface LabelUpdatedPayload {

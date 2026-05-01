@@ -75,6 +75,15 @@ const SAFE_SESSION_ID_RE = /^[A-Za-z0-9._-]+$/
  */
 export const CONFIRM_TOKEN_TTL_MS = 5 * 60 * 1000
 
+/**
+ * Cap on bookmark label length. The label is persisted in branch_views.label
+ * and surfaced back to the LLM via list_branches and recall — an unbounded
+ * label expands every future tools/list response. 256 chars is enough for
+ * meaningful human labels ("v1 baseline before refactor") and short of any
+ * reasonable abuse vector.
+ */
+export const MAX_BOOKMARK_LABEL_BYTES = 256
+
 interface McpToolDeps {
   db: DB
   tobeStore: TobeStore
@@ -771,6 +780,11 @@ export function createMcpToolsWithTokens(
         }
 
         let target: RevisionRow | undefined
+        // When the user reaches detail-mode via view_id, surface a warning if
+        // the view's head was reclassified out of closed_forkable. The AI can
+        // still inspect the turn, but rewind_to will reject it — without this
+        // hint the next_steps text contradicts the actual behavior.
+        let viewIdNonForkableWarning: string | undefined
         if (typeof parsed.view_id === 'string') {
           // Resolve view → its current head_revision_id, then load that revision.
           const view = deps.db
@@ -780,6 +794,9 @@ export function createMcpToolsWithTokens(
           target = loadRevision(deps.db, view.head_revision_id)
           if (!target || target.task_id !== sess.task_id) {
             return { error: 'view points at a turn that is not in this session' }
+          }
+          if (target.classification !== 'closed_forkable') {
+            viewIdNonForkableWarning = `this view points at a non-forkable turn (classification=${target.classification}); rewind_to will reject. The view's head was reclassified after the bookmark was created.`
           }
         }
         else if (typeof parsed.turn_id === 'string') {
@@ -851,6 +868,16 @@ export function createMcpToolsWithTokens(
           sealed_at: number | null
           relative_to_target: number // negative = older, positive = newer
         }> | undefined
+        let surroundingSkipped: string | undefined
+        if (surrounding > 0 && target.sealed_at === null) {
+          // Target lacks sealed_at (e.g., reached via view_id whose head was
+          // reclassified from closed_forkable to open/dangling). Surfacing
+          // an empty array would imply "no nearby turns"; surfacing nothing
+          // would silently drop the explicit `surrounding=N` request. Instead
+          // return an empty list AND a warning so the AI knows why.
+          surroundingTurns = []
+          surroundingSkipped = 'target turn has no sealed_at — likely reclassified after view was created; surrounding window not applicable'
+        }
         if (surrounding > 0 && target.sealed_at !== null) {
           const before = deps.db.prepare(`
             SELECT id, stop_reason, sealed_at FROM revisions
@@ -896,6 +923,8 @@ export function createMcpToolsWithTokens(
             preceding_open_turn_count: preceding.length,
             branch_views_at_turn: branchViewsAtTurnLean,
             ...(surroundingTurns ? { surrounding_turns: surroundingTurns } : {}),
+            ...(surroundingSkipped ? { surrounding_skipped: surroundingSkipped } : {}),
+            ...(viewIdNonForkableWarning ? { warning: viewIdNonForkableWarning } : {}),
             next_steps: 'To rewind to this turn, call `rewind_to` with `turn_id` set to this turn\'s id (or `turn_back_n` matching its position in the list). To save it as a bookmark, call `bookmark`.',
           }
         }
@@ -980,21 +1009,28 @@ export function createMcpToolsWithTokens(
 
       // rewind_events: prior fork.back_requested events for THIS session,
       // surfaced inline so the AI can see "a rewind happened here" between
-      // turns. Bounded LIMIT 50 to keep the response small on long sessions
-      // — long-tail rewind history is reachable via list_branches.
+      // turns. Bounded LIMIT 50 to keep the response small on long sessions.
+      // We expose `rewind_events_total` and `rewind_events_truncated` so the
+      // AI knows when older rewinds are out of view (without those, a
+      // session with 73 rewinds silently looks like 50).
+      const REWIND_EVENT_LIMIT = 50
+      const rewindEventsTotal = (deps.db.prepare(`
+        SELECT COUNT(*) AS n FROM events
+         WHERE session_id = ? AND topic = 'fork.back_requested'
+      `).get(ctx.sessionId) as { n: number }).n
       const rewindEventRows = deps.db.prepare(`
         SELECT event_id, payload, created_at FROM events
          WHERE session_id = ? AND topic = 'fork.back_requested'
          ORDER BY event_id DESC
-         LIMIT 50
-      `).all(ctx.sessionId) as Array<{
+         LIMIT ?
+      `).all(ctx.sessionId, REWIND_EVENT_LIMIT) as Array<{
         event_id: string
         payload: string
         created_at: number
       }>
       const rewindEvents: Array<{
         at: number
-        from_turn_id: string
+        from_turn_id: string | null
         to_turn_id: string
         view_id: string
       }> = []
@@ -1003,15 +1039,15 @@ export function createMcpToolsWithTokens(
           const p = JSON.parse(row.payload) as {
             fork_point_revision_id?: string
             target_view_id?: string
-            // The "from" turn: the head_revision_id at the moment of fork
-            // is recorded as `head_revision_id` by some emitters. If absent,
-            // skip — we don't fabricate.
             head_revision_id?: string
           }
           if (!p.fork_point_revision_id || !p.target_view_id) continue
+          // head_revision_id is emitted by rewind_to / submit_file in v0.4.4+;
+          // pre-v0.4.4 events stored before this release have it absent. Surface
+          // as null (not '') to make the absence explicit to the AI consumer.
           rewindEvents.push({
             at: row.created_at,
-            from_turn_id: p.head_revision_id ?? '',
+            from_turn_id: typeof p.head_revision_id === 'string' ? p.head_revision_id : null,
             to_turn_id: p.fork_point_revision_id,
             view_id: p.target_view_id,
           })
@@ -1024,6 +1060,8 @@ export function createMcpToolsWithTokens(
         turns,
         current_head_turn_id: headId,
         rewind_events: rewindEvents,
+        rewind_events_total: rewindEventsTotal,
+        rewind_events_truncated: rewindEventsTotal > rewindEvents.length,
         next_steps: nextSteps,
       }
     },
@@ -1125,11 +1163,18 @@ export function createMcpToolsWithTokens(
       }
 
       // Resolve the target revision: turn_id wins; else turn_back_n; else default 1.
+      // Also capture `headBeforeFork` — the closed_forkable head at this moment.
+      // It's the "from" turn surfaced by recall's rewind_events ("where did
+      // I rewind FROM?"). Always computed regardless of which entry path was
+      // taken so the audit event payload is consistent. Falls back to target
+      // when no settled head is reachable (rare; corrupt revision chain), so
+      // the field is never blank in production v0.4.4+.
       let target: RevisionRow | undefined
       if (typeof parsed.turn_id === 'string' && typeof parsed.turn_back_n === 'number') {
         return { error: 'pass either turn_id or turn_back_n, not both' }
       }
 
+      const headBeforeFork = effectiveHead(deps.db, sess.task_id)
       if (typeof parsed.turn_id === 'string') {
         target = loadRevision(deps.db, parsed.turn_id)
         if (!target || target.task_id !== sess.task_id) {
@@ -1144,15 +1189,14 @@ export function createMcpToolsWithTokens(
         if (!Number.isInteger(n) || n < 1) {
           return { error: 'turn_back_n must be an integer ≥ 1' }
         }
-        const head = effectiveHead(deps.db, sess.task_id)
-        if (!head) {
+        if (!headBeforeFork) {
           return { error: 'cannot rewind: no settled (non-in-flight) revision available' }
         }
-        target = nthForkableBack(deps.db, head, n)
+        target = nthForkableBack(deps.db, headBeforeFork, n)
         if (!target) {
           // Use the cycle-safe helper so a corrupt parent chain doesn't hang
           // the error path on top of failing the happy path.
-          const available = countForkableBack(deps.db, head)
+          const available = countForkableBack(deps.db, headBeforeFork)
           return { error: `only ${available} forkable turns available; cannot go back ${n}` }
         }
       }
@@ -1191,6 +1235,10 @@ export function createMcpToolsWithTokens(
           new_message_cid: newMessageBlob.cid,
           target_view_id: targetViewId,
           task_id: sess.task_id,
+          // The closed_forkable head at the moment of rewind — used by
+          // recall's rewind_events to surface "where did I rewind FROM?".
+          // Falls back to target.id when no settled head is reachable.
+          head_revision_id: (headBeforeFork ?? target).id,
         },
         ctx.sessionId,
         [newMessageBlob.ref],
@@ -1222,6 +1270,23 @@ export function createMcpToolsWithTokens(
     handler: async (args, ctx) => {
       const parsed = (args ?? {}) as { label?: string }
 
+      // Validate label: cap at MAX_BOOKMARK_LABEL_BYTES and strip control
+      // chars. Without this, an unbounded label expands every future
+      // list_branches/recall response that surfaces it to the LLM.
+      let label: string | null = null
+      if (typeof parsed.label === 'string' && parsed.label.length > 0) {
+        if (Buffer.byteLength(parsed.label, 'utf8') > MAX_BOOKMARK_LABEL_BYTES) {
+          return { error: `label exceeds ${MAX_BOOKMARK_LABEL_BYTES}-byte cap` }
+        }
+        // Strip ASCII control chars (newline, NUL, etc.) but keep printable
+        // chars + emoji + non-ASCII text. Labels are display-only.
+        // eslint-disable-next-line no-control-regex
+        label = parsed.label.replace(/[\u0000-\u001f\u007f]/g, '')
+        if (label.length === 0) {
+          return { error: 'label contained only control characters after sanitization' }
+        }
+      }
+
       const sess = loadSession(deps.db, ctx.sessionId)
       if (!sess) return { error: 'session not found' }
 
@@ -1239,7 +1304,7 @@ export function createMcpToolsWithTokens(
           view_id: viewId,
           task_id: sess.task_id,
           head_revision_id: head.id,
-          label: parsed.label ?? null,
+          label,
           auto_label: `bookmark@${new Date().toISOString()}`,
         },
         ctx.sessionId,
@@ -1247,7 +1312,7 @@ export function createMcpToolsWithTokens(
       return {
         view_id: viewId,
         head_revision_id: head.id,
-        label: parsed.label ?? null,
+        label,
         next_steps: 'Bookmark saved. The next time you want to return here, call `recall` to list turns (this bookmark is the current head, so you\'ll see its `head_revision_id` as `current_head_turn_id`) and then `rewind_to` with `turn_id` matching it.',
       }
     },
@@ -1255,85 +1320,89 @@ export function createMcpToolsWithTokens(
 
   // ── delete_bookmark ───────────────────────────────────────────────────────
   // Resolves an id-or-label to a single branch_view row in the current session,
-  // emits fork.bookmark_deleted, projector deletes. Auto fork-point views (from
-  // rewind_to) are stored as branch_views too — they CAN be deleted by view_id
-  // but NOT by label, since their `label` field is NULL (and the resolver only
-  // matches non-NULL labels to avoid accidental deletion of the most recent
-  // fork-point when the user says "delete the bookmark with no label").
+  // emits fork.bookmark_deleted, projector deletes. LABEL-ONLY by design: the
+  // user's mental model for navigation is "the bookmark named X" — view_id
+  // is implementation detail. Deleting by id leaks that detail and makes the
+  // surface inconsistent with how the AI/user thinks. So this tool accepts
+  // only `label`.
+  //
+  // Implications:
+  //   - Unlabeled bookmarks (`bookmark()` no args) cannot be deleted via
+  //     this tool. They auto-advance with head until session cleanup.
+  //   - Auto fork-point views (label=NULL, created by rewind_to) cannot
+  //     be deleted via this tool. System-managed; reaped on `retcon clean
+  //     --actor X`.
+  // Both are by design — if you want a deletable bookmark, give it a label.
   tools.set('delete_bookmark', {
     description:
-      'USE WHEN: the user wants to remove a saved spot. '
-      + 'Deletes a single branch_view by its view_id or unique label. Auto fork-point views (created when you rewind_to elsewhere) can only be deleted by view_id since their label is NULL. Errors if the label matches multiple views. The deletion is recorded in the event log; replay reconstructs branch_views before the deletion. '
+      'USE WHEN: the user wants to remove a saved spot they previously bookmarked with a label. '
+      + 'Deletes the single bookmark with the given label in this session. Errors if no bookmark has that label, or if multiple bookmarks share it. NOTE: unlabeled bookmarks and auto fork-point views (created by rewind_to) cannot be deleted via this tool — they are reaped on session cleanup. '
       + 'NEXT STEPS: call `list_branches` to see what remains.',
     inputSchema: {
       type: 'object',
       properties: {
-        id_or_label: { type: 'string', description: 'view_id (e.g., "01...") OR unique label of the branch_view to delete. Errors if a label matches >1 view.' },
+        label: { type: 'string', description: 'Exact label of the bookmark to delete. Must be unique within this session.' },
       },
-      required: ['id_or_label'],
+      required: ['label'],
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const parsed = (args ?? {}) as { id_or_label?: unknown }
+      const parsed = (args ?? {}) as { label?: unknown }
 
-      if (typeof parsed.id_or_label !== 'string' || parsed.id_or_label.length === 0) {
-        return { error: 'id_or_label is required and must be a non-empty string' }
+      if (typeof parsed.label !== 'string' || parsed.label.length === 0) {
+        return { error: 'label is required and must be a non-empty string' }
       }
-      const idOrLabel = parsed.id_or_label
+      const label = parsed.label
 
       const sess = loadSession(deps.db, ctx.sessionId)
       if (!sess) return { error: 'session not found' }
 
-      // Try id match first (fast path, exact). Then label match scoped to this
-      // session's task. Label match deliberately excludes NULL-label rows so
-      // a label query never accidentally targets a fork_point.
-      const byId = deps.db
-        .prepare(`SELECT id, task_id, label, head_revision_id, auto_label FROM branch_views WHERE id = ? AND task_id = ?`)
-        .get(idOrLabel, sess.task_id) as
-        | { id: string, task_id: string, label: string | null, head_revision_id: string, auto_label: string }
-        | undefined
+      // Match label exactly within this session's task. NULL-label rows
+      // (fork_points, unlabeled bookmarks) are excluded automatically —
+      // SQL's `label = ?` never matches NULL.
+      const matches = deps.db
+        .prepare(`SELECT id, task_id, label, head_revision_id, auto_label FROM branch_views WHERE task_id = ? AND label = ?`)
+        .all(sess.task_id, label) as Array<{
+        id: string
+        task_id: string
+        label: string | null
+        head_revision_id: string
+        auto_label: string
+      }>
 
-      let target: typeof byId
-      if (byId) {
-        target = byId
+      if (matches.length === 0) {
+        return { error: `no bookmark with label '${label}' in this session` }
       }
-      else {
-        const byLabel = deps.db
-          .prepare(`SELECT id, task_id, label, head_revision_id, auto_label FROM branch_views WHERE task_id = ? AND label = ?`)
-          .all(sess.task_id, idOrLabel) as Array<{
-          id: string
-          task_id: string
-          label: string | null
-          head_revision_id: string
-          auto_label: string
-        }>
-        if (byLabel.length === 0) {
-          return { error: `no branch_view with id or label '${idOrLabel}' in this session` }
+      if (matches.length > 1) {
+        return {
+          error: `label '${label}' matches ${matches.length} bookmarks — labels must be unique to delete by label. Use list_branches to inspect them.`,
+          ambiguous_views: matches.map(r => ({
+            view_id: r.id,
+            kind: r.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark',
+            label: r.label,
+            head_turn_id: r.head_revision_id,
+          })),
         }
-        if (byLabel.length > 1) {
-          return {
-            error: `label '${idOrLabel}' matches ${byLabel.length} views — pass view_id instead`,
-            ambiguous_view_ids: byLabel.map(r => r.id),
-          }
-        }
-        target = byLabel[0]
       }
+      const target = matches[0]!
 
       ctx.producer.emit(
         'fork.bookmark_deleted',
-        { view_id: target!.id, task_id: target!.task_id },
+        { view_id: target.id, task_id: target.task_id },
         ctx.sessionId,
       )
-      // Determine kind from auto_label prefix (matches list_branches semantics).
-      const kind = target!.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark'
+      // Kind from auto_label prefix (always 'bookmark' here since label != NULL,
+      // and fork.back_requested writes label=NULL while fork.bookmark_created
+      // writes the user-supplied label).
+      const kind = target.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark'
       return {
         deleted: {
-          view_id: target!.id,
+          view_id: target.id,
           kind,
-          label: target!.label,
-          head_turn_id_at_delete: target!.head_revision_id,
+          label: target.label,
+          head_turn_id_at_delete: target.head_revision_id,
         },
-        next_steps: 'Branch view removed. Call `list_branches` to see what remains.',
+        next_steps: 'Bookmark removed. Call `list_branches` to see what remains.',
       }
     },
   })
@@ -1853,6 +1922,10 @@ export function createMcpToolsWithTokens(
           new_message_cid: newMessageBlob.cid,
           target_view_id: targetViewId,
           task_id: sess.task_id,
+          // For submit_file, head==fork_point: the AI edits content at the
+          // current head. recall's rewind_events surfaces from==to which
+          // signals "edit, not rewind" (no actual jump in the revision DAG).
+          head_revision_id: headForkable.id,
           via: 'submit_file',
           dump_path: resolvedPath,
         },

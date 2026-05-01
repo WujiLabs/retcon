@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic, event_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, event_id);
+-- Composite index for "all events of topic X in session Y, in event_id order".
+-- Used by recall's rewind_events query (filter to fork.back_requested in this
+-- session). Without this, idx_events_session covers session_id but post-filters
+-- topic — on long sessions with thousands of non-rewind events, that scan is
+-- expensive. CREATE IF NOT EXISTS is additive on upgrade; no migration needed.
+CREATE INDEX IF NOT EXISTS idx_events_session_topic ON events(session_id, topic, event_id);
 
 CREATE TABLE IF NOT EXISTS projection_offsets (
   projection_id TEXT PRIMARY KEY,
