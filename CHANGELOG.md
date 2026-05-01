@@ -2,7 +2,22 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
-## [0.4.1-alpha.0] - 2026-04-29
+## [0.4.2-alpha.0] - 2026-04-29
+
+End of the "schema bump wipes your DB" era. retcon's first real user is starting to depend on the event log surviving across upgrades, and silently dropping every table on a schema mismatch is unacceptable for that. This release replaces the nuke-and-reinit shortcut with a backup + per-version migration registry. Empty registry for now (v5 is the only release in the wild and the only entry path is fresh-install), but the framework is in place so the next schema bump has somewhere to land.
+
+### Changed
+
+- **DB migration policy: no more silent wipes.** When `migrate()` finds an on-disk DB at an older schema_version than the current binary, it now (1) takes a `VACUUM INTO` snapshot to `<dbPath>.bak.v<old>.<ISO-ts>` so the user has a fallback, then (2) walks `MIGRATIONS[from] → MIGRATIONS[from+1] → ...` applying each registered step. If any step is missing from the registry, `migrate()` throws with the backup path and the live DB is left untouched. Previous behavior (`DROP TABLE` everything and recreate at current) is gone. The error message tells the user where the backup is and how to recover (downgrade retcon, restore the backup, or remove the live DB to start fresh).
+- **`MIGRATIONS` registry in `src/db.ts`.** `Record<number, (db: DB) => void>`, keyed by from-version. Empty for v0.4.2 since v5 is the only release. Future schema bumps register a function under the from-version when they bump `CURRENT_SCHEMA_VERSION`.
+- **`migrate(db, dbPath?)` signature.** The optional `dbPath` enables backups; omit for `:memory:` tests where there's no file to copy. Threaded through `cli/daemon.ts:runDaemon` so production launches always supply it.
+- **`openDb({ path, readonly: true })` no longer tries to set WAL pragmas.** Read-only opens can't write the DB header, so `journal_mode = WAL` and `wal_autocheckpoint` are skipped. `foreign_keys = ON` still applies (per-connection). Surfaced because the new test suite opens backup files in read-only mode to verify their integrity.
+
+### Added
+
+- **5 new unit tests in `db.test.ts`.** Covers: fresh-DB-no-backup-file, refusal-when-no-migration-registered (live DB byte-identical after the throw, including a fingerprint blob), backup-file-is-a-real-openable-SQLite-with-original-content, error-message-tells-user-backup-path, in-memory-mode-skips-backup. The "leaves live DB untouched" assertion is the one that pins the user-visible promise.
+
+
 
 Smoke-testing 0.4 against a real conversation surfaced a 400 from Anthropic on the third or fourth spliced turn: `A maximum of 4 blocks with cache_control may be provided`. Persistent-fork splicing accumulates ephemeral `cache_control` markers across turns, and a few turns in we'd push the body past Anthropic's hard cap. This release adds a cap that mirrors what claude does internally — keep the tail markers, strip the head — so the cached prefix extends turn-by-turn instead of being frozen at the start of the spliced branch. Plus the Phase 4 tool-adoption test now reliably verifies what claude actually does (event-log assertions, not silent passes).
 

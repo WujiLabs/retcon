@@ -82,8 +82,9 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   const upstream = opts.upstream ?? process.env.RETCON_UPSTREAM ?? ANTHROPIC_UPSTREAM
 
   ensureRetconDirs()
-  const db = openDb({ path: retconDbPath() })
-  migrate(db)
+  const dbPath = retconDbPath()
+  const db = openDb({ path: dbPath })
+  migrate(db, dbPath)
 
   // Garbage-collect stale pending_actors entries. A row leaks here if a
   // `retcon` invocation registered an actor but the user CTRL-C'd before

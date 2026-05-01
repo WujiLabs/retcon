@@ -7,11 +7,20 @@
 //   1. Source of truth (append-only, immutable):  blobs, events, projection_offsets
 //   2. Projected views (rebuildable from events): sessions, tasks, revisions, branch_views
 //
-// Pre-1.0 alpha policy: schema bumps are destructive. If we find an older
-// schema version on disk, we drop everything and recreate at the latest
-// version. retcon's data at this stage is dev / test data — preserving it
-// across schema changes isn't worth the migration cost. Once we cut a 1.0
-// release, this comment becomes a lie and we add real migrations.
+// Migration policy: NEVER wipe an on-disk DB silently. If we find an older
+// schema version, we (1) make a `VACUUM INTO` snapshot of the file at
+// `<dbPath>.bak.v<old>.<ts>` so the user can fall back, then (2) iterate
+// the MIGRATIONS registry from <old> → CURRENT_SCHEMA_VERSION applying
+// each step's SQL. Missing migration step ⇒ throw with the backup path
+// in the message, leaving the original DB untouched. The user decides
+// whether to downgrade retcon, restore the backup, or wipe manually.
+//
+// Empty MIGRATIONS for now: v5 is the only release in the wild and the
+// only entry path is fresh-install. Future schema bumps register a
+// function under from-version → from-version+1.
+
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 
 import Database from 'better-sqlite3'
 
@@ -21,16 +30,21 @@ export type DB = Database.Database
 // from flat-hash (Block.encode of the inline-encoded value) to Merkle-hash
 // (computeStorageBlock / computeTopBlock). For Anthropic messages with a
 // nested `content` array, the two hashes produce different CIDs for the
-// same logical content. Bumping the schema forces nuke-and-reinit on
-// upgrade per the alpha policy so dedup stays intact (otherwise a v4 DB
-// would carry forward flat-hashed leaves and new writes would double-
-// store the same content under Merkle-hashed CIDs).
+// same logical content. A v4→v5 migration would need to re-hash every
+// message blob; not written yet, so attempting to upgrade a v4 DB throws
+// with the backup path in the error.
 export const CURRENT_SCHEMA_VERSION = 5
 
-// Single source of truth for the schema_version table DDL. Used in three
-// places (initial create in migrate(), the SOURCE_OF_TRUTH_SCHEMA bundle,
-// and the post-nuke recreate) so a column-shape change here propagates to
-// all of them.
+// Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N
+// and brings it to N+1. Add an entry whenever you bump
+// CURRENT_SCHEMA_VERSION. Empty for now since v5 is the only release.
+const MIGRATIONS: Record<number, (db: DB) => void> = {
+  // 4: (db) => { db.exec('...'); /* re-hash blobs, etc. */ },
+}
+
+// Single source of truth for the schema_version table DDL. Used in two
+// places (initial create in migrate() and the SOURCE_OF_TRUTH_SCHEMA
+// bundle) so a column-shape change here propagates to both.
 const SCHEMA_VERSION_DDL = `
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
@@ -140,14 +154,20 @@ export interface OpenDbOptions {
 }
 
 export function openDb(options: OpenDbOptions): DB {
-  const db = new Database(options.path, { readonly: options.readonly ?? false })
-  db.pragma('journal_mode = WAL')
+  const readonly = options.readonly ?? false
+  const db = new Database(options.path, { readonly })
+  // Read-only opens can't set WAL or wal_autocheckpoint (both write the
+  // header / checkpoint state), so skip pragmas that need write access.
+  // foreign_keys is per-connection regardless.
+  if (!readonly) {
+    db.pragma('journal_mode = WAL')
+    // Keep the WAL file from growing unbounded under sustained writes.
+    // SQLite auto-truncates the WAL when it exceeds this many pages
+    // (default is 1000). We set it explicitly so the behavior doesn't
+    // depend on the sqlite version baked into better-sqlite3.
+    db.pragma('wal_autocheckpoint = 1000')
+  }
   db.pragma('foreign_keys = ON')
-  // Keep the WAL file from growing unbounded under sustained writes. SQLite
-  // auto-truncates the WAL when it exceeds this many pages (default is 1000).
-  // We set it explicitly so the behavior doesn't depend on the sqlite version
-  // baked into better-sqlite3.
-  db.pragma('wal_autocheckpoint = 1000')
   return db
 }
 
@@ -168,13 +188,23 @@ export function closeDb(db: DB): void {
 /**
  * Bring the DB to CURRENT_SCHEMA_VERSION.
  *
- * On a fresh DB: create everything at the latest schema and stamp the version.
- * On a DB at an older schema: drop all retcon-owned tables and recreate at
- * current. Pre-1.0 alpha policy — retcon's data is dev / test data and not
- * worth migrating yet. Reject if the DB version is newer than what this
- * binary knows about.
+ * Fresh DB (no schema_version row): create everything at the latest schema
+ * and stamp the version.
+ *
+ * Older DB (schema_version < CURRENT): snapshot the file via VACUUM INTO
+ * to `<dbPath>.bak.v<old>.<ISO-ts>` first, then walk the MIGRATIONS
+ * registry stepping from <old>+1 up to CURRENT, applying each entry. If
+ * any step is missing from the registry, throw with the backup path in
+ * the message and leave the live DB untouched. The user decides whether
+ * to downgrade retcon, restore the backup, or wipe manually.
+ *
+ * Newer DB: throw. We don't downgrade.
+ *
+ * `dbPath` is required when the DB is on disk (so we can VACUUM INTO a
+ * sibling file). Tests that open `:memory:` can omit it; in that case we
+ * skip the backup since there's no file to copy.
  */
-export function migrate(db: DB): void {
+export function migrate(db: DB, dbPath?: string): void {
   // schema_version belongs to source-of-truth, but we read from it before
   // the rest of the schema exists. Create just that table first, idempotently.
   db.exec(SCHEMA_VERSION_DDL)
@@ -192,45 +222,71 @@ export function migrate(db: DB): void {
   }
 
   if (current > 0 && current < CURRENT_SCHEMA_VERSION) {
-    process.stderr.write(
-      `[retcon] DB schema_version=${current} predates this binary's ${CURRENT_SCHEMA_VERSION}; `
-      + `dropping all tables and recreating. (Pre-1.0 alpha policy: no migrations yet.)\n`,
-    )
-    nukeAllTables(db)
+    // Take a consistent snapshot BEFORE we run a single migration step.
+    // VACUUM INTO is sync, atomic, and produces a valid SQLite file at
+    // dest. If anything goes wrong below, the user has this file.
+    const backupPath = dbPath ? backupOnDisk(db, dbPath, current) : null
+    if (backupPath) {
+      process.stderr.write(`[retcon] DB schema_version=${current} predates this binary's ${CURRENT_SCHEMA_VERSION}; backed up to ${backupPath} before migrating.\n`)
+    }
+
+    for (let v = current; v < CURRENT_SCHEMA_VERSION; v++) {
+      const step = MIGRATIONS[v]
+      if (!step) {
+        throw new Error(
+          `[retcon] No migration registered for schema_version ${v} → ${v + 1}. `
+          + (backupPath
+            ? `Your DB has been backed up to ${backupPath} and the live file is unchanged. `
+            : 'The live DB is unchanged. ')
+          + `To proceed, either downgrade @playtiss/retcon to a build that wrote schema_version=${current}, `
+          + 'or remove the DB to start fresh (the backup remains).',
+        )
+      }
+      step(db)
+      // Idempotent: we stamp the new version after each step so a partial
+      // migration leaves a recoverable state.
+      db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)')
+        .run(v + 1, Date.now())
+    }
   }
 
-  // Create everything at the latest schema. CREATE ... IF NOT EXISTS makes
-  // this idempotent for both the fresh-DB case and the post-nuke case.
+  // Always idempotently ensure the latest-schema DDL is present. On a fresh
+  // DB this is the create path; on a migrated DB this is a no-op because
+  // every CREATE uses IF NOT EXISTS.
   db.exec(SOURCE_OF_TRUTH_SCHEMA)
   db.exec(PROJECTED_VIEWS_SCHEMA)
 
-  if (current < CURRENT_SCHEMA_VERSION) {
+  if (current === 0) {
     db.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)')
       .run(CURRENT_SCHEMA_VERSION, Date.now())
   }
 }
 
 /**
- * Drop every retcon-owned table. Pre-1.0 schema-bump shortcut so we don't
- * have to write per-version migrations for data that's all dev / test
- * traffic at this stage.
+ * Snapshot the live DB file to a sibling backup file via VACUUM INTO.
+ * Returns the backup path (or throws on copy failure — we'd rather refuse
+ * to migrate than risk losing the user's data without a fallback).
+ *
+ * VACUUM INTO is the SQLite-native way to get a consistent snapshot of an
+ * open DB into a new file. It briefly takes a write lock, walks the b-tree,
+ * and emits a defragmented copy. Available since SQLite 3.27 (2019); ships
+ * with every better-sqlite3.
+ *
+ * The destination filename embeds the OLD schema version + ISO timestamp
+ * so multiple backups don't collide and the user can tell which version
+ * each one came from.
  */
-function nukeAllTables(db: DB): void {
-  db.exec(`
-    DROP TABLE IF EXISTS pending_actors;
-    DROP TABLE IF EXISTS branch_views;
-    DROP TABLE IF EXISTS revisions;
-    -- Defensive cleanup: 'versions' was the v1 table name that became
-    -- 'revisions' after the v1→v2 rename. Any DB old enough to still have
-    -- it would already trigger nuke-and-reinit via schema_version<CURRENT,
-    -- but the explicit DROP keeps the post-nuke state predictable.
-    DROP TABLE IF EXISTS versions;
-    DROP TABLE IF EXISTS tasks;
-    DROP TABLE IF EXISTS sessions;
-    DROP TABLE IF EXISTS projection_offsets;
-    DROP TABLE IF EXISTS events;
-    DROP TABLE IF EXISTS blobs;
-    DROP TABLE IF EXISTS schema_version;
-  `)
-  db.exec(SCHEMA_VERSION_DDL)
+function backupOnDisk(db: DB, dbPath: string, fromVersion: number): string {
+  const dir = path.dirname(dbPath)
+  const base = path.basename(dbPath)
+  const ts = new Date().toISOString().replace(/[:.]/g, '-')
+  const backupPath = path.join(dir, `${base}.bak.v${fromVersion}.${ts}`)
+  // VACUUM INTO refuses to overwrite. The timestamp makes collisions
+  // effectively impossible, but unlink defensively just in case.
+  if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath)
+  // Path goes into a SQL string literal; SQLite single-quote-doubling
+  // escapes any quotes in dbPath. Belt-and-suspenders since dbPath comes
+  // from retconHome() which we control, but cheap to be safe.
+  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, '\'\'')}'`)
+  return backupPath
 }
