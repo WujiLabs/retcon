@@ -302,7 +302,7 @@ describe('recall (detail mode)', () => {
   it('errors when both turn_id and turn_back_n are passed', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_id: 'x', turn_back_n: 1 }) as { error: string }
-    expect(res.error).toMatch(/not both/)
+    expect(res.error).toMatch(/exactly one/)
   })
 
   it('errors when turn_back_n exceeds available turns', async () => {
@@ -339,6 +339,147 @@ describe('recall (detail mode)', () => {
     expect('parent_revision_id' in res.turn).toBe(true)
     expect('asset_cid' in res.turn).toBe(true)
     expect(Array.isArray(res.preceding_open_turns)).toBe(true)
+  })
+})
+
+// ─── recall (Phase 3 extensions) ────────────────────────────────────────────
+//
+// Phase 3 of the bookmark management plan (v0.4.4): recall accepts view_id,
+// surrounding window, and surfaces rewind_events + branch_views_at_turn.
+
+describe('recall (Phase 3 extensions)', () => {
+  let fx: TestFixture
+  beforeEach(() => {
+    fx = fixture()
+  })
+  afterEach(() => fx.cleanup())
+
+  it('1: view_id-happy — resolves to bookmark\'s head_turn_id', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const bm = await call(fx, 'bookmark', { label: 'v1' }) as {
+      view_id: string
+      head_revision_id: string
+    }
+    const res = await call(fx, 'recall', { view_id: bm.view_id }) as {
+      turn: { turn_id: string }
+    }
+    expect(res.turn.turn_id).toBe(turn.id)
+    expect(res.turn.turn_id).toBe(bm.head_revision_id)
+  })
+
+  it('2: view_id-not-found — clear error message', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'recall', { view_id: 'never-existed' }) as { error: string }
+    expect(res.error).toMatch(/view not found/)
+  })
+
+  it('3: surrounding-window — returns N before + N after', async () => {
+    // Seed 5 forkable turns; inspect the middle one with surrounding=2.
+    const turns = []
+    for (let i = 0; i < 5; i++) {
+      const messages: Array<{ role: string, content: string }> = []
+      for (let j = 0; j <= i; j++) {
+        messages.push({ role: 'user', content: `q${j}` })
+        messages.push({ role: 'assistant', content: `a${j}` })
+      }
+      messages.pop() // end on user
+      turns.push(emitTurn(fx, 'end_turn', messages))
+    }
+    const middle = turns[2]!
+    const res = await call(fx, 'recall', { turn_id: middle.id, surrounding: 2 }) as {
+      turn: { turn_id: string }
+      surrounding_turns: Array<{ turn_id: string, relative_to_target: number }>
+    }
+    expect(res.turn.turn_id).toBe(middle.id)
+    expect(res.surrounding_turns.length).toBe(4)
+    // 2 before (negative relative), 2 after (positive). Each group sorted
+    // closest-first.
+    const before = res.surrounding_turns.filter(t => t.relative_to_target < 0)
+    const after = res.surrounding_turns.filter(t => t.relative_to_target > 0)
+    expect(before.length).toBe(2)
+    expect(after.length).toBe(2)
+    expect(before.map(t => t.relative_to_target).sort((a, b) => b - a)).toEqual([-1, -2])
+    expect(after.map(t => t.relative_to_target).sort((a, b) => a - b)).toEqual([1, 2])
+  })
+
+  it('4: surrounding-clipped-at-edges — returns whatever exists when N exceeds available', async () => {
+    // 3 turns, inspect the LAST with surrounding=5. Should get 2 before + 0 after.
+    const turns = []
+    for (let i = 0; i < 3; i++) {
+      const messages: Array<{ role: string, content: string }> = []
+      for (let j = 0; j <= i; j++) {
+        messages.push({ role: 'user', content: `q${j}` })
+        messages.push({ role: 'assistant', content: `a${j}` })
+      }
+      messages.pop()
+      turns.push(emitTurn(fx, 'end_turn', messages))
+    }
+    const last = turns[2]!
+    const res = await call(fx, 'recall', { turn_id: last.id, surrounding: 5 }) as {
+      surrounding_turns: Array<{ relative_to_target: number }>
+    }
+    expect(res.surrounding_turns.length).toBe(2) // 2 before, 0 after
+    expect(res.surrounding_turns.every(t => t.relative_to_target < 0)).toBe(true)
+  })
+
+  it('5: list-mode-rewind_events-populated — fork.back_requested events surface inline', async () => {
+    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    const turn2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }])
+    // Emit a synthetic rewind event.
+    fx.producer.emit(
+      'fork.back_requested',
+      {
+        target_view_id: 'view_rewind1',
+        source_view_id: 'src',
+        fork_point_revision_id: turn1.id,
+        new_message_cid: 'cid',
+        task_id: fx.taskId,
+        head_revision_id: turn2.id,
+      },
+      fx.sessionId,
+    )
+    const res = await call(fx, 'recall', {}) as {
+      rewind_events: Array<{ from_turn_id: string, to_turn_id: string, view_id: string }>
+    }
+    expect(res.rewind_events.length).toBe(1)
+    expect(res.rewind_events[0]!.to_turn_id).toBe(turn1.id)
+    expect(res.rewind_events[0]!.view_id).toBe('view_rewind1')
+  })
+
+  it('6: list-mode-no-rewinds — empty rewind_events array', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'recall', {}) as { rewind_events: unknown[] }
+    expect(res.rewind_events).toEqual([])
+  })
+
+  it('7: detail-mode-branch_views_at_turn — surfaces every view pointing at this turn', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const bm1 = await call(fx, 'bookmark', { label: 'a' }) as { view_id: string }
+    const bm2 = await call(fx, 'bookmark', { label: 'b' }) as { view_id: string }
+    const res = await call(fx, 'recall', { turn_id: turn.id }) as {
+      branch_views_at_turn: Array<{ view_id: string, kind: string, label: string | null }>
+    }
+    expect(res.branch_views_at_turn.length).toBe(2)
+    const ids = res.branch_views_at_turn.map(v => v.view_id).sort()
+    expect(ids).toEqual([bm1.view_id, bm2.view_id].sort())
+    expect(res.branch_views_at_turn.every(v => v.kind === 'bookmark')).toBe(true)
+  })
+
+  it('8: view_id-pointing-at-deleted-view — clean "view not found" error', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const bm = await call(fx, 'bookmark', { label: 'v1' }) as { view_id: string }
+    await call(fx, 'delete_bookmark', { id_or_label: bm.view_id })
+    const res = await call(fx, 'recall', { view_id: bm.view_id }) as { error: string }
+    expect(res.error).toMatch(/view not found/)
+  })
+
+  it('9: surrounding=0 — omits surrounding_turns field entirely from response', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'recall', { turn_id: turn.id, surrounding: 0 }) as Record<string, unknown>
+    expect('surrounding_turns' in res).toBe(false)
+    // Same when omitted.
+    const res2 = await call(fx, 'recall', { turn_id: turn.id }) as Record<string, unknown>
+    expect('surrounding_turns' in res2).toBe(false)
   })
 })
 

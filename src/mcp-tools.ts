@@ -724,14 +724,16 @@ export function createMcpToolsWithTokens(
     description:
       'USE WHEN: the user wants to revisit, rewind, recall, or pull up a past moment in this conversation. ALSO use when YOU recognize you have gone off track and want to back up. '
       + 'Returns recent forkable turns (closed_forkable Revisions) with content previews and turn ids you can pass to `rewind_to`. '
-      + 'No args: list recent turns. `turn_back_n`: inspect the Nth turn back (1=most recent forkable). `turn_id`: inspect a specific turn. '
-      + 'NEXT STEPS: to rewind to a turn, call `rewind_to`. To bookmark the latest turn, call `bookmark`.',
+      + 'No args: list recent turns plus a rewind_events array showing where you have rewound. `turn_back_n`: inspect the Nth turn back. `turn_id`: inspect a specific turn. `view_id`: inspect the turn a branch_view (from `list_branches`) points at. `surrounding: N` (0-10): include N forkable turns on each side of the inspected turn. '
+      + 'NEXT STEPS: to rewind to a turn, call `rewind_to`. To save a spot, call `bookmark`. To list saved spots, call `list_branches`.',
     inputSchema: {
       type: 'object',
       properties: {
-        turn_back_n: { type: 'number', description: 'Inspect the Nth forkable turn back (1=most recent). Mutually exclusive with turn_id.' },
-        turn_id: { type: 'string', description: 'Inspect a specific turn by id (returned by an earlier recall call). Mutually exclusive with turn_back_n.' },
-        limit: { type: 'number', description: 'When listing (no turn_back_n/turn_id), max turns to return (1-200, default 20).' },
+        turn_back_n: { type: 'number', description: 'Inspect the Nth forkable turn back (1=most recent). Mutually exclusive with turn_id and view_id.' },
+        turn_id: { type: 'string', description: 'Inspect a specific turn by id. Mutually exclusive with turn_back_n and view_id.' },
+        view_id: { type: 'string', description: 'Inspect the turn this branch_view points at (resolves to head_revision_id at call time). Mutually exclusive with turn_id and turn_back_n.' },
+        surrounding: { type: 'number', description: 'When inspecting a turn, also return N forkable turns on each side (0-10). Default 0 = no window.' },
+        limit: { type: 'number', description: 'When listing (no turn_back_n/turn_id/view_id), max turns to return (1-200, default 20).' },
         offset: { type: 'number', description: 'When listing, pagination offset (default 0).' },
         verbose: { type: 'boolean', description: 'Include internal fields (revision ids, asset CIDs, classifications) for debugging.' },
       },
@@ -741,6 +743,8 @@ export function createMcpToolsWithTokens(
       const parsed = (args ?? {}) as {
         turn_back_n?: number
         turn_id?: string
+        view_id?: string
+        surrounding?: number
         limit?: number
         offset?: number
         verbose?: boolean
@@ -750,14 +754,35 @@ export function createMcpToolsWithTokens(
       const sess = loadSession(deps.db, ctx.sessionId)
       if (!sess) return { error: 'session not found', session_id: ctx.sessionId }
 
-      // Detail mode: turn_id or turn_back_n.
-      if (typeof parsed.turn_id === 'string' || typeof parsed.turn_back_n === 'number') {
-        if (typeof parsed.turn_id === 'string' && typeof parsed.turn_back_n === 'number') {
-          return { error: 'pass either turn_id or turn_back_n, not both' }
+      // Detail mode triggered by any of: turn_id, turn_back_n, view_id.
+      const detailMode = typeof parsed.turn_id === 'string'
+        || typeof parsed.turn_back_n === 'number'
+        || typeof parsed.view_id === 'string'
+
+      if (detailMode) {
+        // Mutual exclusion: only one entry path allowed.
+        const entryCount = [
+          typeof parsed.turn_id === 'string',
+          typeof parsed.turn_back_n === 'number',
+          typeof parsed.view_id === 'string',
+        ].filter(Boolean).length
+        if (entryCount > 1) {
+          return { error: 'pass exactly one of turn_id, turn_back_n, view_id' }
         }
 
         let target: RevisionRow | undefined
-        if (typeof parsed.turn_id === 'string') {
+        if (typeof parsed.view_id === 'string') {
+          // Resolve view → its current head_revision_id, then load that revision.
+          const view = deps.db
+            .prepare('SELECT head_revision_id, task_id FROM branch_views WHERE id = ? AND task_id = ?')
+            .get(parsed.view_id, sess.task_id) as { head_revision_id: string, task_id: string } | undefined
+          if (!view) return { error: 'view not found in this session' }
+          target = loadRevision(deps.db, view.head_revision_id)
+          if (!target || target.task_id !== sess.task_id) {
+            return { error: 'view points at a turn that is not in this session' }
+          }
+        }
+        else if (typeof parsed.turn_id === 'string') {
           target = loadRevision(deps.db, parsed.turn_id)
           if (!target || target.task_id !== sess.task_id) {
             return { error: 'turn not found in this session' }
@@ -795,10 +820,82 @@ export function createMcpToolsWithTokens(
           stop_reason: target.stop_reason,
           sealed_at: target.sealed_at,
         }
+
+        // branch_views_at_turn: every branch_view whose head_revision_id
+        // matches THIS turn. Useful for "what bookmarks point here?".
+        const branchViewsAtTurn = deps.db.prepare(`
+          SELECT id, label, auto_label FROM branch_views
+           WHERE task_id = ? AND head_revision_id = ?
+           ORDER BY updated_at DESC, id DESC
+        `).all(sess.task_id, target.id) as Array<{
+          id: string
+          label: string | null
+          auto_label: string
+        }>
+        const branchViewsAtTurnLean = branchViewsAtTurn.map(v => ({
+          view_id: v.id,
+          kind: v.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark',
+          label: v.label,
+        }))
+
+        // surrounding window: N forkable turns before AND after the target,
+        // by sealed_at. Cap at 10 each side. surrounding=0 (or unset) returns
+        // no surrounding_turns field at all (not present-but-empty) to keep
+        // the response shape minimal.
+        const surrounding = typeof parsed.surrounding === 'number'
+          ? Math.min(Math.max(Math.floor(parsed.surrounding), 0), 10)
+          : 0
+        let surroundingTurns: Array<{
+          turn_id: string
+          stop_reason: string | null
+          sealed_at: number | null
+          relative_to_target: number // negative = older, positive = newer
+        }> | undefined
+        if (surrounding > 0 && target.sealed_at !== null) {
+          const before = deps.db.prepare(`
+            SELECT id, stop_reason, sealed_at FROM revisions
+             WHERE task_id = ? AND classification = 'closed_forkable'
+                   AND sealed_at IS NOT NULL
+                   AND (sealed_at < ? OR (sealed_at = ? AND id < ?))
+             ORDER BY sealed_at DESC, id DESC LIMIT ?
+          `).all(sess.task_id, target.sealed_at, target.sealed_at, target.id, surrounding) as Array<{
+            id: string
+            stop_reason: string | null
+            sealed_at: number | null
+          }>
+          const after = deps.db.prepare(`
+            SELECT id, stop_reason, sealed_at FROM revisions
+             WHERE task_id = ? AND classification = 'closed_forkable'
+                   AND sealed_at IS NOT NULL
+                   AND (sealed_at > ? OR (sealed_at = ? AND id > ?))
+             ORDER BY sealed_at ASC, id ASC LIMIT ?
+          `).all(sess.task_id, target.sealed_at, target.sealed_at, target.id, surrounding) as Array<{
+            id: string
+            stop_reason: string | null
+            sealed_at: number | null
+          }>
+          surroundingTurns = [
+            ...before.map((r, i) => ({
+              turn_id: r.id,
+              stop_reason: r.stop_reason,
+              sealed_at: r.sealed_at,
+              relative_to_target: -(i + 1),
+            })),
+            ...after.map((r, i) => ({
+              turn_id: r.id,
+              stop_reason: r.stop_reason,
+              sealed_at: r.sealed_at,
+              relative_to_target: i + 1,
+            })),
+          ]
+        }
+
         if (!verbose) {
           return {
             turn: lean,
             preceding_open_turn_count: preceding.length,
+            branch_views_at_turn: branchViewsAtTurnLean,
+            ...(surroundingTurns ? { surrounding_turns: surroundingTurns } : {}),
             next_steps: 'To rewind to this turn, call `rewind_to` with `turn_id` set to this turn\'s id (or `turn_back_n` matching its position in the list). To save it as a bookmark, call `bookmark`.',
           }
         }
@@ -811,6 +908,8 @@ export function createMcpToolsWithTokens(
             created_at: target.created_at,
           },
           preceding_open_turns: preceding,
+          branch_views_at_turn: branchViewsAtTurnLean,
+          ...(surroundingTurns ? { surrounding_turns: surroundingTurns } : {}),
           next_steps: 'To rewind to this turn, call `rewind_to` with `turn_id` set to this turn\'s id. To save it as a bookmark, call `bookmark`.',
         }
       }
@@ -877,9 +976,56 @@ export function createMcpToolsWithTokens(
 
       const nextSteps = turns.length === 0
         ? 'No rewindable turns yet. The current state is `current_head_turn_id`. After more turns close, call `recall` again.'
-        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). To save the current spot, call `bookmark`.'
+        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
 
-      return { total, turns, current_head_turn_id: headId, next_steps: nextSteps }
+      // rewind_events: prior fork.back_requested events for THIS session,
+      // surfaced inline so the AI can see "a rewind happened here" between
+      // turns. Bounded LIMIT 50 to keep the response small on long sessions
+      // — long-tail rewind history is reachable via list_branches.
+      const rewindEventRows = deps.db.prepare(`
+        SELECT event_id, payload, created_at FROM events
+         WHERE session_id = ? AND topic = 'fork.back_requested'
+         ORDER BY event_id DESC
+         LIMIT 50
+      `).all(ctx.sessionId) as Array<{
+        event_id: string
+        payload: string
+        created_at: number
+      }>
+      const rewindEvents: Array<{
+        at: number
+        from_turn_id: string
+        to_turn_id: string
+        view_id: string
+      }> = []
+      for (const row of rewindEventRows) {
+        try {
+          const p = JSON.parse(row.payload) as {
+            fork_point_revision_id?: string
+            target_view_id?: string
+            // The "from" turn: the head_revision_id at the moment of fork
+            // is recorded as `head_revision_id` by some emitters. If absent,
+            // skip — we don't fabricate.
+            head_revision_id?: string
+          }
+          if (!p.fork_point_revision_id || !p.target_view_id) continue
+          rewindEvents.push({
+            at: row.created_at,
+            from_turn_id: p.head_revision_id ?? '',
+            to_turn_id: p.fork_point_revision_id,
+            view_id: p.target_view_id,
+          })
+        }
+        catch { /* malformed event payload — skip */ }
+      }
+
+      return {
+        total,
+        turns,
+        current_head_turn_id: headId,
+        rewind_events: rewindEvents,
+        next_steps: nextSteps,
+      }
     },
   })
 
