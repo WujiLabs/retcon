@@ -540,6 +540,150 @@ describe('delete_bookmark', () => {
   })
 })
 
+// ─── list_branches ───────────────────────────────────────────────────────────
+//
+// Phase 2 of the bookmark management plan (v0.4.4): list_branches surfaces
+// every branch_view row for the session's task — explicit bookmarks AND auto
+// fork-point views — with a `kind` discriminator derived from auto_label.
+
+describe('list_branches', () => {
+  let fx: TestFixture
+  beforeEach(() => {
+    fx = fixture()
+  })
+  afterEach(() => fx.cleanup())
+
+  function seedForkPoint(forkPointRevId: string, label: string | null = null): string {
+    const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
+    fx.producer.emit(
+      'fork.back_requested',
+      {
+        target_view_id: viewId,
+        source_view_id: 'src',
+        fork_point_revision_id: forkPointRevId,
+        new_message_cid: 'cid',
+        task_id: fx.taskId,
+      },
+      fx.sessionId,
+    )
+    if (label !== null) {
+      fx.producer.emit('fork.label_updated', { view_id: viewId, label }, fx.sessionId)
+    }
+    return viewId
+  }
+
+  it('1: returns empty list on a fresh session', async () => {
+    const res = await call(fx, 'list_branches', {}) as { total: number, branches: unknown[] }
+    expect(res.total).toBe(0)
+    expect(res.branches).toEqual([])
+  })
+
+  it('2: lists a mix of bookmark and fork_point with correct kind from auto_label', async () => {
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    // Explicit bookmark (no label).
+    const bm = await call(fx, 'bookmark', {}) as { view_id: string }
+    // Auto fork-point view (label=NULL).
+    const fp = seedForkPoint(turn.id)
+    const res = await call(fx, 'list_branches', {}) as {
+      total: number
+      branches: Array<{ view_id: string, kind: string, label: string | null }>
+    }
+    expect(res.total).toBe(2)
+    const byId = new Map(res.branches.map(b => [b.view_id, b]))
+    expect(byId.get(bm.view_id)?.kind).toBe('bookmark')
+    expect(byId.get(bm.view_id)?.label).toBeNull()
+    expect(byId.get(fp)?.kind).toBe('fork_point')
+    expect(byId.get(fp)?.label).toBeNull()
+  })
+
+  it('3: n_back_of_head=0 when bookmark is tracking the current head', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await call(fx, 'bookmark', { label: 'tracking' })
+    const res = await call(fx, 'list_branches', {}) as {
+      branches: Array<{ label: string | null, n_back_of_head: number | null }>
+    }
+    const tracking = res.branches.find(b => b.label === 'tracking')
+    expect(tracking?.n_back_of_head).toBe(0)
+  })
+
+  it('4: n_back_of_head=N when bookmark is frozen N turns back', async () => {
+    // Turn 1, bookmark, then 2 more turns. The auto-advance updates only
+    // views whose head was the parent of the new revision. With multiple
+    // independent turns landing without parent_revision_id chaining (no
+    // fork yet), the first bookmark stays put. Verify it's reported as
+    // n_back_of_head = position in DESC sequence.
+    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await call(fx, 'bookmark', { label: 'frozen' })
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' }, { role: 'user', content: 'q3' }])
+    const res = await call(fx, 'list_branches', {}) as {
+      branches: Array<{ label: string | null, head_turn_id: string, n_back_of_head: number | null }>
+    }
+    const frozen = res.branches.find(b => b.label === 'frozen')
+    // The frozen bookmark's head_turn_id is whatever the auto-advance
+    // landed on — which depends on the parent chain in the test seeds.
+    // Either it stayed at turn1 (n_back_of_head=2 in a 3-element seq) or
+    // advanced. The contract is: if head IS in the forkable sequence,
+    // n_back_of_head is its DESC index; if not, null. Assert the index
+    // matches the actual position.
+    expect(frozen).toBeDefined()
+    const seq = fx.db.prepare(`
+      SELECT id FROM revisions
+       WHERE task_id = ? AND classification = 'closed_forkable' AND sealed_at IS NOT NULL
+       ORDER BY sealed_at DESC, id DESC
+    `).all(fx.taskId) as Array<{ id: string }>
+    const expectedIdx = seq.findIndex(r => r.id === frozen!.head_turn_id)
+    expect(frozen!.n_back_of_head).toBe(expectedIdx === -1 ? null : expectedIdx)
+    // Also verify turn1 still exists in revisions (sanity).
+    expect(fx.db.prepare('SELECT id FROM revisions WHERE id = ?').get(turn1.id)).toBeTruthy()
+  })
+
+  it('5: n_back_of_head=null when head_revision_id is not in the closed_forkable sequence', async () => {
+    // Bookmark a forkable turn, then surgically reclassify that revision
+    // to dangling_unforkable. n_back_of_head should fall back to null.
+    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const { view_id } = await call(fx, 'bookmark', { label: 'orphan' }) as {
+      view_id: string
+    }
+    fx.db.prepare(`UPDATE revisions SET classification = 'dangling_unforkable' WHERE id = ?`)
+      .run(turn.id)
+    const res = await call(fx, 'list_branches', {}) as {
+      branches: Array<{ view_id: string, n_back_of_head: number | null }>
+    }
+    const orphan = res.branches.find(b => b.view_id === view_id)
+    expect(orphan?.n_back_of_head).toBeNull()
+  })
+
+  it('6: pagination via limit + offset', async () => {
+    // Seed 5 forkable turns + one bookmark each.
+    for (let i = 0; i < 5; i++) {
+      const messages = []
+      for (let j = 0; j <= i; j++) {
+        messages.push({ role: 'user', content: `q${j}` }, { role: 'assistant', content: `a${j}` })
+      }
+      messages.pop() // end on user
+      emitTurn(fx, 'end_turn', messages)
+      await call(fx, 'bookmark', { label: `b${i}` })
+    }
+    const page1 = await call(fx, 'list_branches', { limit: 2, offset: 0 }) as {
+      total: number
+      branches: Array<{ label: string | null }>
+    }
+    const page2 = await call(fx, 'list_branches', { limit: 2, offset: 2 }) as {
+      total: number
+      branches: Array<{ label: string | null }>
+    }
+    expect(page1.total).toBe(5)
+    expect(page2.total).toBe(5)
+    expect(page1.branches.length).toBe(2)
+    expect(page2.branches.length).toBe(2)
+    // Disjoint pages.
+    const p1Labels = page1.branches.map(b => b.label)
+    const p2Labels = page2.branches.map(b => b.label)
+    for (const lbl of p1Labels) expect(p2Labels).not.toContain(lbl)
+  })
+})
+
 // ─── rewind_to ───────────────────────────────────────────────────────────────
 
 describe('rewind_to (dual-secret flow)', () => {

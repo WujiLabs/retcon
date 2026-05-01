@@ -130,6 +130,21 @@ function mostRecentForkableRevision(db: DB, taskId: string): RevisionRow | undef
 }
 
 /**
+ * Return all closed_forkable revision ids for a task in DESC order — the same
+ * sequence `recall` list-mode walks. Used by `list_branches` to compute
+ * `n_back_of_head` (position of a branch_view's head_revision_id in this
+ * sequence) without re-querying per row. O(N) in the task's forkable count.
+ */
+function forkableSequence(db: DB, taskId: string): string[] {
+  const rows = db.prepare(`
+    SELECT id FROM revisions
+     WHERE task_id = ? AND classification = 'closed_forkable' AND sealed_at IS NOT NULL
+     ORDER BY sealed_at DESC, id DESC
+  `).all(taskId) as Array<{ id: string }>
+  return rows.map(r => r.id)
+}
+
+/**
  * Look up the request_received event for a given revision id and return its
  * request body CID. Revisions table doesn't carry this directly (the Revision's
  * asset_cid points at the {request_body_cid, response_body_cid} DictAsset);
@@ -1174,6 +1189,93 @@ export function createMcpToolsWithTokens(
         },
         next_steps: 'Branch view removed. Call `list_branches` to see what remains.',
       }
+    },
+  })
+
+  // ── list_branches ─────────────────────────────────────────────────────────
+  // Returns every branch_view for the current session's task, ordered by
+  // updated_at DESC so the most recently active branch is on top. The `kind`
+  // field distinguishes user bookmarks from auto fork-points (created when
+  // you rewind_to elsewhere). Discrimination is by auto_label prefix:
+  //   - "bookmark@..." → kind='bookmark'   (created via bookmark())
+  //   - "fork@..."     → kind='fork_point' (created via rewind_to())
+  // The `label` field is independent and may be NULL for either kind.
+  //
+  // n_back_of_head is computed against forkableSequence(task_id) — 0 means
+  // the branch is currently tracking head (auto-advance still active), N>0
+  // means it points at the Nth forkable turn back, null means its head is
+  // not in the closed_forkable sequence (rare: head was reclassified).
+  tools.set('list_branches', {
+    description:
+      'USE WHEN: the user asks what bookmarks/branches/saved spots exist, or you need to navigate to one. '
+      + 'Lists every branch_view for this session — both explicit bookmarks (created via `bookmark`) and automatic fork-point views (created when you `rewind_to`). Each entry has a `kind` field. Branches auto-advance: their `head_turn_id` moves forward as new turns close on the same branch, until you fork. '
+      + 'NEXT STEPS: pass a view_id to `recall` to inspect the turn it points at, then `rewind_to` to return there. To remove a branch, call `delete_bookmark`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max entries to return (1-200, default 50).' },
+        offset: { type: 'number', description: 'Pagination offset (default 0).' },
+        verbose: { type: 'boolean', description: 'Include internal fields (auto_label, created_at).' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const parsed = (args ?? {}) as { limit?: number, offset?: number, verbose?: boolean }
+      const limit = Math.min(Math.max(parsed.limit ?? 50, 1), 200)
+      const offset = Math.max(parsed.offset ?? 0, 0)
+      const verbose = parsed.verbose === true
+
+      const sess = loadSession(deps.db, ctx.sessionId)
+      if (!sess) return { error: 'session not found' }
+
+      const total = (deps.db
+        .prepare('SELECT COUNT(*) AS n FROM branch_views WHERE task_id = ?')
+        .get(sess.task_id) as { n: number }).n
+
+      const rows = deps.db.prepare(`
+        SELECT id, label, auto_label, head_revision_id, created_at, updated_at
+          FROM branch_views
+         WHERE task_id = ?
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ? OFFSET ?
+      `).all(sess.task_id, limit, offset) as Array<{
+        id: string
+        label: string | null
+        auto_label: string
+        head_revision_id: string
+        created_at: number
+        updated_at: number
+      }>
+
+      const seq = forkableSequence(deps.db, sess.task_id)
+      const nBackOfHead = (revId: string): number | null => {
+        const idx = seq.indexOf(revId)
+        return idx === -1 ? null : idx
+      }
+
+      const branches = rows.map((r) => {
+        const kind = r.auto_label.startsWith('fork@') ? 'fork_point' : 'bookmark'
+        const lean = {
+          view_id: r.id,
+          kind,
+          label: r.label,
+          head_turn_id: r.head_revision_id,
+          n_back_of_head: nBackOfHead(r.head_revision_id),
+        }
+        if (!verbose) return lean
+        return {
+          ...lean,
+          auto_label: r.auto_label,
+          created_at: r.created_at,
+          updated_at: r.updated_at,
+        }
+      })
+
+      const nextSteps = branches.length === 0
+        ? 'No branches yet. Call `bookmark` to save the current spot.'
+        : 'To inspect a branch\'s turn, call `recall({view_id})`. To rewind there: `recall({view_id})` then `rewind_to({turn_id})` (two-call inspect-then-act). To remove a branch, call `delete_bookmark({id_or_label})`.'
+
+      return { total, branches, next_steps: nextSteps }
     },
   })
 
