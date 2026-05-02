@@ -34,6 +34,31 @@ Both kinds **auto-advance**: when a new turn closes whose parent is a view's cur
 
 The implication: `view_id` resolution is LIVE. `recall({view_id})` returns the current head, not a snapshot. If the AI calls `list_branches` at t=0 and sees view X at turn_5, then a turn closes at t=1, then `recall({view_id: X})` at t=2 returns turn_6 detail, not turn_5. Documented in `bookmark` and `list_branches` tool descriptions.
 
+## The synthetic departure node (v0.5)
+
+Every navigation event in the DAG is a real row. After a successful `rewind_to` or `submit_file`, retcon inserts a **synthetic departure Revision (SR)** — a real `closed_forkable` Revision in the `revisions` table with `stop_reason='rewind_synthetic'` (or `'submit_synthetic'`). The model is one we lifted from Playfilo's `playfilo_node.ts`: a "departure node" is a child of the assistant turn that called the navigation tool, role=`toolResult`, content=the tool's response, dead-end in the lineage but a navigable row.
+
+retcon doesn't control claude's persistence layer the way Playfilo's pi-integration-skill does — but retcon's revision DAG is its own derivation. We synthesize a row that, when reconstructed for upstream replay, produces a coherent message body:
+
+```
+[
+  ...history through R1.request_body.messages,    // unchanged from the real conversation
+  R1.response_body assistant turn (the tool_use), // R1's actual assistant emission
+  R2': synthetic tool_result paired with R1's tool_use_id,
+  R3': synthetic assistant wrap-up text,
+]
+```
+
+The R2' tool_result satisfies Anthropic's tool_use/tool_result pairing constraint, so cascade rewinds (rewinding to a marker) don't trip the API's validators when SR's body becomes the prefix of the next request.
+
+Three properties keep this clean:
+
+- **SR is a real row.** Same table as everything else. `rewind_to`, `dump_to_file`, `recall` all use the same query patterns they use for real Revisions. No special cases. `recall` discriminates via the existing `stop_reason` column — `kind: 'rewind_marker'` ↔ `stop_reason='rewind_synthetic'`.
+- **SR is created only on success.** When the spliced /v1/messages succeeds (status 2xx, stop_reason=end_turn), retcon emits `fork.forked`. A projector (`RewindMarkerV1Projector`) reads SR-construction metadata that the MCP handler stashed in the TOBE pending file (synthetic_revision_id, parent_revision_id=R1.id, R1's tool_use_id, synthetic R2'/R3' text), uses `buildSyntheticAsset` to compose the body and store its blobs, then INSERTs the SR row. Failure path (4xx upstream, non-end_turn stop_reason, or buildSyntheticAsset returning null) means no SR — the existing `R_real` ("rewind failed" assistant turn) takes its place naturally and the audit log gets `fork.synthesis_failed`.
+- **SR's content is decoupled from claude's actual tool_result bytes.** Claude embeds the loud-failure scaffolding (`"RETCON ERROR: ..."`) as the actual tool_result bytes for the rewind_to/submit_file call. On the success path that body is discarded by the splice. SR's R2'/R3' content is retcon-generated narrative ("Rewind initiated. Target: rev_abcd1234. Synthetic message: ..."), purely for navigation/display — no byte-matching with claude's traffic.
+
+The handoff between MCP-call time (when synthetic content is composed) and response-completed time (when fork.forked fires) goes through the TOBE pending file's optional `synthetic` field. Pre-v0.5 daemons that wrote TOBE without `synthetic` keep working: proxy-handler logs a warning and skips fork.forked emit; the rewind itself still applies.
+
 ## The rewind_to trick: why the rewind doesn't replace the in-flight turn
 
 `rewind_to` gets called inside an in-flight `tool_use` round-trip. Anthropic's protocol forbids replying to a `tool_use` with anything other than a `tool_result`. So we acknowledge `rewind_to` with `{status: "scheduled", ...}` as its tool_result, let claude finish that turn cleanly, and apply the rewind on the *next* LLM call.
@@ -168,9 +193,10 @@ The deepest insight: **retcon depends on the harness being open. The harness's o
 
 Code lives under `src/`. The four files that implement the model above are:
 
-- [`proxy-handler.ts`](./src/proxy-handler.ts) — the body rewrites (TOBE swap + persistent-fork splice).
+- [`proxy-handler.ts`](./src/proxy-handler.ts) — the body rewrites (TOBE swap + persistent-fork splice + fork.forked emission on the success path).
 - [`hook-handler.ts`](./src/hook-handler.ts) — the hook contract (rebind, clear/compact release).
-- [`mcp-tools.ts`](./src/mcp-tools.ts) — the rewind tools.
-- [`tobe.ts`](./src/tobe.ts) — the one-shot rewind baton.
+- [`mcp-tools.ts`](./src/mcp-tools.ts) — the rewind tools (recall/rewind_to/bookmark/list_branches/delete_bookmark/dump_to_file/submit_file).
+- [`tobe.ts`](./src/tobe.ts) — the one-shot rewind baton (now carries SR-construction metadata).
+- [`rewind-marker-v1.ts`](./src/rewind-marker-v1.ts) — `buildSyntheticAsset` (composes R1.history + R2' + R3' synthetic body) and `RewindMarkerV1Projector` (INSERTs SR rows from `fork.forked`).
 
 Everything else is plumbing. `ls src/` and the header comment of each file is a faster tour than any component map could be.

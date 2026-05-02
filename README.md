@@ -48,7 +48,7 @@ This is destructive of the event log (the source-of-truth append-only history) f
 
 Available to claude inside the session via the MCP server retcon auto-registers as `mcp__retcon__*`:
 
-- `recall` — list recent forkable turns (no args, also surfaces `rewind_events` so you can see "a rewind happened here") OR inspect one (`turn_back_n: N`, `turn_id: "..."`, or `view_id: "..."`). `surrounding: N` (0-10) on inspect adds N forkable turns on each side. Detail mode also lists `branch_views_at_turn` — every saved spot pointing at the inspected turn.
+- `recall` — list recent forkable turns OR inspect one (`turn_back_n: N`, `turn_id: "..."`, or `view_id: "..."`). Each entry has a `kind` field: `"turn"` (real /v1/messages assistant turn), `"rewind_marker"` (a synthetic departure row marking a successful prior rewind), or `"submit_marker"` (same for `submit_file`). Markers are first-class navigable points — you can rewind back to them or dump them just like real turns. `surrounding: N` (0-10) on inspect adds N forkable turns on each side. Detail mode also lists `branch_views_at_turn` — every saved spot pointing at the inspected turn.
 - `rewind_to` — roll the conversation back to a chosen turn and replace the next message. **Two-step call**: the first call returns rules + a single-use `confirm_clean`/`confirm_meta` token pair; the AI classifies its own message (does it stand alone, or does it contain a meta-reference to cut-off content?) and re-calls with the matching token. Catches the AI before it sends a `"redo your last answer"`-style message that would confuse the post-rewind context.
 - `bookmark` — pin the latest forkable turn with an optional human label. **Behaves like a git branch, not a git tag**: its head auto-advances as new turns close on this branch. When you fork via `rewind_to`, the bookmark stays on the original branch and a new auto fork-point view is created at the fork point.
 - `list_branches` — return every saved navigation point in this session. Both explicit bookmarks AND the auto fork-point views created by `rewind_to`. Each entry has a `kind` field (`"bookmark"` or `"fork_point"`) and `n_back_of_head` (0 = currently tracking head, N>0 = N forkable turns back, null = head not in the closed_forkable sequence). This is the only way to see and navigate to branches you've forked away from.
@@ -69,7 +69,13 @@ Available to claude inside the session via the MCP server retcon auto-registers 
 | Save a spot to return to later | `bookmark` |
 | Remove a saved spot or stale fork-point view | `delete_bookmark` |
 
-Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets.
+Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets — including the synthetic departure rows (SR rows) that materialize after a successful `rewind_to` or `submit_file`.
+
+### Synthetic departure rows (rewind/submit markers)
+
+After a successful `rewind_to` (or `submit_file`), retcon inserts a real row into the revisions table marking where that navigation happened. It's a valid `closed_forkable` Revision — `recall` shows it inline with `kind: "rewind_marker"` (or `"submit_marker"`), and `rewind_to({turn_id: <SR.id>})` and `dump_to_file({turn_id: <SR.id>})` work the same as on any other turn. Cascade rewinds (rewinding to a marker) just produce another marker. The pre-rewind branch's tail and the rewind moment itself are both first-class navigable points; no special navigation surface needed.
+
+Behind the scenes: when the spliced /v1/messages succeeds (status 2xx, stop_reason=end_turn), retcon emits `fork.forked`. A projector reads the SR-construction metadata that the MCP handler stashed in the TOBE pending file, builds a synthetic body of `[history through R1, R1's assistant turn, synthetic tool_result paired with R1's tool_use_id, synthetic assistant wrap-up]`, and INSERTs the SR row pointing at that body. R1 is the assistant turn that called `rewind_to`/`submit_file`. The synthetic body satisfies Anthropic's tool_use/tool_result pairing constraint, so cascade rewinds don't trip the API's validators.
 
 ### What "two-step" means for `rewind_to`
 
