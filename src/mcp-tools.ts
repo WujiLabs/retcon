@@ -608,6 +608,11 @@ function submitRulesText(tokens: ConfirmTokenPair): string {
     '  - Each line must be a valid JSON object with `role` and `content`.',
     '  - The LAST line\'s role MUST be "assistant". Your `message` arg gets appended as a `{role: "user", content: <message>}` line; if the dump\'s tail is already a user line, the appended user would create back-to-back user turns and the receiving AI would see a malformed conversation.',
     '',
+    'COMMON WORKFLOWS:',
+    '  1. CLEAN REDO of recent turns: skip submit_file. Use rewind_to alone — single-point rewinds are simpler and cheaper.',
+    '  2. FORGET THE PINK ELEPHANT (multi-turn contamination): when something sensitive, biasing, or off-topic was spread across several turns and a single rewind point can\'t reach it. dump_to_file → grep/Edit the JSONL to remove the lines or rewrite them → submit_file. The receiving AI sees a sanitized history with no awareness of the removed content.',
+    '  3. FACTUAL CORRECTION in earlier content: dump → Edit the specific message line(s) to fix the error → submit_file with a `message` that signals the correction (e.g. "I corrected the budget from $500 to $5,000 in the earlier turn — please redo the cost analysis.").',
+    '',
     'PARALLEL TOOLS — DO NOT call submit_file alongside other tools in the same assistant turn. The submitted history replaces the next /v1/messages, so any sibling tool_use calls (Read, Bash, Edit, etc.) lose their results before the receiving AI ever sees them. Call submit_file alone, finish your other work first, OR queue the substantive change in the `message` arg instead.',
     '',
     'So `message` must:',
@@ -753,11 +758,10 @@ export function createMcpToolsWithTokens(
   // turn_back_n = inspect Nth turn back. turn_id = inspect specific turn.
   tools.set('recall', {
     description:
-      'USE WHEN: the user wants to revisit, rewind, recall, or pull up a past moment in this conversation. ALSO use when YOU recognize you have gone off track and want to back up. '
-      + 'Returns recent forkable turns (closed_forkable Revisions) with content previews and turn ids you can pass to `rewind_to`. '
-      + 'Each turn has a `kind`: "turn" = a real /v1/messages assistant turn; "rewind_marker" = a synthetic departure row marking where a previous rewind succeeded; "submit_marker" = the same for submit_file. Markers are first-class navigable points — `rewind_to({turn_id: <marker>.turn_id})` and `dump_to_file({turn_id: <marker>.turn_id})` both work. '
-      + 'No args: list recent turns. `turn_back_n`: inspect the Nth turn back. `turn_id`: inspect a specific turn. `view_id`: inspect the turn a branch_view (from `list_branches`) points at. `surrounding: N` (0-10): include N forkable turns on each side of the inspected turn. '
-      + 'NEXT STEPS: to rewind to a turn, call `rewind_to`. To save a spot, call `bookmark`. To list saved spots, call `list_branches`.',
+      'USE WHEN: the user wants to revisit, rewind, recall, or pull up a past moment, OR you recognize you have gone off track and want to back up. '
+      + 'Returns recent forkable turns with content previews and turn ids you can pass to `rewind_to`. Each entry has a `kind`: "turn" (real assistant turn), "rewind_marker"/"submit_marker" (synthetic markers from prior rewinds/submits — navigable like real turns). '
+      + 'Args: no args = list. `turn_back_n` / `turn_id` / `view_id` = inspect one. `surrounding: N` (0-10) widens the window when inspecting. '
+      + 'NEXT STEPS: `rewind_to` to jump back, `bookmark` to save a spot, `list_branches` to see saved ones.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1053,17 +1057,17 @@ export function createMcpToolsWithTokens(
   // Replaces fork_back. Adds opaque dual-secret + narrow regex guardrail.
   tools.set('rewind_to', {
     description:
-      'USE WHEN: the user explicitly asks to rewind, restart, or revise an earlier turn. ALSO use when YOU recognize the conversation went off track and you want to back up. '
-      + 'Walks back N forkable turns and replaces the conversation tail with your `message` arg. The next /v1/messages call will arrive with the rewound history + your `message` as the next user-role turn — and the AI handling that call has NO memory of cut-off turns. '
-      + 'TWO-STEP CALL: First call WITHOUT a `confirm` token returns the rules + a single-use token pair. Pick the token matching your message and re-call. '
-      + 'NEXT STEPS: after a successful rewind_to, WAIT for the next /v1/messages — that is where the rewind lands. Do not call further tools.',
+      'USE WHEN: the user asks to rewind/restart/revise an earlier turn, OR you recognize the conversation went off track. For "forget X spread across multiple turns" use `dump_to_file` + edit + `submit_file` instead — rewind_to is single-point only. '
+      + 'Walks back N forkable turns and replaces the conversation tail with your `message` arg. The AI handling the next /v1/messages has NO memory of cut-off turns. '
+      + 'TWO-STEP: first call without `confirm` returns rules + tokens; second call confirms. '
+      + 'NEXT STEPS: WAIT for the next /v1/messages — the rewind lands there. Do not call further tools.',
     inputSchema: {
       type: 'object',
       properties: {
         turn_back_n: { type: 'number', description: 'How many forkable turns back to go (≥1). Mutually exclusive with turn_id.' },
         turn_id: { type: 'string', description: 'Exact turn id (from `recall`) to rewind to. Mutually exclusive with turn_back_n.' },
         message: { type: 'string', description: 'New user message to deliver at the rewound point. Must stand alone (no meta-references to cut-off content).' },
-        confirm: { type: 'string', description: 'Token from this tool\'s prior rules-return call. Pick the clean_token if your message stands alone; pick the meta_token if you spotted a meta-reference (we will reject and let you revise).' },
+        confirm: { type: 'string', description: 'Single-use token issued by this tool\'s first call. The rules-return response names the two choices.' },
         allow_meta_refs: { type: 'boolean', description: 'Override the narrow regex backstop. Use only when your message intentionally references content that is visible in the rewound history.' },
       },
       required: ['message'],
@@ -1273,9 +1277,9 @@ export function createMcpToolsWithTokens(
   // Renamed from fork_bookmark. Same semantics, intent-aligned name.
   tools.set('bookmark', {
     description:
-      'USE WHEN: the user wants to save the current spot in the conversation so they can return to it later. '
-      + 'Bookmarks the most recent forkable turn with an optional human label. The bookmark behaves like a git branch (not a tag): its head auto-advances as new turns close on this branch, until you fork via `rewind_to` (which leaves this bookmark on the original branch and creates a new auto fork-point view at the fork point). The bookmark survives /clear, /compact, and resume — call `list_branches` later to find it. '
-      + 'NEXT STEPS: to see saved spots, call `list_branches`. To revisit one: `recall({view_id})` then `rewind_to({turn_id})`. To remove a bookmark, call `delete_bookmark`.',
+      'USE WHEN: the user wants to save the current spot to return to later. '
+      + 'Bookmarks the most recent forkable turn with an optional label. Behaves like a git branch (not a tag): the head auto-advances as new turns close, until you fork via `rewind_to`. Survives /clear, /compact, and resume. '
+      + 'NEXT STEPS: `list_branches` to see saved spots; `recall({view_id})` then `rewind_to({turn_id})` to revisit; `delete_bookmark` to remove.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1351,9 +1355,9 @@ export function createMcpToolsWithTokens(
   // Both are by design — if you want a deletable bookmark, give it a label.
   tools.set('delete_bookmark', {
     description:
-      'USE WHEN: the user wants to remove a saved spot they previously bookmarked with a label. '
-      + 'Deletes the single bookmark with the given label in this session. Errors if no bookmark has that label, or if multiple bookmarks share it. NOTE: unlabeled bookmarks and auto fork-point views (created by rewind_to) cannot be deleted via this tool — they are reaped on session cleanup. '
-      + 'NEXT STEPS: call `list_branches` to see what remains.',
+      'USE WHEN: the user wants to remove a labeled bookmark. '
+      + 'Deletes the single bookmark with the given label in this session. Errors on no-match or label collision. Unlabeled bookmarks and auto fork-point views can\'t be deleted here — they\'re reaped on session cleanup. '
+      + 'NEXT STEPS: `list_branches` to see what remains.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1438,9 +1442,9 @@ export function createMcpToolsWithTokens(
   // not in the closed_forkable sequence (rare: head was reclassified).
   tools.set('list_branches', {
     description:
-      'USE WHEN: the user asks what bookmarks/branches/saved spots exist, or you need to navigate to one. '
-      + 'Lists every branch_view for this session — both explicit bookmarks (created via `bookmark`) and automatic fork-point views (created when you `rewind_to`). Each entry has a `kind` field. Branches auto-advance: their `head_turn_id` moves forward as new turns close on the same branch, until you fork. '
-      + 'NEXT STEPS: pass a view_id to `recall` to inspect the turn it points at, then `rewind_to` to return there. To remove a branch, call `delete_bookmark`.',
+      'USE WHEN: the user asks what bookmarks/branches exist, or you need to navigate to one. '
+      + 'Lists every branch_view in this session — explicit bookmarks plus auto fork-point views from `rewind_to`. Each has a `kind` field. Heads auto-advance as new turns close, until you fork. '
+      + 'NEXT STEPS: `recall({view_id})` to inspect, then `rewind_to({turn_id})` to return. `delete_bookmark` to remove.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1519,10 +1523,10 @@ export function createMcpToolsWithTokens(
   // claude's outgoing body at replay time and aren't frozen here.
   tools.set('dump_to_file', {
     description:
-      'USE WHEN: you want to inspect or edit the conversation history before continuing. '
-      + 'Writes the conversation through a target turn\'s assistant response to a JSONL file (one Anthropic message per line). The file lives at ~/.retcon/dumps/<id>.jsonl, which retcon pre-allowed for Read/Edit/Write/Glob/Grep, so you can use those tools without prompting the user. '
-      + 'No args = dump current state. `turn_id` or `turn_back_n` = dump through that turn. '
-      + 'NEXT STEPS: use `Read` to view the dump, `Edit` to modify any message, then call `submit_file` with the path + a new user instruction to apply.',
+      'USE WHEN: you want to inspect or edit the conversation history before continuing — especially to forget/rewrite content spread across multiple turns (the "pink elephant" case rewind_to can\'t handle). '
+      + 'Writes the conversation through a target turn to ~/.retcon/dumps/<id>.jsonl (one Anthropic message per line). retcon pre-allowed Read/Edit/Write/Glob/Grep on that path, so no permission prompts. '
+      + 'Args: no args = dump current state; `turn_id`/`turn_back_n` = dump through that turn. '
+      + 'NEXT STEPS: `Read` to view, `Edit` to modify lines, then `submit_file` with the path + a new user instruction.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1714,16 +1718,16 @@ export function createMcpToolsWithTokens(
   // realpath check, JSONL parse-per-line, last-line-must-be-assistant.
   tools.set('submit_file', {
     description:
-      'USE WHEN: you have edited a dump file (or want to apply one as-is) and need to make those changes the conversation history going forward. '
-      + 'Reads a JSONL dump from ~/.retcon/dumps/, validates it (each line a message, last line assistant-role), appends your `message` as a new user turn, and queues it as the next /v1/messages. '
-      + 'TWO-STEP CALL: first call WITHOUT a `confirm` token returns rules + a single-use token pair. Pick the token matching your message and re-call. '
-      + 'NEXT STEPS: after a successful submit, WAIT for the next /v1/messages — the result lands there. Do not call further tools.',
+      'USE WHEN: you need to apply an edited (or as-is) dump as the conversation history going forward. Pairs with `dump_to_file` for "forget the pink elephant" — strip or rewrite multi-turn content that no single rewind_to point can reach. '
+      + 'Reads a JSONL dump from ~/.retcon/dumps/, validates each line, appends your `message` as a new user turn, queues as the next /v1/messages. '
+      + 'TWO-STEP: first call without `confirm` returns rules + tokens; second call confirms. '
+      + 'NEXT STEPS: WAIT for the next /v1/messages — the result lands there. Do not call further tools.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Path to the JSONL dump (must resolve inside ~/.retcon/dumps/).' },
         message: { type: 'string', description: 'New user message to deliver after the dumped history. Must stand alone (no meta-references).' },
-        confirm: { type: 'string', description: 'Token from this tool\'s prior rules-return call. Pick clean if message stands alone, meta if you spotted a meta-reference.' },
+        confirm: { type: 'string', description: 'Single-use token issued by this tool\'s first call. The rules-return response names the two choices.' },
         allow_meta_refs: { type: 'boolean', description: 'Override the narrow regex backstop. Use only when your message intentionally references content visible in the dumped history.' },
       },
       required: ['path', 'message'],
