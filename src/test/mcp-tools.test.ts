@@ -422,89 +422,93 @@ describe('recall (Phase 3 extensions)', () => {
     expect(res.surrounding_turns.every(t => t.relative_to_target < 0)).toBe(true)
   })
 
-  it('5: list-mode-rewind_events-populated — fork.back_requested events surface inline (real rewind_to flow)', async () => {
-    // Use the ACTUAL rewind_to flow rather than a synthetic event, so this
-    // test verifies the production payload contract — including that the
-    // emitter writes `head_revision_id` so recall can populate from_turn_id.
-    // (Initial v0.4.4 implementation had this field empty; caught in /review.)
-    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    const turn2 = emitTurn(fx, 'end_turn', [
-      { role: 'user', content: 'q1' },
-      { role: 'assistant', content: 'a1' },
-      { role: 'user', content: 'q2' },
-    ])
-    // Drive rewind_to via the two-step token flow.
-    await rewindTwoStep(fx, { turn_back_n: 1, message: 'rewind here' })
-    const res = await call(fx, 'recall', {}) as {
-      rewind_events: Array<{ from_turn_id: string | null, to_turn_id: string, view_id: string }>
-    }
-    expect(res.rewind_events.length).toBe(1)
-    // turn_back_n=1 from head=turn2 lands at turn1 (the only forkable older
-    // than head). from_turn_id is the head at the moment of rewind = turn2.
-    expect(res.rewind_events[0]!.to_turn_id).toBe(turn1.id)
-    expect(res.rewind_events[0]!.from_turn_id).toBe(turn2.id)
-    expect(typeof res.rewind_events[0]!.view_id).toBe('string')
+  it('5 (v0.5): rewind_events* fields are NOT in list output — replaced by SR rows with kind=rewind_marker', async () => {
+    // Regression guard: a future change re-introducing rewind_events would
+    // duplicate what SR rows already surface and re-introduce the
+    // fork.back_requested coupling we removed in v0.5.0.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    const res = await call(fx, 'recall', {}) as Record<string, unknown>
+    expect(res.rewind_events).toBeUndefined()
+    expect(res.rewind_events_total).toBeUndefined()
+    expect(res.rewind_events_truncated).toBeUndefined()
   })
 
-  it('5b: list-mode-rewind_events surfaces from_turn_id=null for legacy events without head_revision_id', async () => {
-    // Simulate a pre-v0.4.4 event (lacks head_revision_id field) to verify
-    // graceful degradation. New code surfaces null, not "" — explicit absence.
-    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    fx.producer.emit(
-      'fork.back_requested',
-      {
-        target_view_id: 'view_legacy',
-        source_view_id: 'src',
-        fork_point_revision_id: turn1.id,
-        new_message_cid: 'cid',
-        task_id: fx.taskId,
-      },
-      fx.sessionId,
-    )
+  it('5b (v0.5): list mode surfaces SR rows with kind=rewind_marker', async () => {
+    // Seed a real assistant turn to act as R1, then inject an SR row directly
+    // (mimicking what RewindMarkerV1Projector would do on fork.forked).
+    // SR.sealed_at = 1 keeps it as the oldest entry so the second emitTurn
+    // remains the head (which gets excluded from the list).
+    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head, excluded from list
+    fx.db.prepare(`
+      INSERT INTO revisions
+        (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, ?, ?, 'closed_forkable', 'rewind_synthetic', ?, ?)
+    `).run('rev-sr-1', fx.taskId, 'cid-sr-1', r1.id, 1, 1)
+
     const res = await call(fx, 'recall', {}) as {
-      rewind_events: Array<{ from_turn_id: string | null, view_id: string }>
+      turns: Array<{ turn_id: string, kind: string }>
     }
-    const legacy = res.rewind_events.find(e => e.view_id === 'view_legacy')
-    expect(legacy).toBeDefined()
-    expect(legacy!.from_turn_id).toBeNull()
+    const sr = res.turns.find(t => t.turn_id === 'rev-sr-1')
+    expect(sr).toBeDefined()
+    expect(sr!.kind).toBe('rewind_marker')
+    // Real turns surface with kind='turn'.
+    const real = res.turns.find(t => t.turn_id === r1.id)
+    expect(real?.kind).toBe('turn')
   })
 
-  it('6: list-mode-no-rewinds — empty rewind_events array + total=0 + not truncated', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+  it('5c (v0.5): list mode discriminates submit_marker from rewind_marker', async () => {
+    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    fx.db.prepare(`
+      INSERT INTO revisions
+        (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, ?, ?, 'closed_forkable', 'submit_synthetic', ?, ?)
+    `).run('rev-sr-submit', fx.taskId, 'cid-x', r1.id, 1, 1)
+
     const res = await call(fx, 'recall', {}) as {
-      rewind_events: unknown[]
-      rewind_events_total: number
-      rewind_events_truncated: boolean
+      turns: Array<{ turn_id: string, kind: string }>
     }
-    expect(res.rewind_events).toEqual([])
-    expect(res.rewind_events_total).toBe(0)
-    expect(res.rewind_events_truncated).toBe(false)
+    const submitMarker = res.turns.find(t => t.turn_id === 'rev-sr-submit')
+    expect(submitMarker?.kind).toBe('submit_marker')
   })
 
-  it('6b: list-mode rewind_events_truncated=true when more than 50 events exist', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    // Seed 51 synthetic fork.back_requested events.
-    for (let i = 0; i < 51; i++) {
-      fx.producer.emit(
-        'fork.back_requested',
-        {
-          target_view_id: `view_${i}`,
-          source_view_id: 'src',
-          fork_point_revision_id: `rev_${i}`,
-          new_message_cid: 'cid',
-          task_id: fx.taskId,
-        },
-        fx.sessionId,
-      )
+  it('5d (v0.5): detail mode on an SR turn includes kind=rewind_marker', async () => {
+    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    fx.db.prepare(`
+      INSERT INTO revisions
+        (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, ?, ?, 'closed_forkable', 'rewind_synthetic', ?, ?)
+    `).run('rev-sr-detail', fx.taskId, 'cid-d', r1.id, Date.now(), Date.now())
+
+    const res = await call(fx, 'recall', { turn_id: 'rev-sr-detail' }) as {
+      turn: { turn_id: string, kind: string, stop_reason: string | null }
     }
-    const res = await call(fx, 'recall', {}) as {
-      rewind_events: unknown[]
-      rewind_events_total: number
-      rewind_events_truncated: boolean
+    expect(res.turn.kind).toBe('rewind_marker')
+    expect(res.turn.stop_reason).toBe('rewind_synthetic')
+  })
+
+  it('5e (v0.5): surrounding window entries carry kind discriminator', async () => {
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    const t2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    // Inject an SR sibling for t2.
+    const t2Row = fx.db.prepare('SELECT sealed_at FROM revisions WHERE id = ?').get(t2.id) as { sealed_at: number }
+    fx.db.prepare(`
+      INSERT INTO revisions
+        (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, ?, ?, 'closed_forkable', 'rewind_synthetic', ?, ?)
+    `).run('rev-sr-mid', fx.taskId, 'cid-m', t1.id, t2Row.sealed_at + 1, Date.now())
+
+    const res = await call(fx, 'recall', { turn_id: t3.id, surrounding: 3 }) as {
+      surrounding_turns: Array<{ turn_id: string, kind: string }>
     }
-    expect(res.rewind_events.length).toBe(50)
-    expect(res.rewind_events_total).toBe(51)
-    expect(res.rewind_events_truncated).toBe(true)
+    const sr = res.surrounding_turns.find(t => t.turn_id === 'rev-sr-mid')
+    expect(sr?.kind).toBe('rewind_marker')
+    const real = res.surrounding_turns.find(t => t.turn_id === t1.id)
+    expect(real?.kind).toBe('turn')
   })
 
   it('7: detail-mode-branch_views_at_turn — surfaces every view pointing at this turn', async () => {

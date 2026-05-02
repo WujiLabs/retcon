@@ -139,6 +139,18 @@ function mostRecentForkableRevision(db: DB, taskId: string): RevisionRow | undef
 }
 
 /**
+ * Map a Revision's stop_reason to recall's `kind` discriminator. Real turns
+ * surface as 'turn'; SR rows (Phase 2's synthetic departure Revisions) carry
+ * stop_reason='rewind_synthetic' or 'submit_synthetic' so we can discriminate
+ * them cheaply via the column rather than joining the events table.
+ */
+function turnKindFor(stopReason: string | null): 'turn' | 'rewind_marker' | 'submit_marker' {
+  if (stopReason === 'rewind_synthetic') return 'rewind_marker'
+  if (stopReason === 'submit_synthetic') return 'submit_marker'
+  return 'turn'
+}
+
+/**
  * Return all closed_forkable revision ids for a task in DESC order — the same
  * sequence `recall` list-mode walks. Used by `list_branches` to compute
  * `n_back_of_head` (position of a branch_view's head_revision_id in this
@@ -804,7 +816,8 @@ export function createMcpToolsWithTokens(
     description:
       'USE WHEN: the user wants to revisit, rewind, recall, or pull up a past moment in this conversation. ALSO use when YOU recognize you have gone off track and want to back up. '
       + 'Returns recent forkable turns (closed_forkable Revisions) with content previews and turn ids you can pass to `rewind_to`. '
-      + 'No args: list recent turns plus a rewind_events array showing where you have rewound. `turn_back_n`: inspect the Nth turn back. `turn_id`: inspect a specific turn. `view_id`: inspect the turn a branch_view (from `list_branches`) points at. `surrounding: N` (0-10): include N forkable turns on each side of the inspected turn. '
+      + 'Each turn has a `kind`: "turn" = a real /v1/messages assistant turn; "rewind_marker" = a synthetic departure row marking where a previous rewind succeeded; "submit_marker" = the same for submit_file. Markers are first-class navigable points — `rewind_to({turn_id: <marker>.turn_id})` and `dump_to_file({turn_id: <marker>.turn_id})` both work. '
+      + 'No args: list recent turns. `turn_back_n`: inspect the Nth turn back. `turn_id`: inspect a specific turn. `view_id`: inspect the turn a branch_view (from `list_branches`) points at. `surrounding: N` (0-10): include N forkable turns on each side of the inspected turn. '
       + 'NEXT STEPS: to rewind to a turn, call `rewind_to`. To save a spot, call `bookmark`. To list saved spots, call `list_branches`.',
     inputSchema: {
       type: 'object',
@@ -904,6 +917,7 @@ export function createMcpToolsWithTokens(
         const preview = await turnPreview(deps, target.id)
         const lean = {
           turn_id: target.id,
+          kind: turnKindFor(target.stop_reason),
           preview,
           stop_reason: target.stop_reason,
           sealed_at: target.sealed_at,
@@ -935,6 +949,7 @@ export function createMcpToolsWithTokens(
           : 0
         let surroundingTurns: Array<{
           turn_id: string
+          kind: 'turn' | 'rewind_marker' | 'submit_marker'
           stop_reason: string | null
           sealed_at: number | null
           relative_to_target: number // negative = older, positive = newer
@@ -975,12 +990,14 @@ export function createMcpToolsWithTokens(
           surroundingTurns = [
             ...before.map((r, i) => ({
               turn_id: r.id,
+              kind: turnKindFor(r.stop_reason),
               stop_reason: r.stop_reason,
               sealed_at: r.sealed_at,
               relative_to_target: -(i + 1),
             })),
             ...after.map((r, i) => ({
               turn_id: r.id,
+              kind: turnKindFor(r.stop_reason),
               stop_reason: r.stop_reason,
               sealed_at: r.sealed_at,
               relative_to_target: i + 1,
@@ -1065,6 +1082,7 @@ export function createMcpToolsWithTokens(
         const preview = await turnPreview(deps, r.id)
         const lean = {
           turn_id: r.id,
+          kind: turnKindFor(r.stop_reason),
           n_back: offset + idx + 1, // matches rewind_to(turn_back_n=N)
           preview,
           stop_reason: r.stop_reason,
@@ -1076,63 +1094,17 @@ export function createMcpToolsWithTokens(
 
       const nextSteps = turns.length === 0
         ? 'No rewindable turns yet. The current state is `current_head_turn_id`. After more turns close, call `recall` again.'
-        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
+        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). Entries with `kind: "rewind_marker"` or `"submit_marker"` are synthetic departure points from earlier rewinds/submits — you can rewind back to them or dump them just like real turns. To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
 
-      // rewind_events: prior fork.back_requested events for THIS session,
-      // surfaced inline so the AI can see "a rewind happened here" between
-      // turns. Bounded LIMIT 50 to keep the response small on long sessions.
-      // We expose `rewind_events_total` and `rewind_events_truncated` so the
-      // AI knows when older rewinds are out of view (without those, a
-      // session with 73 rewinds silently looks like 50).
-      const REWIND_EVENT_LIMIT = 50
-      const rewindEventsTotal = (deps.db.prepare(`
-        SELECT COUNT(*) AS n FROM events
-         WHERE session_id = ? AND topic = 'fork.back_requested'
-      `).get(ctx.sessionId) as { n: number }).n
-      const rewindEventRows = deps.db.prepare(`
-        SELECT event_id, payload, created_at FROM events
-         WHERE session_id = ? AND topic = 'fork.back_requested'
-         ORDER BY event_id DESC
-         LIMIT ?
-      `).all(ctx.sessionId, REWIND_EVENT_LIMIT) as Array<{
-        event_id: string
-        payload: string
-        created_at: number
-      }>
-      const rewindEvents: Array<{
-        at: number
-        from_turn_id: string | null
-        to_turn_id: string
-        view_id: string
-      }> = []
-      for (const row of rewindEventRows) {
-        try {
-          const p = JSON.parse(row.payload) as {
-            fork_point_revision_id?: string
-            target_view_id?: string
-            head_revision_id?: string
-          }
-          if (!p.fork_point_revision_id || !p.target_view_id) continue
-          // head_revision_id is emitted by rewind_to / submit_file in v0.4.4+;
-          // pre-v0.4.4 events stored before this release have it absent. Surface
-          // as null (not '') to make the absence explicit to the AI consumer.
-          rewindEvents.push({
-            at: row.created_at,
-            from_turn_id: typeof p.head_revision_id === 'string' ? p.head_revision_id : null,
-            to_turn_id: p.fork_point_revision_id,
-            view_id: p.target_view_id,
-          })
-        }
-        catch { /* malformed event payload — skip */ }
-      }
+      // rewind_events fields (rewind_events / rewind_events_total /
+      // rewind_events_truncated) were dropped in v0.5.0. They've been replaced
+      // by SR (synthetic departure Revision) rows visible inline in the
+      // turns array with `kind: 'rewind_marker'` or 'submit_marker'.
 
       return {
         total,
         turns,
         current_head_turn_id: headId,
-        rewind_events: rewindEvents,
-        rewind_events_total: rewindEventsTotal,
-        rewind_events_truncated: rewindEventsTotal > rewindEvents.length,
         next_steps: nextSteps,
       }
     },
