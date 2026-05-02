@@ -2094,6 +2094,301 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
   })
 })
 
+// ─── Phase 1 (v0.5.0): SR-construction TOBE + parallel-tool guard ────────────
+
+/**
+ * Emit a request_received + response_completed pair where the response body
+ * is real JSON content stored as a content-addressed blob. Used by parallel-
+ * tool-guard tests so loadResponseToolUses can actually inspect the body.
+ */
+async function emitTurnWithRealResponse(
+  fx: TestFixture,
+  stopReason: string,
+  reqMessages: unknown[],
+  respContent: Array<{ type: string, id?: string, name?: string, text?: string, input?: unknown }>,
+): Promise<Event> {
+  const { blobRefFromBytes } = await import('../body-blob.js')
+
+  const reqBytes = Buffer.from(JSON.stringify({ messages: reqMessages }), 'utf8')
+  const reqCid = `bafy-req-${Math.random().toString(36).slice(2)}`
+  const req = fx.producer.emit(
+    'proxy.request_received',
+    { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: reqCid },
+    fx.sessionId,
+    [{ cid: reqCid, bytes: reqBytes }],
+  )
+
+  const respBytes = Buffer.from(
+    JSON.stringify({ role: 'assistant', stop_reason: stopReason, content: respContent }),
+    'utf8',
+  )
+  const respBlob = await blobRefFromBytes(respBytes)
+  fx.producer.emit(
+    'proxy.response_completed',
+    {
+      request_event_id: req.id,
+      status: 200,
+      headers_cid: 'h',
+      body_cid: respBlob.cid,
+      stop_reason: stopReason,
+      asset_cid: 'bafy-asset',
+    },
+    fx.sessionId,
+    [respBlob.ref],
+  )
+  return req
+}
+
+describe('rewind_to: parallel-tool guard (Phase 1)', () => {
+  let fx: TestFixture
+  beforeEach(() => {
+    fx = fixture()
+  })
+  afterEach(() => fx.cleanup())
+
+  it('first-call rules text contains the parallel-tool warning', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const res = await call(fx, 'rewind_to', { turn_back_n: 1, message: 'X' }) as {
+      status: string
+      rules: string
+    }
+    expect(res.status).toBe('rules_returned')
+    expect(res.rules).toMatch(/PARALLEL TOOLS/i)
+    expect(res.rules).toMatch(/lose their results/i)
+  })
+
+  it('rejects when R1 has parallel tool_uses (rewind_to + read_file)', async () => {
+    // Seed two settled turns so turn_back_n=1 has a target.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    // R1 (mostRecentRevision) emits BOTH rewind_to and read_file.
+    await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q3' }], [
+      { type: 'tool_use', id: 'toolu_rewind', name: 'rewind_to', input: { turn_back_n: 1, message: 'X' } },
+      { type: 'tool_use', id: 'toolu_read', name: 'read_file', input: { path: '/etc/foo' } },
+    ])
+    const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'switch to plan B' }) as {
+      error?: string
+      status?: string
+    }
+    expect(res.error).toMatch(/parallel/i)
+    expect(res.error).toMatch(/read_file/)
+    // No TOBE write on rejection.
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+  })
+
+  it('accepts when R1 has only the rewind_to tool_use', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q3' }], [
+      { type: 'tool_use', id: 'toolu_rewind', name: 'rewind_to', input: { turn_back_n: 1, message: 'X' } },
+    ])
+    const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'switch to plan B' }) as {
+      status: string
+    }
+    expect(res.status).toBe('scheduled')
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeTruthy()
+  })
+})
+
+describe('rewind_to: extended TOBE shape (Phase 1)', () => {
+  let fx: TestFixture
+  beforeEach(() => {
+    fx = fixture()
+  })
+  afterEach(() => fx.cleanup())
+
+  it('writes synthetic SR-construction metadata to TOBE pending file', async () => {
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    const r1 = await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q3' }], [
+      { type: 'tool_use', id: 'toolu_rewind_42', name: 'rewind_to', input: { turn_back_n: 1, message: 'X' } },
+    ])
+    await rewindTwoStep(fx, { turn_back_n: 1, message: 'plan B' })
+    const pending = fx.tobeStore.peek(fx.sessionId)
+    expect(pending).toBeTruthy()
+    expect(pending!.synthetic).toBeTruthy()
+    const s = pending!.synthetic!
+    expect(s.kind).toBe('rewind')
+    expect(s.tool_use_id).toBe('toolu_rewind_42')
+    expect(s.parent_revision_id).toBe(r1.id)
+    expect(s.synthetic_user_message).toBe('plan B')
+    expect(s.synthetic_revision_id).toMatch(/^[a-z0-9]/i)
+    expect(s.synthetic_revision_id).not.toBe(r1.id)
+    expect(s.synthetic_revision_id).not.toBe(t1.id)
+    // R2'/R3' content includes the fork target in shorthand form.
+    expect(s.synthetic_tool_result_text).toContain(t1.id.slice(0, 8))
+    expect(s.synthetic_tool_result_text).toContain('plan B')
+    expect(s.synthetic_assistant_text).toContain(t1.id.slice(0, 8))
+    expect(s.target_view_id).toMatch(/.+/)
+    expect(s.back_requested_at).toBeGreaterThan(0)
+  })
+
+  it('omits synthetic field when R1 has no resolvable response body', async () => {
+    // Existing emitTurn with bafy-resp fake CID → loadResponseToolUses fails →
+    // synthetic field stays undefined. Pre-1.0 alpha graceful path.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    await rewindTwoStep(fx, { turn_back_n: 1, message: 'plan B' })
+    const pending = fx.tobeStore.peek(fx.sessionId)
+    expect(pending).toBeTruthy()
+    expect(pending!.synthetic).toBeUndefined()
+  })
+
+  it('TOBE roundtrip: write + peek preserves all synthetic fields', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'q2' },
+    ])
+    await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q3' }], [
+      { type: 'tool_use', id: 'toolu_x', name: 'rewind_to', input: { turn_back_n: 1, message: 'X' } },
+    ])
+    await rewindTwoStep(fx, { turn_back_n: 1, message: 'roundtrip me' })
+    // Read directly via fs to ensure JSON serialization round-trips correctly.
+    const pendingPath = fx.tobeStore.fileFor(fx.sessionId)
+    const raw = JSON.parse(fs.readFileSync(pendingPath, 'utf8')) as { synthetic?: Record<string, unknown> }
+    expect(raw.synthetic).toBeTruthy()
+    expect(raw.synthetic!.kind).toBe('rewind')
+    expect(raw.synthetic!.synthetic_user_message).toBe('roundtrip me')
+    expect(raw.synthetic!.tool_use_id).toBe('toolu_x')
+    expect(typeof raw.synthetic!.back_requested_at).toBe('number')
+  })
+})
+
+describe('submit_file: parallel-tool guard + extended TOBE (Phase 1)', () => {
+  let fx: TestFixture
+  let dumpsDir: string
+
+  beforeEach(() => {
+    fx = fixture()
+    dumpsDir = mkdtempSync(path.join(tmpdir(), 'retcon-test-dumps-'))
+    process.env.RETCON_HOME = path.dirname(dumpsDir)
+    // Move dumps to <RETCON_HOME>/dumps to satisfy retconDumpsDir().
+    const target = path.join(path.dirname(dumpsDir), 'dumps')
+    if (fs.existsSync(target)) rmSync(target, { recursive: true, force: true })
+    fs.renameSync(dumpsDir, target)
+    dumpsDir = target
+  })
+  afterEach(() => {
+    fx.cleanup()
+    rmSync(dumpsDir, { recursive: true, force: true })
+    delete process.env.RETCON_HOME
+  })
+
+  function writeDump(filename: string, lines: Array<{ role: string, content: unknown }>): string {
+    const filePath = path.join(dumpsDir, filename)
+    fs.writeFileSync(filePath, lines.map(m => JSON.stringify(m)).join('\n'))
+    return filePath
+  }
+
+  async function submitTwoStep(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const tokenStore = new ConfirmTokenStore()
+    const tools = createMcpToolsWithTokens(
+      {
+        db: fx.db,
+        tobeStore: fx.tobeStore,
+        storageProvider: fx.storageProvider,
+        rewindEnabled: true,
+      },
+      { rewind: tokenStore, submit: new ConfirmTokenStore() },
+    )
+    const tool = tools.get('submit_file')!
+    const first = await tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer }) as {
+      status: string
+      confirm_clean?: string
+    }
+    if (first.status !== 'rules_returned') return first
+    return tool.handler(
+      { ...args, confirm: first.confirm_clean! },
+      { sessionId: fx.sessionId, producer: fx.producer },
+    )
+  }
+
+  it('first-call rules text contains the parallel-tool warning', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const dumpPath = writeDump('seed.jsonl', [
+      { role: 'user', content: 'old' },
+      { role: 'assistant', content: 'old reply' },
+    ])
+    const tools = createMcpTools({
+      db: fx.db,
+      tobeStore: fx.tobeStore,
+      storageProvider: fx.storageProvider,
+    })
+    const res = await tools.get('submit_file')!.handler(
+      { path: dumpPath, message: 'X' },
+      { sessionId: fx.sessionId, producer: fx.producer },
+    ) as { status: string, rules: string }
+    expect(res.status).toBe('rules_returned')
+    expect(res.rules).toMatch(/PARALLEL TOOLS/i)
+    expect(res.rules).toMatch(/lose their results/i)
+  })
+
+  it('rejects when R1 has parallel tool_uses (submit_file + read_file)', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q2' }], [
+      { type: 'tool_use', id: 'toolu_submit', name: 'submit_file', input: { path: 'x', message: 'y' } },
+      { type: 'tool_use', id: 'toolu_read', name: 'read_file', input: { path: '/etc/foo' } },
+    ])
+    const dumpPath = writeDump('parallel.jsonl', [
+      { role: 'user', content: 'old' },
+      { role: 'assistant', content: 'old reply' },
+    ])
+    const res = await submitTwoStep({ path: dumpPath, message: 'submit me' }) as {
+      error?: string
+    }
+    expect(res.error).toMatch(/parallel/i)
+    expect(res.error).toMatch(/read_file/)
+    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+  })
+
+  it('writes synthetic SR-construction metadata to TOBE pending file', async () => {
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const r1 = await emitTurnWithRealResponse(fx, 'tool_use', [{ role: 'user', content: 'q2' }], [
+      { type: 'tool_use', id: 'toolu_submit_99', name: 'submit_file', input: { path: 'x', message: 'y' } },
+    ])
+    const dumpPath = writeDump('happy.jsonl', [
+      { role: 'user', content: 'edited 1' },
+      { role: 'assistant', content: 'edited reply' },
+    ])
+    const res = await submitTwoStep({ path: dumpPath, message: 'apply edits' }) as {
+      status: string
+    }
+    expect(res.status).toBe('scheduled')
+    const pending = fx.tobeStore.peek(fx.sessionId)
+    expect(pending).toBeTruthy()
+    expect(pending!.synthetic).toBeTruthy()
+    const s = pending!.synthetic!
+    expect(s.kind).toBe('submit')
+    expect(s.tool_use_id).toBe('toolu_submit_99')
+    expect(s.parent_revision_id).toBe(r1.id)
+    expect(s.synthetic_user_message).toBe('apply edits')
+    expect(s.synthetic_tool_result_text).toContain(t1.id.slice(0, 8))
+    expect(s.synthetic_tool_result_text).toContain('happy.jsonl')
+    expect(s.synthetic_tool_result_text).toContain('2 messages')
+    expect(s.synthetic_assistant_text).toMatch(/Submission applied/)
+  })
+})
+
 describe('gcDumps', () => {
   it('imports as a named export from cli/daemon', async () => {
     // Indirect import via dynamic require to avoid coupling all the other

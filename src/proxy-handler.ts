@@ -778,6 +778,59 @@ async function dispatch(
             && payload.status < 500
         if (isHttpSuccess) ctx.tobeStore.commit(sessionId)
 
+        // Synthetic departure Revision (SR) — v0.5.0. When TOBE consumption
+        // succeeds AND the receiving AI ended its turn cleanly (stop_reason
+        // === 'end_turn', status 2xx), emit fork.forked carrying the SR-
+        // construction metadata pre-computed by the MCP handler. The
+        // RewindMarker projector consumes this, builds R2'/R3' synthetic
+        // messages, stores blobs, and inserts the SR row.
+        //
+        // We gate on 2xx (< 300), not < 500 — a 4xx upstream means the
+        // rewound conversation didn't actually progress, no SR should be
+        // born. We also skip when stop_reason is anything other than
+        // 'end_turn' (e.g., 'max_tokens' or 'tool_use' — the assistant is
+        // mid-thought, not at a forkable stopping point).
+        //
+        // Backward-compat: TOBE pending files written by older daemons
+        // (mid-upgrade restart) lack `synthetic`. We log to stderr and skip;
+        // the rewind/submit still applies, just no SR materializes.
+        if (
+          isHttpSuccess
+          && topic === 'proxy.response_completed'
+          && typeof payload.status === 'number'
+          && payload.status >= 200
+          && payload.status < 300
+          && payload.stop_reason === 'end_turn'
+        ) {
+          if (pending.synthetic) {
+            const s = pending.synthetic
+            ctx.producer.emit(
+              'fork.forked',
+              {
+                kind: s.kind,
+                synthetic_revision_id: s.synthetic_revision_id,
+                parent_revision_id: s.parent_revision_id,
+                target_revision_id: pending.fork_point_revision_id,
+                to_revision_id: requestEvent.id,
+                synthetic_tool_result_text: s.synthetic_tool_result_text,
+                synthetic_assistant_text: s.synthetic_assistant_text,
+                synthetic_user_message: s.synthetic_user_message,
+                tool_use_id: s.tool_use_id,
+                target_view_id: s.target_view_id,
+                sealed_at: s.back_requested_at,
+              },
+              sessionId,
+            )
+          }
+          else {
+            console.warn(
+              `[proxy-handler] TOBE consumed for session=${sessionId} but `
+              + `pending.synthetic is missing — likely written by a pre-v0.5 daemon. `
+              + `Skipping fork.forked emission; no SR will materialize.`,
+            )
+          }
+        }
+
         // Notify any in-flight fork_back awaiter with a structured outcome.
         // fork_back can either await this or query the event log after the
         // fact; both paths go through ForkAwaiter / lastForkOutcome.

@@ -29,7 +29,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import type { AssetId, StorageProvider } from '@playtiss/core'
-import { generateTraceId } from '@playtiss/core'
+import { generateTraceId, load as loadAsset } from '@playtiss/core'
 
 import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import { retconDumpsDir } from './cli/paths.js'
@@ -151,6 +151,73 @@ function forkableSequence(db: DB, taskId: string): string[] {
      ORDER BY sealed_at DESC, id DESC
   `).all(taskId) as Array<{ id: string }>
   return rows.map(r => r.id)
+}
+
+/**
+ * Look up the response_completed event for a given revision id and return its
+ * response body CID. Used to inspect R1's assistant response (e.g., for tool_use
+ * detection in the rewind_to/submit_file parallel-tool guard).
+ */
+function responseBodyCidFor(db: DB, revisionId: string): string | null {
+  const row = db.prepare(`
+    SELECT payload FROM events WHERE event_id = ? AND topic = 'proxy.response_completed'
+  `).get(revisionId) as { payload: string } | undefined
+  if (!row) {
+    // Try by request_event_id pointer (revisions row id == request_received event id).
+    const row2 = db.prepare(`
+      SELECT payload FROM events
+       WHERE topic = 'proxy.response_completed'
+             AND json_extract(payload, '$.request_event_id') = ?
+    `).get(revisionId) as { payload: string } | undefined
+    if (!row2) return null
+    try {
+      const p = JSON.parse(row2.payload) as { body_cid?: string }
+      return p.body_cid ?? null
+    }
+    catch {
+      return null
+    }
+  }
+  try {
+    const parsed = JSON.parse(row.payload) as { body_cid?: string }
+    return parsed.body_cid ?? null
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * Load the assistant response body for a revision (R1) and extract its tool_use
+ * blocks. Returns the list of {id, name} pairs in declaration order, or null if
+ * the response can't be loaded/parsed. Used by the rewind_to/submit_file guard
+ * to detect parallel tool_uses.
+ */
+async function loadResponseToolUses(
+  deps: McpToolDeps,
+  revisionId: string,
+): Promise<Array<{ id: string, name: string }> | null> {
+  const responseBodyCid = responseBodyCidFor(deps.db, revisionId)
+  if (!responseBodyCid) return null
+  try {
+    const blob = await loadAsset(responseBodyCid as AssetId, deps.storageProvider)
+    if (!(blob instanceof Uint8Array)) return null
+    const text = new TextDecoder().decode(blob)
+    const parsed = JSON.parse(text) as {
+      content?: Array<{ type?: string, id?: string, name?: string }>
+    }
+    if (!Array.isArray(parsed.content)) return null
+    const toolUses: Array<{ id: string, name: string }> = []
+    for (const block of parsed.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        toolUses.push({ id: block.id, name: block.name })
+      }
+    }
+    return toolUses
+  }
+  catch {
+    return null
+  }
 }
 
 /**
@@ -460,6 +527,8 @@ function rewindRulesText(tokens: ConfirmTokenPair): string {
     '  - your own reasoning that led to calling this tool',
     '  - any cut-off turns (they\'re gone from the receiving AI\'s context)',
     '',
+    'PARALLEL TOOLS — DO NOT call rewind_to alongside other tools in the same assistant turn. The rewound history replaces the next /v1/messages, so any sibling tool_use calls (Read, Bash, Edit, etc.) lose their results before the receiving AI ever sees them. Call rewind_to alone, finish your other work first, OR pack the substantive change into the `message` arg instead.',
+    '',
     'So `message` must:',
     '  1. Carry the SUBSTANTIVE instruction. Not "rewind to my previous answer" — the rewind already happened, and the receiving AI sees no "previous answer." Send the new value, the corrected plan, the actual instruction.',
     '  2. Be readable in isolation. Don\'t write "let\'s continue from here" — there\'s no shared "here" for the receiving AI. The history above must already make sense; this turn must already make sense.',
@@ -590,6 +659,8 @@ function submitRulesText(tokens: ConfirmTokenPair): string {
     '  - The path must resolve inside ~/.retcon/dumps/ (no traversal).',
     '  - Each line must be a valid JSON object with `role` and `content`.',
     '  - The LAST line\'s role MUST be "assistant". Your `message` arg gets appended as a `{role: "user", content: <message>}` line; if the dump\'s tail is already a user line, the appended user would create back-to-back user turns and the receiving AI would see a malformed conversation.',
+    '',
+    'PARALLEL TOOLS — DO NOT call submit_file alongside other tools in the same assistant turn. The submitted history replaces the next /v1/messages, so any sibling tool_use calls (Read, Bash, Edit, etc.) lose their results before the receiving AI ever sees them. Call submit_file alone, finish your other work first, OR queue the substantive change in the `message` arg instead.',
     '',
     'So `message` must:',
     '  1. Carry the SUBSTANTIVE instruction. Not "submit my edits" — the edits already happened, and the receiving AI sees them as if they always existed. Send the new value, the corrected plan, the actual instruction.',
@@ -1162,6 +1233,32 @@ export function createMcpToolsWithTokens(
         return { error: 'rewind_to requires an MCP-initialized session (orphan sessions cannot rewind)' }
       }
 
+      // ── Parallel-tool guard ───────────────────────────────────────────────
+      // R1 = the assistant turn that emitted tool_use(rewind_to). By the time
+      // claude dispatches the MCP call, the assistant response has already
+      // closed (response_completed has fired) — claude only dispatches tool
+      // calls after the SSE stream completes. So R1.response_body is
+      // queryable. If R1 has other tool_use blocks alongside rewind_to,
+      // reject: the rewound history will replace the next /v1/messages and
+      // the parallel tools' results would be discarded before the receiving
+      // AI ever sees them.
+      const r1 = mostRecentRevision(deps.db, sess.task_id)
+      let rewindToolUseId: string | null = null
+      if (r1) {
+        const toolUses = await loadResponseToolUses(deps, r1.id)
+        if (toolUses) {
+          const parallel = toolUses.filter(t => t.name !== 'rewind_to')
+          if (parallel.length > 0) {
+            const names = parallel.map(t => t.name).join(', ')
+            return {
+              error: `rewind_to was called in parallel with other tool(s): ${names}. The rewound context will discard their results before the receiving AI sees them. Either call rewind_to alone (no parallel tools), or finish the other work first and rewind on a later turn.`,
+            }
+          }
+          const rewindEntry = toolUses.find(t => t.name === 'rewind_to')
+          if (rewindEntry) rewindToolUseId = rewindEntry.id
+        }
+      }
+
       // Resolve the target revision: turn_id wins; else turn_back_n; else default 1.
       // Also capture `headBeforeFork` — the closed_forkable head at this moment.
       // It's the "from" turn surfaced by recall's rewind_events ("where did
@@ -1217,10 +1314,37 @@ export function createMcpToolsWithTokens(
       const prior = lastForkOutcome(deps.db, ctx.sessionId)
 
       const targetViewId = generateTraceId()
+
+      // SR-construction metadata (v0.5.0). Populated only when we have R1
+      // (= the assistant turn that emitted tool_use(rewind_to)) AND its
+      // tool_use_id. Without those, the proxy-handler skips fork.forked
+      // emission and no SR row materializes — the rewind still applies.
+      // Pre-1.0 alpha policy: documented gap, not a regression.
+      const syntheticRevisionId = generateTraceId()
+      const forkShort = target.id.slice(0, 8)
+      const syntheticToolResultText
+        = `Rewind initiated. Target: rev_${forkShort}. Synthetic message: ${message}`
+      const syntheticAssistantText
+        = `Rewind initiated. Jumping to rev_${forkShort}.`
+      const backRequestedAt = Date.now()
+
       deps.tobeStore.write(ctx.sessionId, {
         messages: baseMessages,
         fork_point_revision_id: target.id,
         source_view_id: ctx.sessionId,
+        synthetic: r1 && rewindToolUseId
+          ? {
+              kind: 'rewind',
+              target_view_id: targetViewId,
+              synthetic_revision_id: syntheticRevisionId,
+              synthetic_tool_result_text: syntheticToolResultText,
+              synthetic_assistant_text: syntheticAssistantText,
+              synthetic_user_message: message,
+              tool_use_id: rewindToolUseId,
+              parent_revision_id: r1.id,
+              back_requested_at: backRequestedAt,
+            }
+          : undefined,
       })
 
       // Persistent fork branch context — see daemon for downstream consumers.
@@ -1889,6 +2013,27 @@ export function createMcpToolsWithTokens(
         return { error: 'submit_file requires an MCP-initialized session (orphan sessions cannot submit)' }
       }
 
+      // ── Parallel-tool guard ───────────────────────────────────────────────
+      // Mirror of rewind_to: if the assistant turn emitting submit_file also
+      // emits other tool_uses, the splice will discard their results. Reject
+      // with a clear error.
+      const r1 = mostRecentRevision(deps.db, sess.task_id)
+      let submitToolUseId: string | null = null
+      if (r1) {
+        const toolUses = await loadResponseToolUses(deps, r1.id)
+        if (toolUses) {
+          const parallel = toolUses.filter(t => t.name !== 'submit_file')
+          if (parallel.length > 0) {
+            const names = parallel.map(t => t.name).join(', ')
+            return {
+              error: `submit_file was called in parallel with other tool(s): ${names}. The submitted history will discard their results before the receiving AI sees them. Either call submit_file alone, or finish the other work first and submit on a later turn.`,
+            }
+          }
+          const submitEntry = toolUses.find(t => t.name === 'submit_file')
+          if (submitEntry) submitToolUseId = submitEntry.id
+        }
+      }
+
       // submit_file needs at least one closed_forkable revision to use as
       // the fork-point anchor in the emitted fork.back_requested event.
       // The projector requires a non-null fork_point_revision_id and the
@@ -1903,10 +2048,37 @@ export function createMcpToolsWithTokens(
       }
       const targetViewId = generateTraceId()
 
+      // SR-construction metadata (v0.5.0). Same handoff as rewind_to: the
+      // proxy-handler emits fork.forked at TOBE-consumed time and the
+      // RewindMarker projector inserts the SR row. Skipped (no SR
+      // materialized) when R1 or its tool_use can't be resolved — the
+      // submit still applies.
+      const syntheticRevisionId = generateTraceId()
+      const headShort = headForkable.id.slice(0, 8)
+      const dumpBasename = path.basename(resolvedPath)
+      const syntheticToolResultText
+        = `Submission applied. Edited dump from ${dumpBasename} (${messages.length} messages) merged at rev_${headShort}.`
+      const syntheticAssistantText
+        = `Submission applied. Continuing from edited conversation.`
+      const backRequestedAt = Date.now()
+
       deps.tobeStore.write(ctx.sessionId, {
         messages: finalMessages,
         fork_point_revision_id: headForkable.id,
         source_view_id: ctx.sessionId,
+        synthetic: r1 && submitToolUseId
+          ? {
+              kind: 'submit',
+              target_view_id: targetViewId,
+              synthetic_revision_id: syntheticRevisionId,
+              synthetic_tool_result_text: syntheticToolResultText,
+              synthetic_assistant_text: syntheticAssistantText,
+              synthetic_user_message: message,
+              tool_use_id: submitToolUseId,
+              parent_revision_id: r1.id,
+              back_requested_at: backRequestedAt,
+            }
+          : undefined,
       })
 
       // Persist as branch context (same as rewind_to) so subsequent turns

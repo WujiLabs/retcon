@@ -222,6 +222,210 @@ describe('proxy pass-through + event emission', () => {
     expect(fx.tobeStore.peek(sessionId)).toBeNull()
   })
 
+  // ── Phase 1 (v0.5.0): fork.forked emission ───────────────────────────────
+  // SR is born only when (a) TOBE was consumed, (b) HTTP status is 2xx,
+  // (c) stop_reason is 'end_turn', (d) the TOBE pending file carried the
+  // synthetic SR-construction metadata. Each test below pins one of those
+  // gates.
+
+  it('fork.forked: emitted when TOBE consumed AND 2xx AND end_turn AND synthetic present', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const sessionId = 'sess-forked-happy'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'rewritten' }],
+      fork_point_revision_id: 'ver-fork-x',
+      source_view_id: 'view-x',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'view-target',
+        synthetic_revision_id: 'rev-synth-1',
+        synthetic_tool_result_text: 'Rewind initiated. Target: rev_abcd1234. Synthetic message: hi.',
+        synthetic_assistant_text: 'Rewind initiated. Jumping to rev_abcd1234.',
+        synthetic_user_message: 'hi',
+        tool_use_id: 'toolu_42',
+        parent_revision_id: 'rev-r1',
+        back_requested_at: 1234567890,
+      },
+    })
+
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+    })
+    await res.text()
+
+    const forkedPayload = await waitForEvent(fx.db, 'fork.forked') as {
+      kind?: string
+      synthetic_revision_id?: string
+      parent_revision_id?: string
+      target_revision_id?: string
+      to_revision_id?: string
+      synthetic_tool_result_text?: string
+      synthetic_user_message?: string
+      tool_use_id?: string
+      target_view_id?: string
+      sealed_at?: number
+    }
+    expect(forkedPayload.kind).toBe('rewind')
+    expect(forkedPayload.synthetic_revision_id).toBe('rev-synth-1')
+    expect(forkedPayload.parent_revision_id).toBe('rev-r1')
+    expect(forkedPayload.target_revision_id).toBe('ver-fork-x')
+    expect(forkedPayload.to_revision_id).toMatch(/.+/)
+    expect(forkedPayload.synthetic_tool_result_text).toContain('rev_abcd1234')
+    expect(forkedPayload.synthetic_user_message).toBe('hi')
+    expect(forkedPayload.tool_use_id).toBe('toolu_42')
+    expect(forkedPayload.target_view_id).toBe('view-target')
+    expect(forkedPayload.sealed_at).toBe(1234567890)
+  })
+
+  it('fork.forked: NOT emitted when stop_reason is not end_turn', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'max_tokens', content: [{ type: 'text', text: '...' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const sessionId = 'sess-no-end-turn'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'r' }],
+      fork_point_revision_id: 'ver-fork-y',
+      source_view_id: 'view-y',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'tv',
+        synthetic_revision_id: 'rev-skip',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
+        tool_use_id: 'toolu',
+        parent_revision_id: 'r1',
+        back_requested_at: 1,
+      },
+    })
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+    })
+
+    // response_completed must already be in the log; fork.forked must NOT.
+    await waitForEvent(fx.db, 'proxy.response_completed')
+    const consumer = createEventConsumer(fx.db)
+    const found = consumer.poll('_probe_no_forked', ['fork.forked'], 1)
+    expect(found.length).toBe(0)
+  })
+
+  it('fork.forked: NOT emitted on 4xx upstream (not 2xx)', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(429, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit' } }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const sessionId = 'sess-4xx'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'r' }],
+      fork_point_revision_id: 'ver-fork-z',
+      source_view_id: 'view-z',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'tv',
+        synthetic_revision_id: 'rev-4xx',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
+        tool_use_id: 'toolu',
+        parent_revision_id: 'r1',
+        back_requested_at: 1,
+      },
+    })
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+    })
+
+    await waitForEvent(fx.db, 'proxy.response_completed')
+    const consumer = createEventConsumer(fx.db)
+    const found = consumer.poll('_probe_no_forked_4xx', ['fork.forked'], 1)
+    expect(found.length).toBe(0)
+  })
+
+  it('fork.forked: NOT emitted when TOBE has no synthetic field (backward-compat)', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const sessionId = 'sess-no-synth'
+    // Pre-v0.5.0 TOBE shape: no `synthetic`.
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'r' }],
+      fork_point_revision_id: 'ver-old',
+      source_view_id: 'view-old',
+    })
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+    })
+
+    await waitForEvent(fx.db, 'proxy.response_completed')
+    const consumer = createEventConsumer(fx.db)
+    const found = consumer.poll('_probe_no_forked_old', ['fork.forked'], 1)
+    expect(found.length).toBe(0)
+  })
+
+  it('fork.forked: NOT emitted on a normal /v1/messages with no TOBE pending', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: 'sess-noop' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+
+    await waitForEvent(fx.db, 'proxy.response_completed')
+    const consumer = createEventConsumer(fx.db)
+    const found = consumer.poll('_probe_no_forked_noop', ['fork.forked'], 1)
+    expect(found.length).toBe(0)
+  })
+
   it('end-to-end: HTTP call populates sessions + versions projected views', async () => {
     // Use the standard projector chain (sessions_v1 + versions_v1).
     const db = openDb({ path: ':memory:' })

@@ -16,12 +16,50 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+/**
+ * SR-construction metadata carried via TOBE pending file from the MCP handler
+ * (rewind_to or submit_file) to the proxy-handler that consumes the file. The
+ * MCP handler computes synthetic content + R1.id at MCP-call time. proxy-
+ * handler emits `fork.forked` after response_completed, populating the event
+ * with these fields. The RewindMarkerV1 projector then INSERTs the SR row
+ * with `synthetic_revision_id`.
+ *
+ * Optional for backward compat: a TOBE pending file written by an older daemon
+ * lacks these fields. proxy-handler logs a warning and skips fork.forked
+ * emission — the rewind/submit still applies, just no synthetic departure
+ * row materializes for that operation. Pre-1.0 alpha policy.
+ */
+export interface SyntheticDepartureMeta {
+  /** Discriminates which operation produced this TOBE. */
+  kind: 'rewind' | 'submit'
+  /** target_view_id from fork.back_requested (correlation). */
+  target_view_id: string
+  /** Pre-generated SR id; same value used for both fork.forked emit and INSERT. */
+  synthetic_revision_id: string
+  /** R2' display content (varies by kind). */
+  synthetic_tool_result_text: string
+  /** R3' display content (varies by kind). */
+  synthetic_assistant_text: string
+  /** The user's `message` arg from rewind_to OR submit_file. */
+  synthetic_user_message: string
+  /** R1's tool_use id. The synthetic body pairs this with R2's tool_result. */
+  tool_use_id: string
+  /** R1.id — the assistant turn that emitted tool_use(rewind_to | submit_file).
+   *  SR.parent_revision_id will be set to this. */
+  parent_revision_id: string
+  /** Timestamp at MCP-call time. SR.sealed_at uses this. */
+  back_requested_at: number
+}
+
 export interface TobePending {
   messages: unknown[]
   fork_point_revision_id: string
   source_view_id: string
   /** Optional hint: the TraceId of the fork.back_requested event that wrote this file. */
   fork_back_event_id?: string
+  /** SR-construction metadata. Optional for backward compat with v0.4.x TOBE files
+   *  written before v0.5.0. Missing → proxy-handler skips fork.forked emit. */
+  synthetic?: SyntheticDepartureMeta
 }
 
 export interface TobeStore {
