@@ -61,6 +61,26 @@ Every successful rewind/submit produces an SR row in the revisions table. The pi
 
 The hand-off across T0→T1→T2 is what makes the unit-test path and production path agree. T1 is where the production-only failure modes live (claude's request body shape, gzip/SSE on the response side). Tests that mock T0→T2 directly skip the T1 hazards; the integration test (`cli-tmux-integration.test.ts`) is what catches them.
 
+### What the synthetic body looks like
+
+The SR's `asset_cid` points at a messages-shape blob containing four parts:
+
+```
+[
+  ...history through R1.request_body.messages,    // unchanged from the real conversation
+  R1.response_body assistant turn (the tool_use), // R1's actual assistant emission
+  R2': synthetic tool_result paired with R1's tool_use_id,
+  R3': synthetic assistant wrap-up text,
+]
+```
+
+Two pieces of this shape are load-bearing for downstream consumers:
+
+- **R2's `tool_use_id` MUST match R1's tool_use_id** for the operation tool (rewind_to or submit_file). Anthropic's API requires every `tool_use` to be paired with a `tool_result`. The R1 turn ends with an unpaired tool_use; R2' provides the matching tool_result. Without this pairing, cascade rewinds (a later `rewind_to({turn_id: SR.id})` whose synthetic body becomes a request prefix) would 400 from upstream.
+- **R3' is a normal assistant text turn.** It's there so the SR's body ends on an assistant turn, not on a user-tool_result turn. That keeps `dump_to_file({turn_id: SR.id})` producing a JSONL with the standard alternation (last line = assistant), which `submit_file`'s last-line-must-be-assistant validation requires for cascade workflows.
+
+R2'/R3' content is retcon-generated narrative ("Rewind initiated. Target: rev_<short>. Synthetic message: <user_msg>" / "Rewind initiated. Jumping to rev_<short>"), purely for navigation/display. It's never byte-matched against claude's actual traffic — the loud-failure scaffolding claude emits as the actual tool_result for rewind_to/submit_file lives only in the discarded request body, never in the SR's body.
+
 ### Why R1's content comes from the request body, not the response
 
 The natural place to find R1's parsed content would be R1's response body. But:
