@@ -479,12 +479,18 @@ function rewindRulesText(tokens: ConfirmTokenPair): string {
     '  2. Be readable in isolation. Don\'t write "let\'s continue from here" — there\'s no shared "here" for the receiving AI. The history above must already make sense; this turn must already make sense.',
     '  3. Include change-context if the user should see the AI acknowledge the change. If the user changed their mind from A to B and you want acknowledgment, write "B (changing my earlier answer of A)". Pure "B" works for clean redos.',
     '  4. Be framed from the user\'s POV. It becomes a user-role turn. For user-initiated rewinds, write what the user would have said if they\'d retyped at the rewound point. For AI-initiated rewinds, write the user-shaped instruction the user WOULD have given if they\'d been steering you.',
+    '  5. NOT re-introduce the thing being forgotten. If the user said "forget about the pink elephant" and your `message` says "no pink elephants here", the post-rewind AI sees the elephant again and the rewind was wasted. For sensitive content (passwords, leaked credentials, PII), describe the removal in general terms ("(I removed the leaked credential from the earlier turn)") rather than echoing the actual value. The whole point of forgetting is to NOT name the thing.',
+    '  6. Pack stacked instructions. When the user says "rewind to X, then answer Y", the post-rewind AI lands at X with no awareness of Y. Put Y in `message` so it has something to do — otherwise the receiving AI sees only history-up-to-X and a placeholder turn, and may produce a confused "what would you like?" response instead of answering.',
     '',
     'EXAMPLES:',
     '  User: "I want to change my previous answer from A to B."',
     '    → message: "B (changing my earlier answer of A)"',
     '  User: "Restart from the database planning. Use Postgres instead of SQLite."',
     '    → message: "Let\'s use Postgres for the database, not SQLite."',
+    '  User: "Go back to before we started talking about auth, then answer: what\'s the right session timeout?"',
+    '    → message: "What\'s the right session timeout?"  (the stacked question goes IN the message)',
+    '  User: "Forget the API key I just leaked." (single-turn version — for multi-turn, use submit_file)',
+    '    → message: "(I removed the leaked credential from the earlier turn — please continue without referencing it.)"',
     '  You (AI, autonomously realized you went off track):',
     '    → message: "Let me try a different approach. Use approach Y instead of approach X — [explain in 1-2 sentences]."',
     '',
@@ -492,6 +498,7 @@ function rewindRulesText(tokens: ConfirmTokenPair): string {
     '  ❌ "continue from here"  ❌ "redo your last response"',
     '  ❌ "the same question I just asked"  ❌ "what I said earlier"',
     '  ❌ "User wants to change A to B." (third-person, reads weird as a user-turn)',
+    '  ❌ Echoing the forgotten content ("ignore the password ABC123" — re-leaks it).',
     '',
     'NOW CLASSIFY YOUR MESSAGE AND RE-CALL:',
     '',
@@ -499,6 +506,8 @@ function rewindRulesText(tokens: ConfirmTokenPair): string {
     `  - If your \`message\` contains a META-REFERENCE you spotted: re-call with confirm="${tokens.meta}" — we will reject and you can revise`,
     '',
     'Both tokens are single-use. They expire in 5 minutes. If you classify dishonestly (send the clean token with a meta-reference in your message), we run a narrow regex check that catches the most flagrant cases.',
+    '',
+    'Note on the tokens: they classify your CURRENT message, not the one you originally typed. The pair is bound to your session, not to a specific message — if your first attempt had a meta-reference, REVISE the `message` arg and use the token that matches the revised version. The clean path is the goal; the meta path is an honest escape hatch when you can\'t fix the message yourself.',
   ].join('\n')
 }
 
@@ -620,16 +629,23 @@ function submitRulesText(tokens: ConfirmTokenPair): string {
     '  2. Be readable in isolation. Don\'t write "let\'s continue from here" — there\'s no shared "here" for the receiving AI. The history above must already make sense; this turn must already make sense.',
     '  3. Include change-context if the user should see the AI acknowledge the edit. If you fixed a factual error in the history, write something like "(I corrected an error in the earlier discussion — please verify and continue.)" Pure substantive instruction works for clean replays.',
     '  4. Be framed from the user\'s POV. It becomes a user-role turn.',
+    '  5. NOT re-introduce the thing you just removed from the dump. If the workflow is "forget about the pink elephant" and your `message` says "no pink elephants, please", the post-submit AI sees the elephant again — your edits to the JSONL were wasted. For sensitive content (passwords, leaked credentials, PII), describe the removal in general terms ("(I removed the leaked credential from earlier turns)") rather than echoing the actual value. The whole point of forgetting is to NOT name the thing.',
+    '  6. Pack stacked instructions. When the user says "submit the cleaned dump, then answer Y", put Y in `message` so the post-submit AI has something to do — otherwise it sees a fresh user turn with no instruction and may produce a confused "what next?" response.',
     '',
     'EXAMPLES:',
     '  After editing a dump to fix a wrong calculation:',
     '    → message: "(I corrected the budget number in the earlier turn from $500 to $5,000.) Continue with the cost analysis using the corrected number."',
+    '  After stripping a leaked credential from multiple turns:',
+    '    → message: "(I removed the leaked credential from earlier turns.) Please continue with the security review without referencing the removed value."',
     '  After dumping current state with no edits, just to redirect:',
     '    → message: "Switch the focus to security review now."',
+    '  After cleaning the dump, with a stacked question from the user:',
+    '    → message: "What\'s the right session timeout for our use case?"',
     '',
     'ANTI-PATTERNS — do not pass these:',
     '  ❌ "submit my changes"  ❌ "see the edits I made"',
     '  ❌ "as I just edited"  ❌ "now apply this"',
+    '  ❌ Echoing the removed content ("ignore the password ABC123" — re-leaks what you just stripped).',
     '',
     'NOW CLASSIFY YOUR MESSAGE AND RE-CALL:',
     '',
@@ -637,6 +653,8 @@ function submitRulesText(tokens: ConfirmTokenPair): string {
     `  - If your \`message\` contains a META-REFERENCE you spotted: re-call with confirm="${tokens.meta}" — we will reject and you can revise`,
     '',
     'Both tokens are single-use. They expire in 5 minutes. If you classify dishonestly (send the clean token with a meta-reference in your message), we run a narrow regex check that catches the most flagrant cases.',
+    '',
+    'Note on the tokens: they classify your CURRENT message, not the one you originally typed. The pair is bound to your session, not to a specific message — if your first attempt had a meta-reference, REVISE the `message` arg and use the token that matches the revised version. The clean path is the goal; the meta path is an honest escape hatch when you can\'t fix the message yourself.',
   ].join('\n')
 }
 
@@ -1523,7 +1541,7 @@ export function createMcpToolsWithTokens(
   // claude's outgoing body at replay time and aren't frozen here.
   tools.set('dump_to_file', {
     description:
-      'USE WHEN: you want to inspect or edit the conversation history before continuing — especially to forget/rewrite content spread across multiple turns (the "pink elephant" case rewind_to can\'t handle). '
+      'USE WHEN: you want to inspect or edit the conversation history before continuing. Three common cases: (1) just look at past messages, (2) fix a factual error in an earlier turn, (3) strip content spread across multiple turns — the "pink elephant" pattern that single-point rewind_to can\'t reach. '
       + 'Writes the conversation through a target turn to ~/.retcon/dumps/<id>.jsonl (one Anthropic message per line). retcon pre-allowed Read/Edit/Write/Glob/Grep on that path, so no permission prompts. '
       + 'Args: no args = dump current state; `turn_id`/`turn_back_n` = dump through that turn. '
       + 'NEXT STEPS: `Read` to view, `Edit` to modify lines, then `submit_file` with the path + a new user instruction.',
