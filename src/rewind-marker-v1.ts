@@ -107,10 +107,17 @@ export async function buildSyntheticAsset(
 
   // Find the operation tool's tool_use block — R2's synthetic tool_result
   // pairs to its id so Anthropic's tool_use/tool_result invariant holds.
-  const operationToolName = args.kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  //
+  // Name-matching: claude's request body carries the FULL MCP-prefixed
+  // name (e.g. `mcp__retcon__rewind_to`). Earlier drafts compared against
+  // the bare `rewind_to` and silently mis-classified the operation tool
+  // as a parallel sibling — caught by cli-tmux-integration. We accept
+  // either form to stay forgiving across naming conventions.
+  const bare = args.kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  const prefixed = `mcp__retcon__${bare}`
   let toolUseId: string | null = null
   for (const block of r1.content as Array<{ type?: string, name?: string, id?: string }>) {
-    if (block.type === 'tool_use' && block.name === operationToolName && typeof block.id === 'string') {
+    if (block.type === 'tool_use' && (block.name === prefixed || block.name === bare) && typeof block.id === 'string') {
       toolUseId = block.id
       break
     }
@@ -182,10 +189,15 @@ export function detectParallelTools(
   }
   if (!r1 || !Array.isArray(r1.content)) return { ok: false }
 
-  const operationToolName = kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  // Accept either bare or MCP-prefixed name — claude's body uses the
+  // prefixed form (`mcp__retcon__rewind_to`) but unit tests and earlier
+  // drafts of buildSyntheticAsset used the bare form. Be forgiving.
+  const bare = kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  const prefixed = `mcp__retcon__${bare}`
   const parallel: string[] = []
   for (const block of r1.content as Array<{ type?: string, name?: string }>) {
-    if (block.type === 'tool_use' && typeof block.name === 'string' && block.name !== operationToolName) {
+    if (block.type === 'tool_use' && typeof block.name === 'string'
+      && block.name !== bare && block.name !== prefixed) {
       parallel.push(block.name)
     }
   }

@@ -138,9 +138,19 @@ describe('buildSettingsAndArgs', () => {
 })
 
 describe('retconAllowEntries', () => {
-  it('returns 5 entries (Read/Edit/Write/Glob/Grep) for the dumps directory', () => {
+  it('returns MCP-tool entries + 5 dumps-directory FS entries', () => {
     const entries = retconAllowEntries('/home/alice')
-    expect(entries).toHaveLength(5)
+    // 7 MCP tool names + 5 filesystem entries.
+    expect(entries).toHaveLength(12)
+    // retcon's MCP tools — auto-allowed so claude doesn't prompt the user.
+    expect(entries).toContain('mcp__retcon__recall')
+    expect(entries).toContain('mcp__retcon__rewind_to')
+    expect(entries).toContain('mcp__retcon__bookmark')
+    expect(entries).toContain('mcp__retcon__delete_bookmark')
+    expect(entries).toContain('mcp__retcon__list_branches')
+    expect(entries).toContain('mcp__retcon__dump_to_file')
+    expect(entries).toContain('mcp__retcon__submit_file')
+    // Dumps-directory filesystem access for dump_to_file / submit_file.
     expect(entries).toContain('Read(/home/alice/.retcon/dumps/**)')
     expect(entries).toContain('Edit(/home/alice/.retcon/dumps/**)')
     expect(entries).toContain('Write(/home/alice/.retcon/dumps/**)')
@@ -148,9 +158,10 @@ describe('retconAllowEntries', () => {
     expect(entries).toContain('Grep(/home/alice/.retcon/dumps/**)')
   })
 
-  it('uses ** so any depth under dumps/ matches', () => {
+  it('FS entries use ** so any depth under dumps/ matches', () => {
     const entries = retconAllowEntries('/h')
-    for (const e of entries) {
+    const fsEntries = entries.filter(e => /^(Read|Edit|Write|Glob|Grep)\(/.test(e))
+    for (const e of fsEntries) {
       expect(e).toMatch(/\.retcon\/dumps\/\*\*\)$/)
     }
   })

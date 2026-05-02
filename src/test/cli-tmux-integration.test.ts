@@ -221,6 +221,58 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     }
     expect(parsed.fork_point_revision_id).toMatch(/^[a-z0-9-]+$/)
     expect(parsed.task_id).toBe(taskId)
+
+    // v0.5.0-alpha.1: also assert the synthetic departure Revision (SR)
+    // pipeline ran end-to-end against real Anthropic SSE+gzip traffic.
+    // fork.forked fires after claude's wrap-up /v1/messages closes with
+    // stop_reason=end_turn (post-splice). Assertion catches the SSE+gzip
+    // blindness bug that v0.5.0-alpha.0 shipped: alpha.0 silently failed to
+    // parse R1's response body, never wrote synthetic to TOBE, never
+    // emitted fork.forked, never materialized SR rows. alpha.0 unit tests
+    // passed because they used uncompressed JSON fixtures.
+    try {
+      await waitFor(
+        () => parseInt(sql(`SELECT COUNT(*) FROM events WHERE session_id='${sessionId}' AND topic='fork.forked'`), 10) >= 1,
+        90000,
+        'fork.forked event in proxy.db (SR pipeline ran end-to-end against real Anthropic traffic)',
+      )
+    }
+    catch (err) {
+      // Surface a richer diagnostic before re-throwing — the default
+      // waitFor message captures the pane but not the event log, and the
+      // test cleanup wipes the events table on afterAll, so post-mortem
+      // SQLite queries can't see what happened.
+      const recentForks = sql(
+        `SELECT topic || '|' || COALESCE(json_extract(payload, '$.error_message'), '-') `
+        + `FROM events WHERE session_id='${sessionId}' AND topic LIKE 'fork.%' ORDER BY event_id`,
+      )
+      const tobeApplied = sql(
+        `SELECT events.event_id || '|cid=' || json_extract(events.payload, '$.tobe_applied_from.original_body_cid') `
+        + `|| '|sr=' || COALESCE((SELECT json_extract(rc.payload, '$.stop_reason') FROM events rc `
+        + `WHERE rc.topic='proxy.response_completed' AND json_extract(rc.payload, '$.request_event_id')=events.event_id), '?') `
+        + `|| '|status=' || COALESCE((SELECT json_extract(rc.payload, '$.status') FROM events rc `
+        + `WHERE rc.topic='proxy.response_completed' AND json_extract(rc.payload, '$.request_event_id')=events.event_id), '?') `
+        + `FROM events WHERE session_id='${sessionId}' AND topic='proxy.request_received' `
+        + `AND json_extract(payload, '$.tobe_applied_from') IS NOT NULL`,
+      )
+      const recentResponses = sql(
+        `SELECT json_extract(payload, '$.status') || '|' || COALESCE(json_extract(payload, '$.stop_reason'), 'null') `
+        + `FROM events WHERE session_id='${sessionId}' AND topic='proxy.response_completed' `
+        + `ORDER BY event_id DESC LIMIT 5`,
+      )
+      throw new Error(
+        `${(err as Error).message}\n--- diagnostic ---\n`
+        + `fork.* events:\n${recentForks || '(none)'}\n`
+        + `tobe-applied requests (req_id|cid|stop_reason|status):\n${tobeApplied || '(none — TOBE never consumed)'}\n`
+        + `last 5 response_completed (status|stop_reason):\n${recentResponses}\n`
+        + `--- end ---`,
+      )
+    }
+    const synthCount = parseInt(
+      sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND stop_reason='rewind_synthetic'`),
+      10,
+    )
+    expect(synthCount).toBeGreaterThanOrEqual(1)
   }, 240000)
 
   // ─────────────────────────────────────────────────────────────────────────

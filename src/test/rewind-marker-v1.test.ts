@@ -254,6 +254,45 @@ describe('buildSyntheticAsset', () => {
     expect(built).not.toBeNull()
     expect(built!.toolUseId).toBe('toolu_op')
   })
+
+  // REGRESSION GUARD (cli-tmux-integration caught this in v0.5.0-alpha.1):
+  // claude's actual /v1/messages body uses the MCP-prefixed tool name
+  // `mcp__retcon__rewind_to`, NOT the bare `rewind_to`. An earlier draft
+  // matched only the bare name, so the operation tool itself was
+  // mis-classified as "parallel" and the splice always aborted.
+  it('matches MCP-prefixed tool name (mcp__retcon__rewind_to) — claude\'s real shape', async () => {
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_R', name: 'mcp__retcon__rewind_to' }],
+      undefined,
+      'toolu_R',
+    )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'rewind',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
+    expect(built).not.toBeNull()
+    expect(built!.toolUseId).toBe('toolu_R')
+  })
+
+  it('matches MCP-prefixed submit_file name', async () => {
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_S', name: 'mcp__retcon__submit_file' }],
+      undefined,
+      'toolu_S',
+    )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'submit',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
+    expect(built).not.toBeNull()
+    expect(built!.toolUseId).toBe('toolu_S')
+  })
 })
 
 describe('RewindMarkerV1Projector', () => {

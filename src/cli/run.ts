@@ -159,19 +159,38 @@ export function pickTransportId(args: readonly string[], isResume: boolean): str
 
 /**
  * Compute the permissions.allow entries that retcon pre-installs on every
- * spawned claude. Today these cover `~/.retcon/dumps/` so the AI can
- * Read/Edit/Write/Glob/Grep dump files without prompting the user (Phase 3
- * dump_to_file/submit_file flow). Lands in Phase 1 as part of the v0.4
- * release even though the dumps directory is not used yet — pre-allowing a
- * not-yet-existing path is harmless and bakes the full permissions story
- * into one release.
+ * spawned claude. Two groups:
  *
- * Each entry is in the Claude Code permissions DSL: `Tool(<glob>)`. The glob
- * uses `**` so any depth under the dumps directory matches.
+ *   1. retcon's own MCP tools (`mcp__retcon__*`). The user opted in by
+ *      running retcon — being prompted to confirm every rewind/recall/
+ *      bookmark call defeats the point. Lists them explicitly rather than
+ *      gobbing because Claude Code's allow DSL takes exact tool names for
+ *      MCP tools.
+ *
+ *   2. File-system access under `~/.retcon/dumps/**` so dump_to_file /
+ *      submit_file's Read/Edit/Write/Glob/Grep loop doesn't prompt either.
+ *
+ * Pre-allowing not-yet-existing paths is harmless. Each entry is in the
+ * Claude Code permissions DSL: `Tool(<arg>)`. For MCP tools the arg is
+ * the full tool name; for filesystem tools the arg is a path glob.
  */
+export const RETCON_MCP_TOOL_NAMES = [
+  'recall',
+  'rewind_to',
+  'bookmark',
+  'delete_bookmark',
+  'list_branches',
+  'dump_to_file',
+  'submit_file',
+] as const
+
 export function retconAllowEntries(homeDir: string): string[] {
   const dumpsGlob = `${homeDir}/.retcon/dumps/**`
   return [
+    // retcon's MCP tools — auto-allow so claude doesn't prompt the user
+    // every time the AI invokes a rewind/recall/bookmark.
+    ...RETCON_MCP_TOOL_NAMES.map(t => `mcp__retcon__${t}`),
+    // dumps-directory filesystem access for dump_to_file / submit_file.
     `Read(${dumpsGlob})`,
     `Edit(${dumpsGlob})`,
     `Write(${dumpsGlob})`,
