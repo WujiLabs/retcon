@@ -2,6 +2,30 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0-alpha.2] - 2026-05-02
+
+Two more bugs the alpha.1 ship missed, both surfaced by extending the cli-tmux-integration test with an SR-row assertion. alpha.0 had silent SSE+gzip blindness; alpha.1 fixed that but the SR pipeline was STILL broken in production for two unrelated reasons. The integration test paid for itself the moment we let it actually run a real rewind end-to-end.
+
+### Fixed
+
+- **`mcp__retcon__*` tools now pre-allowed in claude permissions.** `retconAllowEntries` only listed `~/.retcon/dumps/**` filesystem permissions; retcon's own MCP tools (recall, rewind_to, bookmark, delete_bookmark, list_branches, dump_to_file, submit_file) were not pre-approved. claude prompted "Do you want to proceed?" on every invocation, which silently broke the cli-tmux-integration test (it never made it past the first rewind_to call). Real-world impact: any user who hadn't manually approved these tools before would face a permission prompt on first use. Auto-allow makes sense — the user opted in by running retcon.
+- **Parallel-tool detection fixed for MCP-prefixed tool names.** claude's actual /v1/messages body uses the FULL MCP-prefixed tool name in `tool_use` blocks (`mcp__retcon__rewind_to`), not the bare `rewind_to`. alpha.1's `detectParallelTools` and `buildSyntheticAsset` matched only the bare name, so the operation tool itself was classified as a "parallel sibling" and EVERY splice aborted with `fork.synthesis_failed: parallel tool_uses (mcp__retcon__rewind_to)`. Zero SR rows materialized in production despite the SSE-decoupled architecture. Fix: accept either bare or MCP-prefixed name in both functions. Unit tests added with prefixed names so this regression has a permanent canary.
+
+### Added (testing)
+
+- **cli-tmux-integration test asserts on SR pipeline end-to-end.** After the existing `fork.back_requested` check, the test now waits for `fork.forked` and counts `stop_reason='rewind_synthetic'` rows. On failure it prints a rich diagnostic: every fork.* event with its error_message, every tobe-applied request's stop_reason+status, and the last 5 response_completed outcomes. Catches the SSE+gzip / prefix-name / permissions class of bugs that all hide behind clean unit-test fixtures.
+- **Two regression tests in `rewind-marker-v1.test.ts`** pin the MCP-prefixed name path: one for `mcp__retcon__rewind_to`, one for `mcp__retcon__submit_file`. Failing builds catch any future drift to bare-only matching.
+
+### Verified
+
+- `cli-tmux-integration` test 1 (rewind_to walks the revision DAG) passes in 25s against real Anthropic SSE+gzip traffic, with `fork.forked` firing and SR rows materializing.
+- `cli-tmux-assumptions` 5/5 pass.
+- 453 unit tests pass; lint clean.
+
+### Known / unrelated
+
+- `cli-tmux-integration` test 2 (resume + rewind across boundary) flakes — captured pane shows the post-resume `DURIAN` rewind prompt is never delivered to the resumed claude session via tmux send-keys. Not investigated in this release; fix is orthogonal to the SR pipeline.
+
 ## [0.5.0-alpha.1] - 2026-05-01
 
 Bug-fix release for v0.5.0-alpha.0. Dogfood verification revealed that the SR pipeline was silently broken in production: zero `fork.forked` events ever fired, zero SR rows ever materialized, despite the daemon running v0.5 binary and the rewinds themselves applying. Root cause: the parallel-tool guard at MCP-handler time and `buildSyntheticAsset`'s R1 lookup both tried to `JSON.parse` Anthropic's `/v1/messages` response body, which is gzip-compressed SSE — the parse always failed silently, callers always saw null, the synthetic field was never written to TOBE, and proxy-handler then logged the "pre-v0.5 daemon" backward-compat warning every time. Tests didn't catch it because the proxy-handler integration fixtures used `res.end(JSON.stringify(...))` (uncompressed JSON) — the SSE+gzip path was never exercised.
