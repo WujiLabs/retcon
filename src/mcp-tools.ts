@@ -169,27 +169,21 @@ function forkableSequence(db: DB, taskId: string): string[] {
  * Look up the response_completed event for a given revision id and return its
  * response body CID. Used to inspect R1's assistant response (e.g., for tool_use
  * detection in the rewind_to/submit_file parallel-tool guard).
+ *
+ * `revisionId` is the revisions-table row id, which equals the
+ * proxy.request_received event_id. The matching response_completed has a
+ * DIFFERENT event_id and points back via `payload.request_event_id`. So this
+ * is the only working query path — an earlier draft tried matching by
+ * event_id first and fell through to this; that first attempt could never
+ * succeed (request and response events have distinct ids).
  */
 function responseBodyCidFor(db: DB, revisionId: string): string | null {
   const row = db.prepare(`
-    SELECT payload FROM events WHERE event_id = ? AND topic = 'proxy.response_completed'
+    SELECT payload FROM events
+     WHERE topic = 'proxy.response_completed'
+           AND json_extract(payload, '$.request_event_id') = ?
   `).get(revisionId) as { payload: string } | undefined
-  if (!row) {
-    // Try by request_event_id pointer (revisions row id == request_received event id).
-    const row2 = db.prepare(`
-      SELECT payload FROM events
-       WHERE topic = 'proxy.response_completed'
-             AND json_extract(payload, '$.request_event_id') = ?
-    `).get(revisionId) as { payload: string } | undefined
-    if (!row2) return null
-    try {
-      const p = JSON.parse(row2.payload) as { body_cid?: string }
-      return p.body_cid ?? null
-    }
-    catch {
-      return null
-    }
-  }
+  if (!row) return null
   try {
     const parsed = JSON.parse(row.payload) as { body_cid?: string }
     return parsed.body_cid ?? null
