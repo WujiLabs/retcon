@@ -229,6 +229,39 @@ describe('proxy pass-through + event emission', () => {
   // gates.
 
   it('fork.forked: emitted when TOBE consumed AND 2xx AND end_turn AND synthetic present', async () => {
+    // Seed R1: a real request_received + response_completed with body blobs.
+    // buildSyntheticAsset (Phase 2) walks these to compose the SR's body.
+    const { blobRefFromBytes, blobRefFromMessagesBody } = await import('../body-blob.js')
+    const reqBodyBytes = Buffer.from(
+      JSON.stringify({ messages: [{ role: 'user', content: 'q1' }] }),
+      'utf8',
+    )
+    const reqSplit = await blobRefFromMessagesBody(reqBodyBytes)
+    const r1Event = fx.producer.emit(
+      'proxy.request_received',
+      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: reqSplit.topCid },
+      'sess-forked-happy',
+      reqSplit.refs,
+    )
+    const respBodyBytes = Buffer.from(
+      JSON.stringify({ content: [{ type: 'tool_use', id: 'toolu_42', name: 'rewind_to', input: {} }] }),
+      'utf8',
+    )
+    const respBlob = await blobRefFromBytes(respBodyBytes)
+    fx.producer.emit(
+      'proxy.response_completed',
+      {
+        request_event_id: r1Event.id,
+        status: 200,
+        headers_cid: 'h',
+        body_cid: respBlob.cid,
+        stop_reason: 'tool_use',
+        asset_cid: 'asset-r1',
+      },
+      'sess-forked-happy',
+      [respBlob.ref],
+    )
+
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
@@ -238,6 +271,7 @@ describe('proxy pass-through + event emission', () => {
       producer: fx.producer,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
 
     const sessionId = 'sess-forked-happy'
@@ -253,7 +287,7 @@ describe('proxy pass-through + event emission', () => {
         synthetic_assistant_text: 'Rewind initiated. Jumping to rev_abcd1234.',
         synthetic_user_message: 'hi',
         tool_use_id: 'toolu_42',
-        parent_revision_id: 'rev-r1',
+        parent_revision_id: r1Event.id,
         back_requested_at: 1234567890,
       },
     })
@@ -276,10 +310,11 @@ describe('proxy pass-through + event emission', () => {
       tool_use_id?: string
       target_view_id?: string
       sealed_at?: number
+      synthetic_asset_cid?: string
     }
     expect(forkedPayload.kind).toBe('rewind')
     expect(forkedPayload.synthetic_revision_id).toBe('rev-synth-1')
-    expect(forkedPayload.parent_revision_id).toBe('rev-r1')
+    expect(forkedPayload.parent_revision_id).toBe(r1Event.id)
     expect(forkedPayload.target_revision_id).toBe('ver-fork-x')
     expect(forkedPayload.to_revision_id).toMatch(/.+/)
     expect(forkedPayload.synthetic_tool_result_text).toContain('rev_abcd1234')
@@ -287,6 +322,7 @@ describe('proxy pass-through + event emission', () => {
     expect(forkedPayload.tool_use_id).toBe('toolu_42')
     expect(forkedPayload.target_view_id).toBe('view-target')
     expect(forkedPayload.sealed_at).toBe(1234567890)
+    expect(forkedPayload.synthetic_asset_cid).toMatch(/.+/)
   })
 
   it('fork.forked: NOT emitted when stop_reason is not end_turn', async () => {

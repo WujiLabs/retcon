@@ -30,8 +30,10 @@ import type { BlobRef, EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
+import { buildSyntheticAsset } from './rewind-marker-v1.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
+import { SqliteStorageProvider } from './storage.js'
 import type { TobePending, TobeStore } from './tobe.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
@@ -778,58 +780,10 @@ async function dispatch(
             && payload.status < 500
         if (isHttpSuccess) ctx.tobeStore.commit(sessionId)
 
-        // Synthetic departure Revision (SR) — v0.5.0. When TOBE consumption
-        // succeeds AND the receiving AI ended its turn cleanly (stop_reason
-        // === 'end_turn', status 2xx), emit fork.forked carrying the SR-
-        // construction metadata pre-computed by the MCP handler. The
-        // RewindMarker projector consumes this, builds R2'/R3' synthetic
-        // messages, stores blobs, and inserts the SR row.
-        //
-        // We gate on 2xx (< 300), not < 500 — a 4xx upstream means the
-        // rewound conversation didn't actually progress, no SR should be
-        // born. We also skip when stop_reason is anything other than
-        // 'end_turn' (e.g., 'max_tokens' or 'tool_use' — the assistant is
-        // mid-thought, not at a forkable stopping point).
-        //
-        // Backward-compat: TOBE pending files written by older daemons
-        // (mid-upgrade restart) lack `synthetic`. We log to stderr and skip;
-        // the rewind/submit still applies, just no SR materializes.
-        if (
-          isHttpSuccess
-          && topic === 'proxy.response_completed'
-          && typeof payload.status === 'number'
-          && payload.status >= 200
-          && payload.status < 300
-          && payload.stop_reason === 'end_turn'
-        ) {
-          if (pending.synthetic) {
-            const s = pending.synthetic
-            ctx.producer.emit(
-              'fork.forked',
-              {
-                kind: s.kind,
-                synthetic_revision_id: s.synthetic_revision_id,
-                parent_revision_id: s.parent_revision_id,
-                target_revision_id: pending.fork_point_revision_id,
-                to_revision_id: requestEvent.id,
-                synthetic_tool_result_text: s.synthetic_tool_result_text,
-                synthetic_assistant_text: s.synthetic_assistant_text,
-                synthetic_user_message: s.synthetic_user_message,
-                tool_use_id: s.tool_use_id,
-                target_view_id: s.target_view_id,
-                sealed_at: s.back_requested_at,
-              },
-              sessionId,
-            )
-          }
-          else {
-            console.warn(
-              `[proxy-handler] TOBE consumed for session=${sessionId} but `
-              + `pending.synthetic is missing — likely written by a pre-v0.5 daemon. `
-              + `Skipping fork.forked emission; no SR will materialize.`,
-            )
-          }
-        }
+        // Note: fork.forked emission lives in the response-handler's async
+        // path (after emitTerminal) — it requires building the synthetic
+        // asset, which is async. See the call-site at the end of the
+        // response handler below.
 
         // Notify any in-flight fork_back awaiter with a structured outcome.
         // fork_back can either await this or query the event log after the
@@ -994,11 +948,12 @@ async function dispatch(
             // Hashing is async; the single-tx event-emit invariant requires
             // all hashing to happen before we enter the transaction.
             const asset = await computeRevisionAsset(bodyCid, respBodyBlob.cid)
+            const status = upstreamRes.statusCode ?? 0
             emitTerminal(
               'proxy.response_completed',
               {
                 request_event_id: requestEvent.id,
-                status: upstreamRes.statusCode ?? 0,
+                status,
                 headers_cid: respHeaderBlob.cid,
                 body_cid: respBodyBlob.cid,
                 stop_reason: stopReason,
@@ -1006,6 +961,103 @@ async function dispatch(
               },
               [respHeaderBlob.ref, respBodyBlob.ref, { cid: asset.cid, bytes: asset.bytes }],
             )
+
+            // Synthetic departure Revision (SR) — v0.5.0. Gate on the same
+            // strict triad: TOBE consumed, status 2xx (not just <500 — a 4xx
+            // means the rewind didn't actually progress), stop_reason='end_turn'
+            // (mid-tool-use turns aren't forkable navigation points), and
+            // pending.synthetic populated (pre-v0.5 daemon TOBEs lack it).
+            //
+            // The work happens here (not inside emitTerminal) because building
+            // the synthetic body requires async I/O — loading R1's request +
+            // response blobs through the StorageProvider, walking the link
+            // structure, hashing the synthetic body. Doing it inline keeps
+            // emitTerminal sync (it's also called from the upstream-error and
+            // client-abort sync paths above).
+            //
+            // Failure is loud-but-non-fatal: if the synthetic body can't be
+            // built, emit fork.synthesis_failed for the audit trail and skip
+            // the SR. The rewind itself still applied (TOBE was consumed,
+            // R_new exists) — we just won't have a navigation marker for it.
+            if (
+              pending
+              && pending.synthetic
+              && status >= 200
+              && status < 300
+              && stopReason === 'end_turn'
+              && ctx.db
+            ) {
+              const s = pending.synthetic
+              const storageProvider = new SqliteStorageProvider(ctx.db)
+              try {
+                const built = await buildSyntheticAsset(
+                  { db: ctx.db, storageProvider },
+                  {
+                    parentRevisionId: s.parent_revision_id,
+                    syntheticToolResultText: s.synthetic_tool_result_text,
+                    syntheticAssistantText: s.synthetic_assistant_text,
+                    toolUseId: s.tool_use_id,
+                  },
+                )
+                if (built) {
+                  ctx.producer.emit(
+                    'fork.forked',
+                    {
+                      kind: s.kind,
+                      synthetic_revision_id: s.synthetic_revision_id,
+                      parent_revision_id: s.parent_revision_id,
+                      target_revision_id: pending.fork_point_revision_id,
+                      to_revision_id: requestEvent.id,
+                      synthetic_tool_result_text: s.synthetic_tool_result_text,
+                      synthetic_assistant_text: s.synthetic_assistant_text,
+                      synthetic_user_message: s.synthetic_user_message,
+                      tool_use_id: s.tool_use_id,
+                      target_view_id: s.target_view_id,
+                      sealed_at: s.back_requested_at,
+                      synthetic_asset_cid: built.topCid,
+                    },
+                    sessionId,
+                    built.refs,
+                  )
+                }
+                else {
+                  ctx.producer.emit(
+                    'fork.synthesis_failed',
+                    {
+                      parent_revision_id: s.parent_revision_id,
+                      target_revision_id: pending.fork_point_revision_id,
+                      error_message: 'buildSyntheticAsset returned null (R1 blob missing or unparseable)',
+                    },
+                    sessionId,
+                  )
+                }
+              }
+              catch (synthErr) {
+                const errMsg = (synthErr as Error).message ?? String(synthErr)
+                ctx.producer.emit(
+                  'fork.synthesis_failed',
+                  {
+                    parent_revision_id: s.parent_revision_id,
+                    target_revision_id: pending.fork_point_revision_id,
+                    error_message: `buildSyntheticAsset threw: ${errMsg}`,
+                  },
+                  sessionId,
+                )
+              }
+            }
+            else if (
+              pending
+              && !pending.synthetic
+              && status >= 200
+              && status < 300
+              && stopReason === 'end_turn'
+            ) {
+              console.warn(
+                `[proxy-handler] TOBE consumed for session=${sessionId} but `
+                + `pending.synthetic is missing — likely written by a pre-v0.5 daemon. `
+                + `Skipping fork.forked emission; no SR will materialize.`,
+              )
+            }
           }
           resolve()
         }

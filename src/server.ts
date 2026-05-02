@@ -28,6 +28,7 @@ import { handleMcpRequest, type McpContext, type McpTool } from './mcp-handler.j
 import { ANTHROPIC_UPSTREAM, handleProxyRequest, type ProxyContext } from './proxy-handler.js'
 import { DEFAULT_REDACTED_HEADERS } from './redaction.js'
 import { RevisionsV1Projector } from './revisions-v1.js'
+import { RewindMarkerV1Projector } from './rewind-marker-v1.js'
 import { SessionQueue } from './session-queue.js'
 import { SessionsV1Projector } from './sessions-v1.js'
 import type { TobeStore } from './tobe.js'
@@ -37,15 +38,23 @@ import { VERSION } from './version.js'
  * Build the standard set of projectors wired into a v1 producer.
  *
  * Declared dispatch order:
- *   1. sessions_v1     — must run first so a session/task row exists before
- *                        revisions_v1 tries to reference it on FK.
- *   2. revisions_v1    — sets revisions.parent_revision_id on response_completed;
- *                        branch_views_v1 reads that field later in the same tx.
- *   3. branch_views_v1 — advances matching branch_view's head to the newly
- *                        sealed Revision.
+ *   1. sessions_v1       — must run first so a session/task row exists before
+ *                          revisions_v1 tries to reference it on FK.
+ *   2. revisions_v1      — sets revisions.parent_revision_id on response_completed;
+ *                          branch_views_v1 reads that field later in the same tx.
+ *   3. branch_views_v1   — advances matching branch_view's head to the newly
+ *                          sealed Revision.
+ *   4. rewind_marker_v1  — INSERTs synthetic departure Revisions on fork.forked.
+ *                          Independent of the others (different topic), order is
+ *                          immaterial relative to them, but kept last for clarity.
  */
 export function defaultProjectors(): Projection[] {
-  return [new SessionsV1Projector(), new RevisionsV1Projector(), new BranchViewsV1Projector()]
+  return [
+    new SessionsV1Projector(),
+    new RevisionsV1Projector(),
+    new BranchViewsV1Projector(),
+    new RewindMarkerV1Projector(),
+  ]
 }
 
 /** Convenience: build an EventProducer pre-wired with the v1 projectors. */
