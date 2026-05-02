@@ -229,39 +229,6 @@ describe('proxy pass-through + event emission', () => {
   // gates.
 
   it('fork.forked: emitted when TOBE consumed AND 2xx AND end_turn AND synthetic present', async () => {
-    // Seed R1: a real request_received + response_completed with body blobs.
-    // buildSyntheticAsset (Phase 2) walks these to compose the SR's body.
-    const { blobRefFromBytes, blobRefFromMessagesBody } = await import('../body-blob.js')
-    const reqBodyBytes = Buffer.from(
-      JSON.stringify({ messages: [{ role: 'user', content: 'q1' }] }),
-      'utf8',
-    )
-    const reqSplit = await blobRefFromMessagesBody(reqBodyBytes)
-    const r1Event = fx.producer.emit(
-      'proxy.request_received',
-      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: reqSplit.topCid },
-      'sess-forked-happy',
-      reqSplit.refs,
-    )
-    const respBodyBytes = Buffer.from(
-      JSON.stringify({ content: [{ type: 'tool_use', id: 'toolu_42', name: 'rewind_to', input: {} }] }),
-      'utf8',
-    )
-    const respBlob = await blobRefFromBytes(respBodyBytes)
-    fx.producer.emit(
-      'proxy.response_completed',
-      {
-        request_event_id: r1Event.id,
-        status: 200,
-        headers_cid: 'h',
-        body_cid: respBlob.cid,
-        stop_reason: 'tool_use',
-        asset_cid: 'asset-r1',
-      },
-      'sess-forked-happy',
-      [respBlob.ref],
-    )
-
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
@@ -286,16 +253,35 @@ describe('proxy pass-through + event emission', () => {
         synthetic_tool_result_text: 'Rewind initiated. Target: rev_abcd1234. Synthetic message: hi.',
         synthetic_assistant_text: 'Rewind initiated. Jumping to rev_abcd1234.',
         synthetic_user_message: 'hi',
-        tool_use_id: 'toolu_42',
-        parent_revision_id: r1Event.id,
+        parent_revision_id: 'rev-r1-id',
         back_requested_at: 1234567890,
       },
     })
 
+    // claude's pre-splice body: realistic shape with R1's parsed assistant
+    // turn (containing the rewind_to tool_use) and a trailing user turn
+    // with the operation's tool_result. proxy-handler reads this body to
+    // derive tool_use_id and compose the synthetic SR body.
+    const claudeBody = {
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'q1' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_42', name: 'rewind_to', input: { turn_back_n: 1, message: 'hi' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_42', content: 'scheduled' }],
+        },
+      ],
+    }
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+      body: JSON.stringify(claudeBody),
     })
     await res.text()
 
@@ -307,22 +293,88 @@ describe('proxy pass-through + event emission', () => {
       to_revision_id?: string
       synthetic_tool_result_text?: string
       synthetic_user_message?: string
-      tool_use_id?: string
       target_view_id?: string
       sealed_at?: number
       synthetic_asset_cid?: string
     }
     expect(forkedPayload.kind).toBe('rewind')
     expect(forkedPayload.synthetic_revision_id).toBe('rev-synth-1')
-    expect(forkedPayload.parent_revision_id).toBe(r1Event.id)
+    expect(forkedPayload.parent_revision_id).toBe('rev-r1-id')
     expect(forkedPayload.target_revision_id).toBe('ver-fork-x')
     expect(forkedPayload.to_revision_id).toMatch(/.+/)
     expect(forkedPayload.synthetic_tool_result_text).toContain('rev_abcd1234')
     expect(forkedPayload.synthetic_user_message).toBe('hi')
-    expect(forkedPayload.tool_use_id).toBe('toolu_42')
     expect(forkedPayload.target_view_id).toBe('view-target')
     expect(forkedPayload.sealed_at).toBe(1234567890)
     expect(forkedPayload.synthetic_asset_cid).toMatch(/.+/)
+  })
+
+  it('fork.forked: NOT emitted, splice aborted, fork.synthesis_failed instead when R1 has parallel tool_uses', async () => {
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: fx.producer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
+    })
+
+    const sessionId = 'sess-parallel'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'rewritten' }],
+      fork_point_revision_id: 'ver-fork-p',
+      source_view_id: 'view-p',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'tv',
+        synthetic_revision_id: 'rev-not-born',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
+        parent_revision_id: 'r1',
+        back_requested_at: 1,
+      },
+    })
+
+    // R1 has parallel tool_uses: rewind_to + read_file.
+    const claudeBody = {
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'q' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_R', name: 'rewind_to', input: {} },
+            { type: 'tool_use', id: 'toolu_F', name: 'read_file', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_R', content: 'scheduled' }],
+        },
+      ],
+    }
+    await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(claudeBody),
+    })
+
+    const synthFail = await waitForEvent(fx.db, 'fork.synthesis_failed') as {
+      error_message?: string
+      parallel_tool_names?: string[]
+    }
+    expect(synthFail.error_message).toMatch(/splice aborted/i)
+    expect(synthFail.parallel_tool_names).toEqual(['read_file'])
+
+    // No fork.forked. TOBE was committed (deleted).
+    const consumer = createEventConsumer(fx.db)
+    const found = consumer.poll('_probe_no_forked_par', ['fork.forked'], 1)
+    expect(found.length).toBe(0)
+    expect(fx.tobeStore.peek(sessionId)).toBeNull()
   })
 
   it('fork.forked: NOT emitted when stop_reason is not end_turn', async () => {
@@ -349,7 +401,6 @@ describe('proxy pass-through + event emission', () => {
         synthetic_tool_result_text: 't',
         synthetic_assistant_text: 'a',
         synthetic_user_message: 'u',
-        tool_use_id: 'toolu',
         parent_revision_id: 'r1',
         back_requested_at: 1,
       },
@@ -391,7 +442,6 @@ describe('proxy pass-through + event emission', () => {
         synthetic_tool_result_text: 't',
         synthetic_assistant_text: 'a',
         synthetic_user_message: 'u',
-        tool_use_id: 'toolu',
         parent_revision_id: 'r1',
         back_requested_at: 1,
       },

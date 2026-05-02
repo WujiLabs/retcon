@@ -2,6 +2,34 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0-alpha.1] - 2026-05-01
+
+Bug-fix release for v0.5.0-alpha.0. Dogfood verification revealed that the SR pipeline was silently broken in production: zero `fork.forked` events ever fired, zero SR rows ever materialized, despite the daemon running v0.5 binary and the rewinds themselves applying. Root cause: the parallel-tool guard at MCP-handler time and `buildSyntheticAsset`'s R1 lookup both tried to `JSON.parse` Anthropic's `/v1/messages` response body, which is gzip-compressed SSE — the parse always failed silently, callers always saw null, the synthetic field was never written to TOBE, and proxy-handler then logged the "pre-v0.5 daemon" backward-compat warning every time. Tests didn't catch it because the proxy-handler integration fixtures used `res.end(JSON.stringify(...))` (uncompressed JSON) — the SSE+gzip path was never exercised.
+
+The fix: drop the response-body-parsing path entirely. Use the same trick `reconstructForkMessages` already uses — claude's pre-splice request body for the next /v1/messages call (R2) carries R1's parsed `content[]` as its second-to-last entry. That body is JSON, uncompressed, no SSE reconstruction needed.
+
+### Changed
+
+- **Parallel-tool detection moved to proxy-handler at TOBE-consumption time.** The MCP-handler-time guard (and the `loadResponseToolUses` / `responseBodyCidFor` helpers) is gone. proxy-handler now parses claude's pre-splice body before applying the splice; if the last assistant has tool_use blocks beyond the operation, it aborts the splice, commits the TOBE, emits `fork.synthesis_failed` with `parallel_tool_names`, and lets claude's R2 go through unchanged. The AI surfaces the failure on its next turn via the loud-failure response (`POSSIBLE CAUSE — did you call rewind_to alongside other tools...?`).
+- **`buildSyntheticAsset` reads R1's content from the originalBody, not from R1's response blob.** New signature: `(originalBody: Uint8Array, kind, syntheticToolResultText, syntheticAssistantText) → {topCid, refs, toolUseId} | null`. Walks the messages array backwards to find the last assistant message, extracts the operation tool's `tool_use_id`, drops the trailing user (which carries the discarded tool_results), appends synthetic R2'/R3'. No StorageProvider needed, no SSE reconstruction.
+- **`SyntheticDepartureMeta.tool_use_id` field dropped.** Derived at proxy-handler time. Reduces TOBE shape duplication and the "MCP handler tries to compute it via SSE parse → fails → field is wrong" failure mode.
+- **Loud-failure response in rewind_to / submit_file** adds a `POSSIBLE CAUSE — did you call <tool> alongside other tools` hint. If the splice aborted on parallel-tool detection, the AI sees this on its next turn and can self-diagnose.
+- **`fork.synthesis_failed` event** gains an optional `parallel_tool_names: string[]` field for parallel-tool aborts. `parent_revision_id` becomes optional in the type (the abort path always populates it from `pending.synthetic`, but earlier emitters may not have).
+
+### Removed
+
+- **`loadResponseToolUses` and `responseBodyCidFor` helpers** (`mcp-tools.ts`). The SSE-blind path is gone.
+- **MCP-handler-time parallel-tool rejection.** Was technically nicer UX (synchronous error inline) but only worked in tests. The deferred-to-proxy-handler version actually runs in production.
+
+### Tests
+
+- `mcp-tools.test.ts`: dropped the parallel-tool guard tests (no longer applicable). Updated extended-TOBE tests to assert `tool_use_id` is absent. Added loud-failure-text-mentions-parallel-tool tests for both rewind_to and submit_file.
+- `proxy-handler.test.ts`: rewrote the fork.forked happy-path test with a realistic claude body shape (R1's parsed assistant turn with tool_use + trailing user with tool_result). Added a parallel-tool-abort test that drives an R1 with `rewind_to + read_file` and asserts no fork.forked fires, fork.synthesis_failed does, TOBE is committed.
+- `rewind-marker-v1.test.ts`: rewrote `buildSyntheticAsset` tests against the new originalBody-based signature. Added a `makeOriginalBody` helper that constructs claude-shape bodies. Tests cover malformed JSON, no last assistant, no operation tool_use, kind discrimination (`kind=submit` rejects R1 with rewind_to), trailing-user-drop semantics.
+- `sr-integration.test.ts`: end-to-end happy path now drives a realistic claude body through the proxy.
+
+All 451 tests pass; lint + build clean. Total v0.5.0-alpha.1 diff: -300 / +250 net (mostly test rewrites; production code shrinks by ~100 lines).
+
 ## [0.5.0-alpha.0] - 2026-05-01
 
 The CEO-as-user spotted the gap during dogfood review: every navigation event in retcon's DAG should be a real row, but rewinds were a side-effect — TOBE pending file got swapped, branch_views updated, but no Revision row marked the moment. "From" turns showed up via a `from_turn_id` field on prior `fork.back_requested` events; "to" turns showed up via auto fork-point branch_views. Neither of those is the rewind itself. This release introduces the **synthetic departure Revision (SR)** — a real row in the `revisions` table representing the moment a rewind or submit_file completed successfully. Same table, same query patterns, no special cases.

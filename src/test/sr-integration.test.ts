@@ -239,7 +239,21 @@ describe('SR end-to-end (Phase 4)', () => {
     const proxyTobeStore = createTobeStore(fx.tmpRoot)
     expect(proxyTobeStore.peek(sessionId)).toBeTruthy()
 
-    await driveTurn(fx, sessionId, [{ role: 'user', content: 'orig user prompt' }])
+    // Realistic claude body shape: R1's parsed assistant turn (with
+    // tool_use(rewind_to)) and a trailing user turn carrying the
+    // tool_result. proxy-handler reads this to derive tool_use_id and
+    // detect parallel tools.
+    await driveTurn(fx, sessionId, [
+      { role: 'user', content: 't2' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_R1', name: 'rewind_to', input: {} }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_R1', content: 'scheduled' }],
+      },
+    ])
 
     // Wait for fork.forked to fire.
     const consumer = createEventConsumer(fx.db)

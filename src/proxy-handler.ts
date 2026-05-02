@@ -30,10 +30,9 @@ import type { BlobRef, EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
-import { buildSyntheticAsset } from './rewind-marker-v1.js'
+import { buildSyntheticAsset, detectParallelTools } from './rewind-marker-v1.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
-import { SqliteStorageProvider } from './storage.js'
 import type { TobePending, TobeStore } from './tobe.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
@@ -608,7 +607,20 @@ async function dispatch(
   // Same bytes get hashed by both the tobe_applied_from metadata block
   // and the proxy.request_received emit. Compute once.
   let originalBodyBlob: Awaited<ReturnType<typeof blobRefFromBytes>> | undefined
-  if (pending) {
+  // Parallel-tool guard (v0.5.0-alpha.1). When R1 has sibling tool_uses
+  // beyond the operation, the splice would discard their tool_results and
+  // upstream would 400. We detect by parsing claude's pre-splice JSON body
+  // (no SSE involved — rawBody is the request claude sent, not the upstream
+  // response) and abort the splice if found. The AI surfaces the failure on
+  // the next turn via the loud-failure response in rewind_to/submit_file.
+  let spliceAborted: { kind: 'rewind' | 'submit', names: string[] } | null = null
+  if (pending && pending.synthetic) {
+    const det = detectParallelTools(rawBody, pending.synthetic.kind)
+    if (det.ok && det.parallel.length > 0) {
+      spliceAborted = { kind: pending.synthetic.kind, names: det.parallel }
+    }
+  }
+  if (pending && !spliceAborted) {
     const { rewritten, originalBody } = applyTobe(rawBody, pending)
     bodyToForward = rewritten
     originalBodyBlob = await blobRefFromBytes(originalBody)
@@ -617,6 +629,22 @@ async function dispatch(
       source_view_id: pending.source_view_id,
       original_body_cid: originalBodyBlob.cid,
     }
+  }
+  else if (pending && spliceAborted) {
+    // Abort path. Keep rawBody as bodyToForward (claude's call goes through
+    // unchanged). Commit (delete) the TOBE so retries don't keep tripping.
+    // Emit fork.synthesis_failed for audit.
+    ctx.tobeStore.commit(sessionId)
+    ctx.producer.emit(
+      'fork.synthesis_failed',
+      {
+        target_revision_id: pending.fork_point_revision_id,
+        parent_revision_id: pending.synthetic?.parent_revision_id,
+        error_message: `splice aborted: R1 had parallel tool_uses (${spliceAborted.names.join(', ')}); rewound context would discard their results`,
+        parallel_tool_names: spliceAborted.names,
+      },
+      sessionId,
+    )
   }
   else if (isMessagesPath && ctx.db) {
     // No TOBE pending — check if this session is on a forked branch and, if
@@ -773,7 +801,7 @@ async function dispatch(
       // outcome (5xx body, client abort, upstream_error) keeps the file
       // so Claude Code's retry loop re-applies it. This is what makes
       // the fork intent idempotent under transient failures.
-      if (pending) {
+      if (pending && !spliceAborted) {
         const isHttpSuccess
           = topic === 'proxy.response_completed'
             && typeof payload.status === 'number'
@@ -962,43 +990,42 @@ async function dispatch(
               [respHeaderBlob.ref, respBodyBlob.ref, { cid: asset.cid, bytes: asset.bytes }],
             )
 
-            // Synthetic departure Revision (SR) — v0.5.0. Gate on the same
-            // strict triad: TOBE consumed, status 2xx (not just <500 — a 4xx
-            // means the rewind didn't actually progress), stop_reason='end_turn'
-            // (mid-tool-use turns aren't forkable navigation points), and
-            // pending.synthetic populated (pre-v0.5 daemon TOBEs lack it).
+            // Synthetic departure Revision (SR) — v0.5.0-alpha.1. Gate on:
+            // TOBE consumed (and not aborted by parallel-tool guard above),
+            // status 2xx (4xx means the rewind didn't actually progress),
+            // stop_reason='end_turn' (mid-tool-use turns aren't forkable
+            // navigation points), pending.synthetic populated (pre-v0.5
+            // daemon TOBEs lack it), and we have an originalBody to
+            // extract R1's parsed content from.
             //
-            // The work happens here (not inside emitTerminal) because building
-            // the synthetic body requires async I/O — loading R1's request +
-            // response blobs through the StorageProvider, walking the link
-            // structure, hashing the synthetic body. Doing it inline keeps
-            // emitTerminal sync (it's also called from the upstream-error and
-            // client-abort sync paths above).
+            // The work happens here (not inside emitTerminal) because
+            // building the synthetic body requires async hashing.
             //
-            // Failure is loud-but-non-fatal: if the synthetic body can't be
-            // built, emit fork.synthesis_failed for the audit trail and skip
-            // the SR. The rewind itself still applied (TOBE was consumed,
-            // R_new exists) — we just won't have a navigation marker for it.
+            // Failure is loud-but-non-fatal: if the synthetic body can't
+            // be built, emit fork.synthesis_failed for the audit trail
+            // and skip the SR. The rewind itself still applied (TOBE was
+            // consumed, R_new exists) — we just won't have a navigation
+            // marker for it.
             if (
               pending
+              && !spliceAborted
               && pending.synthetic
               && status >= 200
               && status < 300
               && stopReason === 'end_turn'
-              && ctx.db
+              && originalBodyBlob
             ) {
               const s = pending.synthetic
-              const storageProvider = new SqliteStorageProvider(ctx.db)
               try {
-                const built = await buildSyntheticAsset(
-                  { db: ctx.db, storageProvider },
-                  {
-                    parentRevisionId: s.parent_revision_id,
-                    syntheticToolResultText: s.synthetic_tool_result_text,
-                    syntheticAssistantText: s.synthetic_assistant_text,
-                    toolUseId: s.tool_use_id,
-                  },
-                )
+                // We hashed `originalBody` into originalBodyBlob already, so
+                // the BlobRef has the bytes. Reuse them directly — no need
+                // to re-fetch from the storage provider.
+                const built = await buildSyntheticAsset({
+                  originalBody: originalBodyBlob.ref.bytes,
+                  kind: s.kind,
+                  syntheticToolResultText: s.synthetic_tool_result_text,
+                  syntheticAssistantText: s.synthetic_assistant_text,
+                })
                 if (built) {
                   ctx.producer.emit(
                     'fork.forked',
@@ -1011,7 +1038,6 @@ async function dispatch(
                       synthetic_tool_result_text: s.synthetic_tool_result_text,
                       synthetic_assistant_text: s.synthetic_assistant_text,
                       synthetic_user_message: s.synthetic_user_message,
-                      tool_use_id: s.tool_use_id,
                       target_view_id: s.target_view_id,
                       sealed_at: s.back_requested_at,
                       synthetic_asset_cid: built.topCid,
@@ -1026,7 +1052,7 @@ async function dispatch(
                     {
                       parent_revision_id: s.parent_revision_id,
                       target_revision_id: pending.fork_point_revision_id,
-                      error_message: 'buildSyntheticAsset returned null (R1 blob missing or unparseable)',
+                      error_message: 'buildSyntheticAsset returned null (originalBody missing last assistant or operation tool_use)',
                     },
                     sessionId,
                   )
@@ -1047,6 +1073,7 @@ async function dispatch(
             }
             else if (
               pending
+              && !spliceAborted
               && !pending.synthetic
               && status >= 200
               && status < 300

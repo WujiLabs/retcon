@@ -16,9 +16,7 @@
 // synthetic body, it emits `fork.synthesis_failed` instead. This projector
 // no-ops on that topic; the audit event captures the gap for the operator.
 
-import type { AssetId, StorageProvider } from '@playtiss/core'
-
-import { blobRefFromMessagesBody, loadHydratedMessagesBody } from './body-blob.js'
+import { blobRefFromMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
 import type { BlobRef, Event, Projection } from './events.js'
 
@@ -35,8 +33,6 @@ export interface ForkForkedPayload {
   synthetic_tool_result_text: string
   synthetic_assistant_text: string
   synthetic_user_message: string
-  /** R1's tool_use id; pairs with the synthetic R2'-tool_result. */
-  tool_use_id: string
   /** target_view_id from fork.back_requested correlation. */
   target_view_id: string
   /** SR.sealed_at — captured at MCP-call time. */
@@ -47,93 +43,94 @@ export interface ForkForkedPayload {
 
 /** Payload of fork.synthesis_failed. Audit-only; projector ignores. */
 export interface ForkSynthesisFailedPayload {
-  parent_revision_id: string
+  parent_revision_id?: string
   target_revision_id: string
   error_message: string
+  /** When the failure is "R1 had parallel tool_uses" we name the siblings. */
+  parallel_tool_names?: string[]
 }
 
 /**
  * Build the synthetic SR body: history-through-R1 + R2' (synthetic
  * tool_result paired with R1's tool_use_id) + R3' (synthetic assistant text).
  *
- * Pulls R1's request body messages and R1's response content from the
- * StorageProvider; concatenates them with the synthetic suffix; stores the
- * result via blobRefFromMessagesBody so SR's asset_cid is in the same
- * link-walked format as real Revision bodies (downstream consumers like
- * loadHydratedMessagesBody work transparently).
+ * Reads R1's parsed content from `originalBody` — the pre-splice JSON body
+ * claude actually sent for R2 (= the next /v1/messages after the
+ * rewind_to/submit_file MCP call). Claude packs R1's assistant turn back
+ * into that body's messages array as the next-to-last entry; the last
+ * entry is the user turn with tool_results that we're discarding via
+ * splice. So R1's content lives in `messages[messages.length - 2]`
+ * provided the tail is the expected user/assistant alternation.
  *
- * Returns null on any failure (R1 not found, body unparseable, etc.).
- * Caller should emit `fork.synthesis_failed` on null and skip SR creation.
+ * This avoids parsing R1's actual response body, which is gzip-encoded
+ * SSE and would need a stream reconstructor. Same pattern
+ * `reconstructForkMessages` uses to read parsed assistant turns.
+ *
+ * Returns null on any structural failure (no last assistant, no operation
+ * tool_use in last assistant). Caller emits `fork.synthesis_failed` on null.
  */
 export async function buildSyntheticAsset(
-  deps: {
-    db: DB
-    storageProvider: StorageProvider
-  },
   args: {
-    parentRevisionId: string
+    /** claude's pre-splice JSON body. Must contain { messages: [...] }. */
+    originalBody: Uint8Array
+    /** Discriminates which operation tool's tool_use_id we extract. */
+    kind: 'rewind' | 'submit'
+    /** R2' display content. */
     syntheticToolResultText: string
+    /** R3' display content. */
     syntheticAssistantText: string
-    toolUseId: string
   },
-): Promise<{ topCid: string, refs: BlobRef[] } | null> {
-  // Look up R1's request_received body_cid + response_completed body_cid.
-  // Direct DB queries keep this synchronous up front; the async work below
-  // is just hashing and link-walking.
-  const reqRow = deps.db.prepare(
-    'SELECT payload FROM events WHERE event_id = ? AND topic = \'proxy.request_received\'',
-  ).get(args.parentRevisionId) as { payload: string } | undefined
-  if (!reqRow) return null
-
-  const respRow = deps.db.prepare(`
-    SELECT payload FROM events
-     WHERE topic = 'proxy.response_completed'
-           AND json_extract(payload, '$.request_event_id') = ?
-  `).get(args.parentRevisionId) as { payload: string } | undefined
-  if (!respRow) return null
-
-  let reqBodyCid: string
-  let respBodyCid: string
+): Promise<{ topCid: string, refs: BlobRef[], toolUseId: string } | null> {
+  let parsed: { messages?: unknown[] }
   try {
-    reqBodyCid = (JSON.parse(reqRow.payload) as { body_cid?: string }).body_cid ?? ''
-    respBodyCid = (JSON.parse(respRow.payload) as { body_cid?: string }).body_cid ?? ''
+    parsed = JSON.parse(Buffer.from(args.originalBody).toString('utf8'))
   }
   catch {
     return null
   }
-  if (!reqBodyCid || !respBodyCid) return null
+  if (!parsed || !Array.isArray(parsed.messages)) return null
+  const messages = parsed.messages as Array<{ role?: string, content?: unknown }>
 
-  // Hydrate R1's request body to extract its messages array.
-  const hydrated = await loadHydratedMessagesBody(deps.storageProvider, reqBodyCid as AssetId)
-  if (!hydrated || !Array.isArray(hydrated.messages)) return null
-  const historyMessages = hydrated.messages
-
-  // Load R1's response body and pull its assistant content[].
-  let respContent: unknown[] | null = null
-  try {
-    const respBytes = await deps.storageProvider.fetchBuffer(respBodyCid as AssetId)
-    const parsed = JSON.parse(Buffer.from(respBytes).toString('utf8')) as {
-      content?: unknown[]
+  // Walk backwards to find the last assistant message — that's R1's parsed
+  // content. content[] inside it has the tool_use blocks (including the
+  // operation we care about) plus any sibling text/thinking blocks.
+  let r1Idx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'assistant') {
+      r1Idx = i
+      break
     }
-    if (Array.isArray(parsed.content)) respContent = parsed.content
   }
-  catch {
-    return null
-  }
-  if (!respContent) return null
+  if (r1Idx === -1) return null
+  const r1 = messages[r1Idx]
+  if (!Array.isArray(r1.content)) return null
 
-  // Compose the synthetic messages array. The shape is critical — Anthropic's
-  // /v1/messages requires every tool_use to be paired with a tool_result; the
-  // R2' message provides that pairing using R1's tool_use_id.
+  // Find the operation tool's tool_use block — R2's synthetic tool_result
+  // pairs to its id so Anthropic's tool_use/tool_result invariant holds.
+  const operationToolName = args.kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  let toolUseId: string | null = null
+  for (const block of r1.content as Array<{ type?: string, name?: string, id?: string }>) {
+    if (block.type === 'tool_use' && block.name === operationToolName && typeof block.id === 'string') {
+      toolUseId = block.id
+      break
+    }
+  }
+  if (!toolUseId) return null
+
+  // historyThroughR1 = everything up to and including R1. We drop the
+  // trailing user turn (which carries the discarded tool_results).
+  const historyThroughR1 = messages.slice(0, r1Idx + 1)
+
+  // Compose the synthetic messages array. R2' provides the tool_result
+  // pairing for R1's operation tool_use; R3' is the assistant wrap-up.
   const syntheticMessages: unknown[] = [
-    ...historyMessages,
-    { role: 'assistant', content: respContent },
+    ...historyThroughR1,
     {
       role: 'user',
       content: [
         {
           type: 'tool_result',
-          tool_use_id: args.toolUseId,
+          tool_use_id: toolUseId,
           content: [{ type: 'text', text: args.syntheticToolResultText }],
         },
       ],
@@ -151,7 +148,48 @@ export async function buildSyntheticAsset(
     'utf8',
   )
   const split = await blobRefFromMessagesBody(bodyBytes)
-  return { topCid: split.topCid, refs: split.refs }
+  return { topCid: split.topCid, refs: split.refs, toolUseId }
+}
+
+/**
+ * Detect parallel tool_uses on R1 from claude's pre-splice body. Returns
+ * the names of any tool_use blocks in R1's content beyond the operation
+ * tool itself. Empty array means clean.
+ *
+ * Used by proxy-handler to abort the splice when the rewound history
+ * would discard sibling tool results. Fail-loud: emit fork.synthesis_failed
+ * with the names so the operator/AI can see what was rejected.
+ */
+export function detectParallelTools(
+  originalBody: Uint8Array,
+  kind: 'rewind' | 'submit',
+): { ok: true, parallel: string[] } | { ok: false } {
+  let parsed: { messages?: unknown[] }
+  try {
+    parsed = JSON.parse(Buffer.from(originalBody).toString('utf8'))
+  }
+  catch {
+    return { ok: false }
+  }
+  if (!parsed || !Array.isArray(parsed.messages)) return { ok: false }
+  const messages = parsed.messages as Array<{ role?: string, content?: unknown }>
+  let r1: { content?: unknown } | null = null
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === 'assistant') {
+      r1 = messages[i]
+      break
+    }
+  }
+  if (!r1 || !Array.isArray(r1.content)) return { ok: false }
+
+  const operationToolName = kind === 'rewind' ? 'rewind_to' : 'submit_file'
+  const parallel: string[] = []
+  for (const block of r1.content as Array<{ type?: string, name?: string }>) {
+    if (block.type === 'tool_use' && typeof block.name === 'string' && block.name !== operationToolName) {
+      parallel.push(block.name)
+    }
+  }
+  return { ok: true, parallel }
 }
 
 /**

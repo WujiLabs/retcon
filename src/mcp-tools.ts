@@ -29,7 +29,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import type { AssetId, StorageProvider } from '@playtiss/core'
-import { generateTraceId, load as loadAsset } from '@playtiss/core'
+import { generateTraceId } from '@playtiss/core'
 
 import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import { retconDumpsDir } from './cli/paths.js'
@@ -163,67 +163,6 @@ function forkableSequence(db: DB, taskId: string): string[] {
      ORDER BY sealed_at DESC, id DESC
   `).all(taskId) as Array<{ id: string }>
   return rows.map(r => r.id)
-}
-
-/**
- * Look up the response_completed event for a given revision id and return its
- * response body CID. Used to inspect R1's assistant response (e.g., for tool_use
- * detection in the rewind_to/submit_file parallel-tool guard).
- *
- * `revisionId` is the revisions-table row id, which equals the
- * proxy.request_received event_id. The matching response_completed has a
- * DIFFERENT event_id and points back via `payload.request_event_id`. So this
- * is the only working query path — an earlier draft tried matching by
- * event_id first and fell through to this; that first attempt could never
- * succeed (request and response events have distinct ids).
- */
-function responseBodyCidFor(db: DB, revisionId: string): string | null {
-  const row = db.prepare(`
-    SELECT payload FROM events
-     WHERE topic = 'proxy.response_completed'
-           AND json_extract(payload, '$.request_event_id') = ?
-  `).get(revisionId) as { payload: string } | undefined
-  if (!row) return null
-  try {
-    const parsed = JSON.parse(row.payload) as { body_cid?: string }
-    return parsed.body_cid ?? null
-  }
-  catch {
-    return null
-  }
-}
-
-/**
- * Load the assistant response body for a revision (R1) and extract its tool_use
- * blocks. Returns the list of {id, name} pairs in declaration order, or null if
- * the response can't be loaded/parsed. Used by the rewind_to/submit_file guard
- * to detect parallel tool_uses.
- */
-async function loadResponseToolUses(
-  deps: McpToolDeps,
-  revisionId: string,
-): Promise<Array<{ id: string, name: string }> | null> {
-  const responseBodyCid = responseBodyCidFor(deps.db, revisionId)
-  if (!responseBodyCid) return null
-  try {
-    const blob = await loadAsset(responseBodyCid as AssetId, deps.storageProvider)
-    if (!(blob instanceof Uint8Array)) return null
-    const text = new TextDecoder().decode(blob)
-    const parsed = JSON.parse(text) as {
-      content?: Array<{ type?: string, id?: string, name?: string }>
-    }
-    if (!Array.isArray(parsed.content)) return null
-    const toolUses: Array<{ id: string, name: string }> = []
-    for (const block of parsed.content) {
-      if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        toolUses.push({ id: block.id, name: block.name })
-      }
-    }
-    return toolUses
-  }
-  catch {
-    return null
-  }
 }
 
 /**
@@ -635,6 +574,9 @@ function rewindScheduledResponse(extra: {
       'Tell the user: "retcon failed to apply the rewind. The next message will not be in the rewound state."',
       'They may need to retry, or run `retcon stop && retcon` to restart the daemon.',
       '',
+      'POSSIBLE CAUSE — did you call rewind_to alongside other tools in the same assistant turn?',
+      'Parallel tool_uses with rewind_to abort the splice (their results would be discarded by the rewound context). If that\'s what happened, retry rewind_to alone — no parallel tools — on a later turn.',
+      '',
       '(On the success path, the proxy splices the rewound history into the next /v1/messages and this entire turn is discarded — meaning you never see this text. Reading it means the splice failed.)',
     ].join('\n'),
     fork_point: extra.fork_point,
@@ -747,6 +689,9 @@ function submitScheduledResponse(extra: {
       'RETCON ERROR: If you are reading this, the submit did NOT take effect.',
       'Tell the user: "retcon failed to apply the submitted dump. The next message will not include the edits."',
       'They may need to retry, or run `retcon stop && retcon` to restart the daemon.',
+      '',
+      'POSSIBLE CAUSE — did you call submit_file alongside other tools in the same assistant turn?',
+      'Parallel tool_uses with submit_file abort the splice (their results would be discarded by the submitted context). If that\'s what happened, retry submit_file alone — no parallel tools — on a later turn.',
       '',
       '(On the success path, the proxy splices the submitted history into the next /v1/messages and this entire turn is discarded — meaning you never see this text. Reading it means the splice failed.)',
     ].join('\n'),
@@ -1199,31 +1144,13 @@ export function createMcpToolsWithTokens(
         return { error: 'rewind_to requires an MCP-initialized session (orphan sessions cannot rewind)' }
       }
 
-      // ── Parallel-tool guard ───────────────────────────────────────────────
-      // R1 = the assistant turn that emitted tool_use(rewind_to). By the time
-      // claude dispatches the MCP call, the assistant response has already
-      // closed (response_completed has fired) — claude only dispatches tool
-      // calls after the SSE stream completes. So R1.response_body is
-      // queryable. If R1 has other tool_use blocks alongside rewind_to,
-      // reject: the rewound history will replace the next /v1/messages and
-      // the parallel tools' results would be discarded before the receiving
-      // AI ever sees them.
+      // R1 = the assistant turn that emitted tool_use(rewind_to). We capture
+      // its id here so SR.parent_revision_id can be set later. The rules-text
+      // warning advises against parallel tool_uses on R1; the actual detection
+      // happens in proxy-handler at TOBE-consumption time, where claude's
+      // pre-splice JSON body exposes R1's parsed content directly (no SSE
+      // parsing needed).
       const r1 = mostRecentRevision(deps.db, sess.task_id)
-      let rewindToolUseId: string | null = null
-      if (r1) {
-        const toolUses = await loadResponseToolUses(deps, r1.id)
-        if (toolUses) {
-          const parallel = toolUses.filter(t => t.name !== 'rewind_to')
-          if (parallel.length > 0) {
-            const names = parallel.map(t => t.name).join(', ')
-            return {
-              error: `rewind_to was called in parallel with other tool(s): ${names}. The rewound context will discard their results before the receiving AI sees them. Either call rewind_to alone (no parallel tools), or finish the other work first and rewind on a later turn.`,
-            }
-          }
-          const rewindEntry = toolUses.find(t => t.name === 'rewind_to')
-          if (rewindEntry) rewindToolUseId = rewindEntry.id
-        }
-      }
 
       // Resolve the target revision: turn_id wins; else turn_back_n; else default 1.
       // Also capture `headBeforeFork` — the closed_forkable head at this moment.
@@ -1281,11 +1208,11 @@ export function createMcpToolsWithTokens(
 
       const targetViewId = generateTraceId()
 
-      // SR-construction metadata (v0.5.0). Populated only when we have R1
-      // (= the assistant turn that emitted tool_use(rewind_to)) AND its
-      // tool_use_id. Without those, the proxy-handler skips fork.forked
-      // emission and no SR row materializes — the rewind still applies.
-      // Pre-1.0 alpha policy: documented gap, not a regression.
+      // SR-construction metadata (v0.5.0). Populated whenever we can resolve
+      // R1 (= mostRecentRevision in this task). proxy-handler derives
+      // tool_use_id at TOBE-consumption time from claude's pre-splice JSON
+      // body. If R1 is missing (rare; corrupted projector state), no SR
+      // materializes — the rewind still applies.
       const syntheticRevisionId = generateTraceId()
       const forkShort = target.id.slice(0, 8)
       const syntheticToolResultText
@@ -1298,7 +1225,7 @@ export function createMcpToolsWithTokens(
         messages: baseMessages,
         fork_point_revision_id: target.id,
         source_view_id: ctx.sessionId,
-        synthetic: r1 && rewindToolUseId
+        synthetic: r1
           ? {
               kind: 'rewind',
               target_view_id: targetViewId,
@@ -1306,7 +1233,6 @@ export function createMcpToolsWithTokens(
               synthetic_tool_result_text: syntheticToolResultText,
               synthetic_assistant_text: syntheticAssistantText,
               synthetic_user_message: message,
-              tool_use_id: rewindToolUseId,
               parent_revision_id: r1.id,
               back_requested_at: backRequestedAt,
             }
@@ -1979,26 +1905,11 @@ export function createMcpToolsWithTokens(
         return { error: 'submit_file requires an MCP-initialized session (orphan sessions cannot submit)' }
       }
 
-      // ── Parallel-tool guard ───────────────────────────────────────────────
-      // Mirror of rewind_to: if the assistant turn emitting submit_file also
-      // emits other tool_uses, the splice will discard their results. Reject
-      // with a clear error.
+      // R1 = the assistant turn that emitted tool_use(submit_file). Captured
+      // here for SR.parent_revision_id. Parallel-tool detection runs at
+      // TOBE-consumption time in proxy-handler against claude's parsed JSON
+      // body — see the rewind_to handler comment above for rationale.
       const r1 = mostRecentRevision(deps.db, sess.task_id)
-      let submitToolUseId: string | null = null
-      if (r1) {
-        const toolUses = await loadResponseToolUses(deps, r1.id)
-        if (toolUses) {
-          const parallel = toolUses.filter(t => t.name !== 'submit_file')
-          if (parallel.length > 0) {
-            const names = parallel.map(t => t.name).join(', ')
-            return {
-              error: `submit_file was called in parallel with other tool(s): ${names}. The submitted history will discard their results before the receiving AI sees them. Either call submit_file alone, or finish the other work first and submit on a later turn.`,
-            }
-          }
-          const submitEntry = toolUses.find(t => t.name === 'submit_file')
-          if (submitEntry) submitToolUseId = submitEntry.id
-        }
-      }
 
       // submit_file needs at least one closed_forkable revision to use as
       // the fork-point anchor in the emitted fork.back_requested event.
@@ -2015,10 +1926,9 @@ export function createMcpToolsWithTokens(
       const targetViewId = generateTraceId()
 
       // SR-construction metadata (v0.5.0). Same handoff as rewind_to: the
-      // proxy-handler emits fork.forked at TOBE-consumed time and the
-      // RewindMarker projector inserts the SR row. Skipped (no SR
-      // materialized) when R1 or its tool_use can't be resolved — the
-      // submit still applies.
+      // proxy-handler derives tool_use_id at TOBE-consumed time, then emits
+      // fork.forked. Skipped (no SR materialized) when R1 can't be resolved
+      // — the submit still applies.
       const syntheticRevisionId = generateTraceId()
       const headShort = headForkable.id.slice(0, 8)
       const dumpBasename = path.basename(resolvedPath)
@@ -2032,7 +1942,7 @@ export function createMcpToolsWithTokens(
         messages: finalMessages,
         fork_point_revision_id: headForkable.id,
         source_view_id: ctx.sessionId,
-        synthetic: r1 && submitToolUseId
+        synthetic: r1
           ? {
               kind: 'submit',
               target_view_id: targetViewId,
@@ -2040,7 +1950,6 @@ export function createMcpToolsWithTokens(
               synthetic_tool_result_text: syntheticToolResultText,
               synthetic_assistant_text: syntheticAssistantText,
               synthetic_user_message: message,
-              tool_use_id: submitToolUseId,
               parent_revision_id: r1.id,
               back_requested_at: backRequestedAt,
             }

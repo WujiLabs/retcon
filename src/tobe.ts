@@ -19,15 +19,23 @@ import path from 'node:path'
 /**
  * SR-construction metadata carried via TOBE pending file from the MCP handler
  * (rewind_to or submit_file) to the proxy-handler that consumes the file. The
- * MCP handler computes synthetic content + R1.id at MCP-call time. proxy-
- * handler emits `fork.forked` after response_completed, populating the event
- * with these fields. The RewindMarkerV1 projector then INSERTs the SR row
- * with `synthetic_revision_id`.
+ * MCP handler computes synthetic display content + R1.id at MCP-call time.
+ * proxy-handler emits `fork.forked` after response_completed, deriving
+ * tool_use_id from claude's actual sent body (the pre-splice originalBody)
+ * which is JSON, not SSE. The RewindMarkerV1 projector then INSERTs the SR
+ * row with `synthetic_revision_id`.
  *
  * Optional for backward compat: a TOBE pending file written by an older daemon
  * lacks these fields. proxy-handler logs a warning and skips fork.forked
  * emission — the rewind/submit still applies, just no synthetic departure
  * row materializes for that operation. Pre-1.0 alpha policy.
+ *
+ * History note: v0.5.0-alpha.0 also stashed `tool_use_id` here, computed at
+ * MCP-call time by parsing R1's response body. That was broken because
+ * Anthropic responses are SSE+gzip and the parse always failed silently.
+ * v0.5.0-alpha.1 derives tool_use_id at proxy-handler time from the
+ * originalBody (claude's parsed JSON), which is the same pattern
+ * `reconstructForkMessages` uses to read parsed assistant turns.
  */
 export interface SyntheticDepartureMeta {
   /** Discriminates which operation produced this TOBE. */
@@ -42,8 +50,6 @@ export interface SyntheticDepartureMeta {
   synthetic_assistant_text: string
   /** The user's `message` arg from rewind_to OR submit_file. */
   synthetic_user_message: string
-  /** R1's tool_use id. The synthetic body pairs this with R2's tool_result. */
-  tool_use_id: string
   /** R1.id — the assistant turn that emitted tool_use(rewind_to | submit_file).
    *  SR.parent_revision_id will be set to this. */
   parent_revision_id: string

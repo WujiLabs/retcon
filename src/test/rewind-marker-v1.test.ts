@@ -99,126 +99,160 @@ async function seedR1(
   return { r1Id: r1.id }
 }
 
-describe('buildSyntheticAsset', () => {
-  let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
-  })
-  afterEach(() => fx.cleanup())
+/**
+ * Construct claude's pre-splice JSON body for /v1/messages: the messages
+ * array carries history through R1's parsed assistant turn (with the
+ * operation tool_use), then a user turn with the operation's tool_result.
+ * That trailing user turn is what the splice would discard.
+ */
+function makeOriginalBody(
+  history: Array<{ role: string, content: unknown }>,
+  r1ToolUses: Array<{ id: string, name: string }>,
+  r1ExtraText?: string,
+  toolResultsForId?: string,
+): Uint8Array {
+  const r1Content: unknown[] = []
+  if (r1ExtraText) r1Content.push({ type: 'text', text: r1ExtraText })
+  for (const tu of r1ToolUses) {
+    r1Content.push({ type: 'tool_use', id: tu.id, name: tu.name, input: {} })
+  }
+  const messages: Array<{ role: string, content: unknown }> = [
+    ...history,
+    { role: 'assistant', content: r1Content },
+  ]
+  if (toolResultsForId) {
+    messages.push({
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolResultsForId, content: 'scheduled' }],
+    })
+  }
+  return Buffer.from(JSON.stringify({ messages }), 'utf8')
+}
 
-  it('returns null when R1 has no request_received event', async () => {
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: 'no-such-revision',
-        syntheticToolResultText: 't',
-        syntheticAssistantText: 'a',
-        toolUseId: 'toolu',
-      },
-    )
+describe('buildSyntheticAsset', () => {
+  it('returns null when originalBody is malformed JSON', async () => {
+    const built = await buildSyntheticAsset({
+      originalBody: Buffer.from('{not valid', 'utf8'),
+      kind: 'rewind',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
     expect(built).toBeNull()
   })
 
-  it('returns null when R1 has request_received but no response_completed', async () => {
-    const reqBytes = Buffer.from(JSON.stringify({ messages: [] }), 'utf8')
-    const reqSplit = await blobRefFromMessagesBody(reqBytes)
-    const r1 = fx.producer.emit(
-      'proxy.request_received',
-      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: reqSplit.topCid },
-      'sess-rm',
-      reqSplit.refs,
+  it('returns null when originalBody has no last assistant message', async () => {
+    const body = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'q' }] }), 'utf8')
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'rewind',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
+    expect(built).toBeNull()
+  })
+
+  it('returns null when last assistant has no operation tool_use', async () => {
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_other', name: 'read_file' }],
+      'thinking...',
+      'toolu_other',
     )
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1.id,
-        syntheticToolResultText: 't',
-        syntheticAssistantText: 'a',
-        toolUseId: 'toolu',
-      },
-    )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'rewind',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
     expect(built).toBeNull()
   })
 
   it('builds a synthetic body that hydrates back to history + R1.assistant + R2 + R3', async () => {
-    const history = [
-      { role: 'user', content: 'first user turn' },
-      { role: 'assistant', content: 'first assistant reply' },
-      { role: 'user', content: 'second user turn' },
-    ]
-    const { r1Id } = await seedR1(fx, history, 'toolu_42')
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1Id,
+    const fx = fixture()
+    try {
+      const body = makeOriginalBody(
+        [
+          { role: 'user', content: 'first user turn' },
+          { role: 'assistant', content: 'first assistant reply' },
+          { role: 'user', content: 'second user turn' },
+        ],
+        [{ id: 'toolu_42', name: 'rewind_to' }],
+        'thinking...',
+        'toolu_42',
+      )
+      const built = await buildSyntheticAsset({
+        originalBody: body,
+        kind: 'rewind',
         syntheticToolResultText: 'TOOL_RESULT_TEXT',
         syntheticAssistantText: 'ASSISTANT_TEXT',
-        toolUseId: 'toolu_42',
-      },
-    )
-    expect(built).not.toBeNull()
-    expect(built!.topCid).toMatch(/.+/)
-    expect(built!.refs.length).toBeGreaterThan(0)
+      })
+      expect(built).not.toBeNull()
+      expect(built!.topCid).toMatch(/.+/)
+      expect(built!.refs.length).toBeGreaterThan(0)
+      expect(built!.toolUseId).toBe('toolu_42')
 
-    // Persist the built blobs so loadHydratedMessagesBody can resolve them.
-    for (const r of built!.refs) {
-      fx.db.prepare(
-        'INSERT OR IGNORE INTO blobs (cid, bytes, size, created_at) VALUES (?, ?, ?, ?)',
-      ).run(r.cid, r.bytes, r.bytes.byteLength, Date.now())
+      // Persist the built blobs so loadHydratedMessagesBody can resolve them.
+      for (const r of built!.refs) {
+        fx.db.prepare(
+          'INSERT OR IGNORE INTO blobs (cid, bytes, size, created_at) VALUES (?, ?, ?, ?)',
+        ).run(r.cid, r.bytes, r.bytes.byteLength, Date.now())
+      }
+      const hydrated = await loadHydratedMessagesBody(fx.storage, built!.topCid as never)
+      expect(hydrated).not.toBeNull()
+      const messages = hydrated!.messages as Array<{ role: string, content: unknown }>
+      // 3 history + 1 R1-assistant + 1 R2'-tool_result + 1 R3'-assistant
+      // (the trailing user-tool_result from originalBody is dropped)
+      expect(messages.length).toBe(6)
+      expect(messages[0].role).toBe('user')
+      expect((messages[0] as { content: string }).content).toBe('first user turn')
+      expect(messages[3].role).toBe('assistant')
+      // R1's assistant content should include the operation tool_use
+      const r1Content = messages[3].content as Array<{ type: string, name?: string, id?: string }>
+      expect(r1Content.find(b => b.type === 'tool_use' && b.name === 'rewind_to')).toBeTruthy()
+      expect(messages[4].role).toBe('user')
+      const r2Content = messages[4].content as Array<{ type: string, tool_use_id: string }>
+      expect(r2Content[0].type).toBe('tool_result')
+      expect(r2Content[0].tool_use_id).toBe('toolu_42')
+      expect(messages[5].role).toBe('assistant')
+      const r3Content = messages[5].content as Array<{ type: string, text: string }>
+      expect(r3Content[0].type).toBe('text')
+      expect(r3Content[0].text).toBe('ASSISTANT_TEXT')
     }
-    const hydrated = await loadHydratedMessagesBody(fx.storage, built!.topCid as never)
-    expect(hydrated).not.toBeNull()
-    const messages = hydrated!.messages as Array<{ role: string, content: unknown }>
-    // 3 history + 1 R1-assistant-wrap + 1 R2'-tool_result + 1 R3'-assistant
-    expect(messages.length).toBe(6)
-    expect(messages[0].role).toBe('user')
-    expect((messages[0] as { content: string }).content).toBe('first user turn')
-    expect(messages[3].role).toBe('assistant')
-    expect(messages[4].role).toBe('user')
-    const r2Content = messages[4].content as Array<{ type: string, tool_use_id: string }>
-    expect(r2Content[0].type).toBe('tool_result')
-    expect(r2Content[0].tool_use_id).toBe('toolu_42')
-    expect(messages[5].role).toBe('assistant')
-    const r3Content = messages[5].content as Array<{ type: string, text: string }>
-    expect(r3Content[0].type).toBe('text')
-    expect(r3Content[0].text).toBe('ASSISTANT_TEXT')
+    finally { fx.cleanup() }
   })
 
-  it('returns null when R1 response body is not parseable JSON', async () => {
-    // Emit R1 with a request body but a response body that's malformed JSON.
-    const reqBytes = Buffer.from(JSON.stringify({ messages: [] }), 'utf8')
-    const reqSplit = await blobRefFromMessagesBody(reqBytes)
-    const r1 = fx.producer.emit(
-      'proxy.request_received',
-      { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: reqSplit.topCid },
-      'sess-rm',
-      reqSplit.refs,
+  it('discriminates kind correctly: kind="submit" only matches submit_file tool_use', async () => {
+    // R1 has rewind_to but we ask for kind=submit → null (no submit_file in R1).
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_R', name: 'rewind_to' }],
+      undefined,
+      'toolu_R',
     )
-    const garbage = Buffer.from('{not valid json', 'utf8')
-    const respBlob = await blobRefFromBytes(garbage)
-    fx.producer.emit(
-      'proxy.response_completed',
-      {
-        request_event_id: r1.id,
-        status: 200,
-        headers_cid: 'h',
-        body_cid: respBlob.cid,
-        stop_reason: 'end_turn',
-        asset_cid: 'a',
-      },
-      'sess-rm',
-      [respBlob.ref],
-    )
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1.id,
-        syntheticToolResultText: 't',
-        syntheticAssistantText: 'a',
-        toolUseId: 'toolu',
-      },
-    )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'submit',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
     expect(built).toBeNull()
+  })
+
+  it('handles real Anthropic shape: trailing user with tool_result is dropped', async () => {
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_op', name: 'submit_file' }],
+      'wrap',
+      'toolu_op',
+    )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'submit',
+      syntheticToolResultText: 't',
+      syntheticAssistantText: 'a',
+    })
+    expect(built).not.toBeNull()
+    expect(built!.toolUseId).toBe('toolu_op')
   })
 })
 
@@ -232,15 +266,18 @@ describe('RewindMarkerV1Projector', () => {
   it('inserts an SR row on fork.forked, parented to R1, classified closed_forkable', async () => {
     const { r1Id } = await seedR1(fx, [{ role: 'user', content: 'q' }], 'toolu_a')
 
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1Id,
-        syntheticToolResultText: 'tr',
-        syntheticAssistantText: 'as',
-        toolUseId: 'toolu_a',
-      },
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_a', name: 'rewind_to' }],
+      undefined,
+      'toolu_a',
     )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'rewind',
+      syntheticToolResultText: 'tr',
+      syntheticAssistantText: 'as',
+    })
     expect(built).not.toBeNull()
 
     const payload: ForkForkedPayload = {
@@ -252,7 +289,6 @@ describe('RewindMarkerV1Projector', () => {
       synthetic_tool_result_text: 'tr',
       synthetic_assistant_text: 'as',
       synthetic_user_message: 'hi',
-      tool_use_id: 'toolu_a',
       target_view_id: 'view-target',
       sealed_at: 9999,
       synthetic_asset_cid: built!.topCid,
@@ -282,15 +318,18 @@ describe('RewindMarkerV1Projector', () => {
 
   it('uses stop_reason="submit_synthetic" when payload.kind="submit"', async () => {
     const { r1Id } = await seedR1(fx, [{ role: 'user', content: 'q' }], 'toolu_b')
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1Id,
-        syntheticToolResultText: 'tr',
-        syntheticAssistantText: 'as',
-        toolUseId: 'toolu_b',
-      },
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_b', name: 'submit_file' }],
+      undefined,
+      'toolu_b',
     )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'submit',
+      syntheticToolResultText: 'tr',
+      syntheticAssistantText: 'as',
+    })
     fx.producer.emit('fork.forked', {
       kind: 'submit',
       synthetic_revision_id: 'rev-synth-SUB',
@@ -300,7 +339,6 @@ describe('RewindMarkerV1Projector', () => {
       synthetic_tool_result_text: 'tr',
       synthetic_assistant_text: 'as',
       synthetic_user_message: 'apply',
-      tool_use_id: 'toolu_b',
       target_view_id: 'view-target',
       sealed_at: 1,
       synthetic_asset_cid: built!.topCid,
@@ -314,15 +352,18 @@ describe('RewindMarkerV1Projector', () => {
 
   it('idempotent: re-emitting the same fork.forked does NOT duplicate the SR row', async () => {
     const { r1Id } = await seedR1(fx, [{ role: 'user', content: 'q' }], 'toolu_c')
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: r1Id,
-        syntheticToolResultText: 'tr',
-        syntheticAssistantText: 'as',
-        toolUseId: 'toolu_c',
-      },
+    const body = makeOriginalBody(
+      [{ role: 'user', content: 'q' }],
+      [{ id: 'toolu_c', name: 'rewind_to' }],
+      undefined,
+      'toolu_c',
     )
+    const built = await buildSyntheticAsset({
+      originalBody: body,
+      kind: 'rewind',
+      syntheticToolResultText: 'tr',
+      syntheticAssistantText: 'as',
+    })
     const payload: ForkForkedPayload = {
       kind: 'rewind',
       synthetic_revision_id: 'rev-synth-IDEM',
@@ -332,7 +373,6 @@ describe('RewindMarkerV1Projector', () => {
       synthetic_tool_result_text: 'tr',
       synthetic_assistant_text: 'as',
       synthetic_user_message: 'hi',
-      tool_use_id: 'toolu_c',
       target_view_id: 'view-target',
       sealed_at: 1,
       synthetic_asset_cid: built!.topCid,
@@ -356,7 +396,6 @@ describe('RewindMarkerV1Projector', () => {
       synthetic_tool_result_text: 'tr',
       synthetic_assistant_text: 'as',
       synthetic_user_message: 'hi',
-      tool_use_id: 'toolu',
       target_view_id: 'view-target',
       sealed_at: 1,
       synthetic_asset_cid: 'cid-fake',
@@ -406,21 +445,9 @@ describe('RewindMarkerV1Projector', () => {
       asset_cid: 'asset-real',
     }, 'sess-rm')
 
-    // Now emit an SR for that same R1.
-    const built = await buildSyntheticAsset(
-      { db: fx.db, storageProvider: fx.storage },
-      {
-        parentRevisionId: realReq.id,
-        syntheticToolResultText: 'tr',
-        syntheticAssistantText: 'as',
-        toolUseId: 'toolu',
-      },
-    )
-    // build returns null because the response body 'cid-resp' isn't a real blob.
-    // For this test, fabricate the SR insert via the projector with a placeholder.
-    expect(built).toBeNull()
-
-    // Use a real synthetic CID via a tiny helper instead.
+    // Now emit an SR for that same R1, fabricating a placeholder synthetic CID
+    // (the projector inserts the row regardless of whether the asset blob
+    // resolves; downstream consumers fail gracefully on missing blobs).
     const syntheticBytes = Buffer.from(JSON.stringify({ messages: [] }), 'utf8')
     const synBlob = await blobRefFromBytes(syntheticBytes)
     fx.producer.emit('fork.forked', {
@@ -432,7 +459,6 @@ describe('RewindMarkerV1Projector', () => {
       synthetic_tool_result_text: 'tr',
       synthetic_assistant_text: 'as',
       synthetic_user_message: 'hi',
-      tool_use_id: 'toolu',
       target_view_id: 'view-target',
       sealed_at: 1,
       synthetic_asset_cid: synBlob.cid,
