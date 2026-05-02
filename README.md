@@ -176,7 +176,12 @@ Provider credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, `OPE
 
 ## How it works
 
-[ARCHITECTURE.md](./ARCHITECTURE.md) covers the model: event sourcing, the fork classification, persistent fork branches via the penultimate-user splice, content-addressed message storage, actor identity + resume binding, and a component map of every file under `src/`.
+Two docs cover the design at depth:
+
+- [INSIGHTS.md](./INSIGHTS.md) — *why* retcon works the way it does. Composition over invasion, the read/write tool split, the SR thesis, progressive disclosure for context-dying tools, split reality across the proxy boundary, why /compact aligns the two realities, harness assumptions.
+- [IMPLEMENTATION.md](./IMPLEMENTATION.md) — *how* the non-trivial mechanisms work. TOBE pending file as one-shot baton, SR pipeline across three time points, persistent-fork penultimate-user splice, cache_control marker handling, resume binding, content-addressed body storage, event sourcing + projector chain.
+
+If you're reading the code and want to understand why a piece is shaped a certain way, INSIGHTS.md. If you're tracing a specific pipeline (TOBE consumption, SR construction, splice mechanics), IMPLEMENTATION.md.
 
 ## License
 

@@ -62,7 +62,7 @@
 //       Respond with TEXT ONLY... create a detailed summary...".
 //       This is what makes /compact's summary represent the forked
 //       branch (our branch_context_json applies to it like any other
-//       /v1/messages). See ARCHITECTURE.md §6.
+//       /v1/messages). See INSIGHTS.md "Why /compact aligns the two realities".
 //
 // RESPONSE FORMAT:
 //   R1. stop_reason values in scope: end_turn, tool_use, max_tokens,
@@ -359,7 +359,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
   // ─── and uses the existing messages[] + appended "summarize" user msg ──
   //
   // Two halves to this assumption (both load-bearing for the persistent
-  // fork story per ARCHITECTURE.md §6):
+  // fork story per INSIGHTS.md "Why /compact aligns the two realities"):
   //   (a) /compact's summarization is a regular /v1/messages call to
   //       ANTHROPIC_BASE_URL (not a side-channel endpoint). Our proxy
   //       sees it.
@@ -374,7 +374,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
   // penultimate-user, and our branch_context replaces the conversation
   // prefix that gets summarized. Together they're why post-compact
   // claude's local view is aligned with our forked branch (see
-  // ARCHITECTURE.md §6).
+  // INSIGHTS.md "Why /compact aligns the two realities").
   //
   // Empirically verified 2026-04-29: the compact request body had 5
   // entries, the last being a 5.7KB user-role "CRITICAL: Respond with
