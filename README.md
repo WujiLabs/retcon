@@ -71,6 +71,20 @@ Available to claude inside the session via the MCP server retcon auto-registers 
 
 Source of truth is the event log; the projector marks each `/v1/messages` round-trip as `closed_forkable`, `dangling_unforkable`, or `open` based on stop reason and stream state. Only `closed_forkable` turns are recall/rewind targets — including the synthetic departure rows (SR rows) that materialize after a successful `rewind_to` or `submit_file`.
 
+### Common workflows
+
+retcon supports four named workflows. The first three are what AIs reach for in practice; the fourth is a power-user pattern.
+
+**1. Clean redo of a single turn.** "Try that answer again with X instead of Y." Use `rewind_to` alone — single-point rewinds are the simplest and most common case.
+
+**2. Save a spot and come back to it.** "Bookmark here, I want to try a different approach but might want to return." Use `bookmark` to save, `list_branches` to see saved spots, `recall({view_id})` then `rewind_to({turn_id})` to return.
+
+**3. Forget the pink elephant.** "Pretend you never saw that sensitive log dump / off-topic tangent / leaked credential." Single-point `rewind_to` only works when the contamination is one turn. When it's spread across multiple turns, use the dump+edit+submit pattern: `dump_to_file` writes the conversation to a JSONL file → use `Read` and `Edit` (or `Grep` to find specific content) to remove or rewrite the lines → `submit_file` queues the sanitized history as the next /v1/messages. The receiving AI sees the cleaned conversation with no memory of what was removed. Use cases: stripping leaked secrets, removing a tangent that biased the model's later reasoning, "answer this WITHOUT mentioning X" workflows, recovering from a botched rewind.
+
+**4. Factual correction in past content.** "I told you the budget was $500 but it's $5,000 — redo the analysis." `dump_to_file` → `Edit` the specific message line → `submit_file` with a `message` that names the correction so the AI acknowledges what changed (e.g. "I corrected the budget from $500 to $5,000 in the earlier turn — please redo the cost analysis."). The dumped JSONL has one message per line, so editing a specific turn is a one-line change.
+
+For workflow 3 and 4: retcon pre-allows `Read`/`Edit`/`Write`/`Glob`/`Grep` on `~/.retcon/dumps/**` so the AI can manipulate dump files without prompting the user.
+
 ### Synthetic departure rows (rewind/submit markers)
 
 After a successful `rewind_to` (or `submit_file`), retcon inserts a real row into the revisions table marking where that navigation happened. It's a valid `closed_forkable` Revision — `recall` shows it inline with `kind: "rewind_marker"` (or `"submit_marker"`), and `rewind_to({turn_id: <SR.id>})` and `dump_to_file({turn_id: <SR.id>})` work the same as on any other turn. Cascade rewinds (rewinding to a marker) just produce another marker. The pre-rewind branch's tail and the rewind moment itself are both first-class navigable points; no special navigation surface needed.
