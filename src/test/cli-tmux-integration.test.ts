@@ -316,6 +316,18 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     )
     expect(preResumeForkable).toBeGreaterThanOrEqual(2)
 
+    // Kill the prior test's tmux session — its claude process is still
+    // running with the original sessionId and would conflict with the
+    // resumed claude trying to attach to the same id. Manual reproduction
+    // confirmed: leaving SESSION alive while spawning RESUME_SESSION makes
+    // the resumed claude swallow user input silently (no error, no prompt
+    // delivered). Killing SESSION first matches what a real user would do
+    // ("close the original window before resuming elsewhere").
+    try {
+      tmux('kill-session', '-t', SESSION)
+    }
+    catch { /* fine if already gone */ }
+
     // Spawn retcon --resume <id>. Positional id avoids the picker.
     tmux(
       'new-session', '-d', '-s', RESUME_SESSION, '-x', '200', '-y', '50',

@@ -22,9 +22,9 @@ Two more bugs the alpha.1 ship missed, both surfaced by extending the cli-tmux-i
 - `cli-tmux-assumptions` 5/5 pass.
 - 453 unit tests pass; lint clean.
 
-### Known / unrelated
+### Test infrastructure
 
-- `cli-tmux-integration` test 2 (resume + rewind across boundary) flakes — captured pane shows the post-resume `DURIAN` rewind prompt is never delivered to the resumed claude session via tmux send-keys. Not investigated in this release; fix is orthogonal to the SR pipeline.
+- **`cli-tmux-integration` test 2 (resume + rewind across boundary) — fixed.** Was flaking because the test left the original tmux session alive while spawning a second claude process via `--resume <same-id>`. Two claudes attached to the same session id silently broke the resumed session's input handling — the rewind prompt typed via `tmux send-keys` got swallowed with no error, no permission prompt, no nothing. Manual reproduction (kill the original session before resuming) worked first try, ruling out the `--resume` permission hypothesis. Fix: kill `SESSION` before spawning `RESUME_SESSION`. All 3 cli-tmux-integration tests now pass in 73s.
 
 ## [0.5.0-alpha.1] - 2026-05-01
 
