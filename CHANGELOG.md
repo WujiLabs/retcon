@@ -2,6 +2,14 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0-alpha.5] - 2026-05-03
+
+Follow-up to alpha.4 — small enhancement to the submit_file rules-return text. The "forget the pink elephant" workflow sanitizes the /v1/messages context the receiving AI sees, but doesn't touch long-lived files (CLAUDE.md, ~/.claude/projects/*/memory/, project notes, TODOS.md, IDE-open files, scratch dumps). If contaminating content was written to any of those, the next session re-leaks it on first read. The previous workflow guidance left this gap implicit.
+
+### Changed
+
+- **`submit_file` rules-return text — FORGET THE PINK ELEPHANT workflow.** Added an explicit external-memory scrub step BEFORE the submit_file call. The AI is now told to verify the content is gone from CLAUDE.md / auto-memory / project notes / TODOS.md / IDE-open files / scratch dumps first, then submit. Reasoning: submit_file's sanitization is scoped to the /v1/messages context only; durable file content survives across sessions and undoes the work.
+
 ## [0.5.0-alpha.4] - 2026-05-03
 
 Documentation pass on INSIGHTS.md surfaced an asymmetry in the projector chain: `branch_views_v1` was creating auto fork-point views from `fork.back_requested` (request time, before splice), while `rewind_marker_v1` was creating SR rows from `fork.forked` (success time, after splice). Failed rewinds — parallel-tool guard fires, upstream 5xx, non-end_turn stop_reason, missing synthetic metadata — left phantom branch_views pointing at fork targets that were never actually used. The two surfaces are conceptually paired (both materialize a navigation handle for "you forked here"); they should share the same success gate.
