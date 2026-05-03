@@ -2,6 +2,45 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0-alpha.3] - 2026-05-03
+
+Description and documentation pass for the v0.5.0 surface. AI tool descriptions are what models actually read to decide which tool to invoke; reader-facing docs are what humans skim to decide whether retcon solves their problem. Both got attention.
+
+### Changed
+
+- **MCP tool descriptions tightened across all 7 tools (~25% shorter on average).** Heavy guidance now lives in the rules-return on first call (rewind_to / submit_file) where it costs zero tokens for conversations that never reach for these tools. The recall, bookmark, list_branches, delete_bookmark, and dump_to_file descriptions trimmed redundancy while keeping AI tool-discovery signal intact (verified 6/6 against real Sonnet + Opus tool-adoption tests).
+- **submit_file's USE WHEN line now leads with the "forget the pink elephant" use case.** The dump-edit-submit workflow lets you remove or rewrite content spread across multiple turns, where single-point rewind_to can't reach. Use cases: stripping leaked credentials, removing a tangent that biased the model's later reasoning, "answer this WITHOUT mentioning X" prompts, recovering from a botched rewind.
+- **dump_to_file's USE WHEN line lists three concrete cases** instead of weighting one as primary. Initial framing ("USE WHEN: ... — *especially* to forget multi-turn content") regressed Sonnet adoption by 124s+ → timeout because Sonnet read "especially X" as scoping the tool to X. Rebalanced phrasing ("Three common cases: (1) just look, (2) fix a factual error, (3) strip multi-turn content") restored 7s adoption time. General principle for tool descriptions: lead with the simpler/broader case; list specialized cases alongside.
+- **`confirm` field in rewind_to and submit_file inputSchemas** no longer references internal token names (`clean_token`, `meta_token`) that the AI doesn't yet know when reading the schema. Replaced with neutral phrasing ("Single-use token issued by this tool's first call. The rules-return response names the two choices.").
+- **PARALLEL TOOLS warning** moved out of the inline tool descriptions and consolidated in the rules-return on first call, where it has more room and lands at the moment the AI is about to act.
+
+### Added
+
+- **Two new rules in rewind_to and submit_file rules-return text.**
+  - *Rule 5: don't re-introduce the thing being forgotten.* Echoing "no pink elephants here" puts the elephant back in the post-rewind AI's context. For sensitive content, describe the removal in general terms ("(I removed the leaked credential)") rather than echoing the actual value.
+  - *Rule 6: pack stacked instructions.* When the user says "rewind to X, then answer Y", put Y in `message` so the post-rewind AI has something to do. Without it, the receiving AI sees a placeholder turn and produces a confused "what would you like?" response.
+- **Note in CLASSIFY section: tokens classify your CURRENT message, not the original.** The pair is bound to the session, not to a specific message. If your first attempt had a meta-reference, revise the message and use the token matching the revised version.
+- **README "Common workflows" subsection** under "Rewind tools" surfaces four named patterns: clean redo, save-and-return, forget-the-pink-elephant, and factual correction. Makes retcon's most differentiated capability (multi-turn forgetting) visible to anyone reading the README.
+- **Two new examples in each rules-return**: stacked-question case, leaked-credential case. New anti-pattern call-out: "Echoing the forgotten content" / `"ignore the password ABC123"` re-leaks what you stripped.
+
+### Documentation reorg
+
+- **`ARCHITECTURE.md` split into [INSIGHTS.md](./INSIGHTS.md) + [IMPLEMENTATION.md](./IMPLEMENTATION.md).** Two-doc structure following a project-wide principle: docs should add value beyond what code reading already gives. INSIGHTS.md answers *why* each design has its shape (mental models, design principles, load-bearing assumptions); IMPLEMENTATION.md answers *how* non-trivial mechanisms work (multi-step pipelines, hand-offs across time/process boundaries, ordering invariants). Derivable content (file lists, type layouts, "where to look in the code" pointers) dropped — Claude Code can read those.
+- **New principle in INSIGHTS.md: "Progressive disclosure for context-dying tools."** Abstracts the rewind_to / submit_file dual-secret guardrail into a reusable design pattern. Names the three conditions a tool must satisfy before this overhead earns its keep, so future tools can be evaluated against the same criteria instead of copying the pattern by reflex.
+- **IMPLEMENTATION.md SR pipeline section** documents the T0/T1/T2 hand-off (MCP-call-time → TOBE-consumed-time → response-completed-time) including the synthetic body shape diagram (history-through-R1 + R1's assistant turn + R2' tool_result + R3' assistant wrap-up) and the load-bearing tool_use_id pairing that makes cascade rewinds API-valid.
+- **README updated** to point at INSIGHTS.md / IMPLEMENTATION.md instead of the old ARCHITECTURE.md.
+
+### Fixed
+
+- **`cli-tmux-integration` test 2 (resume + rewind across boundary) — fixed.** Was flaking because the test left the original tmux session alive while spawning a second claude process via `--resume <same-id>`. Two claudes attached to the same session id silently broke the resumed session's input handling. Manual reproduction confirmed: kill the original session before resuming, and the rewind works first try. Fix: `tmux kill-session -t SESSION` at the start of test 2 before spawning RESUME_SESSION.
+
+### For contributors
+
+- **Doc-authoring principle.** New docs should slot into INSIGHTS.md (why) or IMPLEMENTATION.md (how-non-trivial). Skip anything Claude Code can derive in a single read.
+- **Tool-description-authoring principle.** "USE WHEN: X — especially Y" reads to the AI as "this tool is FOR Y." Use "USE WHEN: X. Common cases: A, B, C." instead. Lead with the broader case; list specialized ones alongside without weighting one as primary.
+
+All 453 unit tests pass; lint + build clean. cli-tmux-tool-adoption verified 6/6 (Sonnet + Opus). cli-tmux-integration verified 3/3.
+
 ## [0.5.0-alpha.2] - 2026-05-02
 
 Two more bugs the alpha.1 ship missed, both surfaced by extending the cli-tmux-integration test with an SR-row assertion. alpha.0 had silent SSE+gzip blindness; alpha.1 fixed that but the SR pipeline was STILL broken in production for two unrelated reasons. The integration test paid for itself the moment we let it actually run a real rewind end-to-end.

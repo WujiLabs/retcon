@@ -1,6 +1,6 @@
 {
   "name": "@playtiss/retcon",
-  "version": "0.5.0-alpha.2",
+  "version": "0.5.0-alpha.3",
   "type": "module",
   "description": "Retcon for AI conversations. The AI recontextualizes its own past via MCP tools. Canonical Observer Actor instantiation of the Collaboration Protocol.",
   "license": "MIT",
