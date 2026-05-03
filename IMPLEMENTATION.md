@@ -176,7 +176,7 @@ Projectors that ship by default:
 
 - `sessions_v1` — creates session rows from `mcp.session_initialized` and `proxy.request_received`; merges binding-token rows on `session.rebound`.
 - `revisions_v1` — INSERTs a row on `proxy.request_received`, UPDATEs it on `proxy.response_completed` (sets parent_revision_id, classification, asset_cid, sealed_at).
-- `branch_views_v1` — manages branch_views from `fork.bookmark_created`, `fork.back_requested`, `fork.bookmark_deleted`, and auto-advance from `proxy.response_completed`.
+- `branch_views_v1` — manages branch_views from `fork.bookmark_created`, `fork.forked`, `fork.label_updated`, `fork.bookmark_deleted`, and auto-advance from `proxy.response_completed`. Auto fork-point views materialize from `fork.forked` (success-only); `fork.back_requested` is audit-only and no projector consumes it.
 - `rewind_marker_v1` — INSERTs SR rows from `fork.forked`. Topic-disjoint from the others.
 
 The dispatch order matters. `sessions_v1` runs first so the session/task rows exist before `revisions_v1` tries to FK against them. `revisions_v1` runs before `branch_views_v1` so that `revisions.parent_revision_id` is set when branch_views_v1 reads it for auto-advance.

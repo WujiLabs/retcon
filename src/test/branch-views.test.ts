@@ -61,23 +61,77 @@ describe('branch_views_v1', () => {
     expect(row.head_revision_id).toBe('rev-head')
   })
 
-  it('creates a fork view with auto-label on fork.back_requested', () => {
+  it('creates a fork view with auto-label on fork.forked (success-only)', () => {
+    // Seed R1 so the parent_revision_id lookup in onForkForked resolves.
+    // RewindMarkerV1Projector does the same lookup; branch-views-v1 reuses
+    // the pattern so that auto fork-point views don't materialize for
+    // failed rewinds (the no-SR case is now also the no-branch_view case).
+    fx.db.prepare(`
+      INSERT INTO revisions (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, NULL, NULL, 'open', 'tool_use', ?, ?)
+    `).run('rev-r1', fx.taskId, Date.now(), Date.now())
+
     fx.producer.emit(
-      'fork.back_requested',
+      'fork.forked',
       {
-        source_view_id: 'view-src',
-        fork_point_revision_id: 'rev-fp-abcdef1234567890',
-        new_message_cid: 'bafy-msg',
+        kind: 'rewind',
+        synthetic_revision_id: 'rev-sr-1',
+        parent_revision_id: 'rev-r1',
+        target_revision_id: 'rev-fp-abcdef1234567890',
+        to_revision_id: 'rev-new',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
         target_view_id: 'view-fork',
-        task_id: fx.taskId,
+        sealed_at: Date.UTC(2026, 4, 3, 12, 0, 0),
+        synthetic_asset_cid: 'cid-fake',
       },
       fx.sessionId,
     )
     const row = loadView(fx.db, 'view-fork')!
     expect(row.head_revision_id).toBe('rev-fp-abcdef1234567890')
     expect(row.label).toBeNull()
-    expect(row.auto_label).toMatch(/^fork@/)
-    expect(row.auto_label).toContain('rev-fp-a') // first 8 chars of fork point
+    expect(row.auto_label).toMatch(/^fork@2026-05-03T12:00:00\.000Z from rev-fp-a/)
+  })
+
+  it('does NOT create a fork view if R1 is missing (failed rewind, R1 lookup fails)', () => {
+    // R1 missing → no SR, no branch_view. Symmetric with RewindMarker's
+    // skip-on-missing-parent posture.
+    fx.producer.emit(
+      'fork.forked',
+      {
+        kind: 'rewind',
+        synthetic_revision_id: 'rev-sr-orphan',
+        parent_revision_id: 'rev-r1-missing',
+        target_revision_id: 'rev-fp',
+        to_revision_id: 'rev-new',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
+        target_view_id: 'view-orphan',
+        sealed_at: Date.now(),
+        synthetic_asset_cid: 'cid',
+      },
+      fx.sessionId,
+    )
+    expect(loadView(fx.db, 'view-orphan')).toBeUndefined()
+  })
+
+  it('fork.back_requested no longer creates a branch_view (regression guard)', () => {
+    // Pre-v0.5.0-alpha.4: this event populated branch_views directly.
+    // Post-fix: it's audit-only. fork.forked is the success-gated signal.
+    fx.producer.emit(
+      'fork.back_requested',
+      {
+        source_view_id: 'view-src',
+        fork_point_revision_id: 'rev-fp',
+        new_message_cid: 'bafy-msg',
+        target_view_id: 'view-back-only',
+        task_id: fx.taskId,
+      },
+      fx.sessionId,
+    )
+    expect(loadView(fx.db, 'view-back-only')).toBeUndefined()
   })
 
   it('updates label on fork.label_updated', () => {

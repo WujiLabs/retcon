@@ -2,6 +2,26 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0-alpha.4] - 2026-05-03
+
+Documentation pass on INSIGHTS.md surfaced an asymmetry in the projector chain: `branch_views_v1` was creating auto fork-point views from `fork.back_requested` (request time, before splice), while `rewind_marker_v1` was creating SR rows from `fork.forked` (success time, after splice). Failed rewinds — parallel-tool guard fires, upstream 5xx, non-end_turn stop_reason, missing synthetic metadata — left phantom branch_views pointing at fork targets that were never actually used. The two surfaces are conceptually paired (both materialize a navigation handle for "you forked here"); they should share the same success gate.
+
+### Fixed
+
+- **`branch_views_v1` projector now subscribes to `fork.forked` instead of `fork.back_requested`.** Auto fork-point views are created only when the rewind/submit actually succeeded, the same condition that produces SR rows. `fork.back_requested` becomes audit-only — no projector consumes it. Net effect: failed rewinds leave neither an SR nor an auto fork-point view; `list_branches` no longer surfaces phantom entries from past failed attempts.
+- **`auto_label` timestamp source.** Previously used the projector's `event.createdAt` (when `fork.back_requested` happened to be processed). Now uses `fork.forked.sealed_at` (the moment the user initiated the rewind), so the timestamp matches what the user thinks of as "when did I fork."
+
+### Migration
+
+- **No retroactive cleanup.** Existing branch_views in your live `proxy.db` from past `fork.back_requested` events stay where they are — including any phantoms from failed rewinds. The new gate applies going forward only. If you want to clean up phantom rows manually: `DELETE FROM branch_views WHERE auto_label LIKE 'fork@%' AND id NOT IN (SELECT json_extract(payload, '$.target_view_id') FROM events WHERE topic = 'fork.forked');`
+
+### For contributors
+
+- **branch-views-v1 unit tests** updated to seed an R1 revision row before emitting `fork.forked` (mirroring `rewind_marker_v1`'s test pattern). Two new tests added: one verifying the parent-missing path silently skips (no phantom branch_view), one regression-guarding that bare `fork.back_requested` no longer creates a branch_view.
+- **mcp-tools.test.ts `seedForkPoint` helpers** (delete_bookmark + list_branches describes) updated to emit `fork.forked` instead of `fork.back_requested`.
+
+All 455 unit tests pass; lint + build clean.
+
 ## [0.5.0-alpha.3] - 2026-05-03
 
 Description and documentation pass for the v0.5.0 surface. AI tool descriptions are what models actually read to decide which tool to invoke; reader-facing docs are what humans skim to decide whether retcon solves their problem. Both got attention.

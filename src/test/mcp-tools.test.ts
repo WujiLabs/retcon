@@ -654,17 +654,32 @@ describe('delete_bookmark', () => {
     return { view_id: res.view_id, head_id: res.head_revision_id }
   }
 
-  /** Seed an auto fork-point view by emitting a fork.back_requested event. */
+  /** Seed an auto fork-point view by emitting a fork.forked event.
+   *  v0.5.0-alpha.4+: branch_views_v1 subscribes to fork.forked (success
+   *  signal), not fork.back_requested. Tests need to seed R1 so the
+   *  parent_revision_id lookup resolves. */
   function seedForkPoint(forkPointRevId: string): string {
     const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
+    const r1Id = `rev-r1-${Math.random().toString(36).slice(2, 10)}`
+    // Seed R1 so branch-views-v1's parent_revision_id lookup succeeds.
+    fx.db.prepare(`
+      INSERT INTO revisions (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, NULL, NULL, 'open', 'tool_use', ?, ?)
+    `).run(r1Id, fx.taskId, Date.now(), Date.now())
     fx.producer.emit(
-      'fork.back_requested',
+      'fork.forked',
       {
+        kind: 'rewind',
+        synthetic_revision_id: `rev-sr-${Math.random().toString(36).slice(2, 10)}`,
+        parent_revision_id: r1Id,
+        target_revision_id: forkPointRevId,
+        to_revision_id: 'rev-new',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
         target_view_id: viewId,
-        source_view_id: 'src',
-        fork_point_revision_id: forkPointRevId,
-        new_message_cid: 'cid',
-        task_id: fx.taskId,
+        sealed_at: Date.now(),
+        synthetic_asset_cid: 'cid-fake',
       },
       fx.sessionId,
     )
@@ -816,14 +831,27 @@ describe('list_branches', () => {
 
   function seedForkPoint(forkPointRevId: string, label: string | null = null): string {
     const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
+    const r1Id = `rev-r1-${Math.random().toString(36).slice(2, 10)}`
+    // Seed R1 so branch-views-v1's parent_revision_id lookup succeeds
+    // (v0.5.0-alpha.4+ uses fork.forked, not fork.back_requested).
+    fx.db.prepare(`
+      INSERT INTO revisions (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
+      VALUES (?, ?, NULL, NULL, 'open', 'tool_use', ?, ?)
+    `).run(r1Id, fx.taskId, Date.now(), Date.now())
     fx.producer.emit(
-      'fork.back_requested',
+      'fork.forked',
       {
+        kind: 'rewind',
+        synthetic_revision_id: `rev-sr-${Math.random().toString(36).slice(2, 10)}`,
+        parent_revision_id: r1Id,
+        target_revision_id: forkPointRevId,
+        to_revision_id: 'rev-new',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
         target_view_id: viewId,
-        source_view_id: 'src',
-        fork_point_revision_id: forkPointRevId,
-        new_message_cid: 'cid',
-        task_id: fx.taskId,
+        sealed_at: Date.now(),
+        synthetic_asset_cid: 'cid-fake',
       },
       fx.sessionId,
     )

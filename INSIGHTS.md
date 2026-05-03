@@ -28,7 +28,7 @@ This is also a deliberate architectural choice. Rewind could have been a CLI com
 `branch_views` rows hold pointers into the Revision DAG. Two kinds, both stored in the same table:
 
 - **Explicit bookmarks** (`fork.bookmark_created`): user-created via `bookmark()`. `auto_label` starts with `bookmark@`.
-- **Auto fork-point views** (`fork.back_requested`): created automatically when you `rewind_to` somewhere. `auto_label` starts with `fork@`. These are the only handle on the pre-rewind branch — without them, branches you've forked away from would be unreachable from the current head's ancestor walk.
+- **Auto fork-point views** (`fork.forked`): created automatically when a `rewind_to` or `submit_file` actually succeeds — same success gate as the SR row in `revisions`. `auto_label` starts with `fork@`. These are the only handle on the pre-rewind branch — without them, branches you've forked away from would be unreachable from the current head's ancestor walk. Failed rewinds (parallel-tool guard fired, upstream 5xx, non-end_turn stop_reason) leave neither an SR nor an auto fork-point view; the existing `R_real` "rewind failed" turn is the only trace.
 
 Both kinds **auto-advance**: when a new turn closes whose parent is a view's current `head_revision_id`, the view advances to the new turn. This is git-branch-like behavior. A view stops advancing only when the user forks elsewhere (the new branch's tail has parent=fork_point, not parent=view's-head, so the view stays put).
 
