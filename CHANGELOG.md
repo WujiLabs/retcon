@@ -2,6 +2,33 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.0] - 2026-05-04
+
+First non-alpha release of `@playtiss/retcon` — retcon makes AI conversations rewindable. Pre-1.0 hardening across the v0.5.0 alpha series (alpha.0 → alpha.5) is rolled into a single shipped version. New external surface unchanged from alpha.5; this entry summarizes what's in 0.5.0 vs the last 0.4.x release.
+
+### What's new since 0.4.x
+
+- **Synthetic departure Revisions (SR).** Every successful `rewind_to` / `submit_file` produces a real row in the `revisions` table with `stop_reason='rewind_synthetic'` (or `'submit_synthetic'`), so navigation events show up in the same query patterns as ordinary turns. `recall` discriminates SR rows via the existing `stop_reason` column. Failed rewinds (parallel-tool guard fires, upstream 5xx, non-end_turn stop_reason) leave neither an SR row nor an auto fork-point view — the existing "rewind failed" assistant turn is the only trace. See INSIGHTS.md and IMPLEMENTATION.md.
+- **`dump_to_file` + `submit_file`.** New tools for the multi-turn-edit workflow ("forget the pink elephant"). `dump_to_file` writes the conversation JSONL to `~/.retcon/dumps/`; the AI inspects/edits with Read/Edit; `submit_file` validates and queues. submit_file's last-line-must-be-assistant validation is the load-bearing constraint that makes the appended user message blend naturally.
+- **Progressive-disclosure rules with opaque dual-secret tokens.** `rewind_to` and `submit_file`'s first call returns rules + `clean_token` + `meta_token`. The AI classifies its message and re-calls with the token that matches; opaque random tokens force the rules-read step. Plus a narrow 4-pattern regex backstop on the clean path for the most flagrant meta-references.
+- **Invisible-success, loud-failure response pattern.** Staged-action tools (`rewind_to`, `submit_file`) embed `RETCON ERROR: ...` text in their success response. The proxy splice discards the response on the success path; if the AI ever reads it, the splice didn't run and the AI surfaces the failure to the user. Fail-loud-by-construction at zero implementation cost.
+- **Permissions injection.** Retcon's CLI inline-merges `permissions.allow` for `Read/Edit/Write/Glob/Grep` over `~/.retcon/dumps/**` plus retcon's own MCP tools, so the AI accesses dumps and calls retcon tools without permission prompts.
+- **fork.forked / fork.synthesis_failed audit events.** Every successful or failed rewind/submit now leaves a structured event row, regardless of whether it materializes an SR.
+- **Doc split.** ARCHITECTURE.md (single doc) split into INSIGHTS.md (the why) and IMPLEMENTATION.md (the non-trivial how). Reader-facing docs are smaller; mechanism docs cover the cross-time-point hand-offs (T0/T1/T2 SR pipeline, TOBE one-shot baton, penultimate-user splice, branch-context persistence, cache_control accumulation passes, resume binding rebind).
+
+### Fixed since alpha.0
+
+- **SSE+gzip blindness in production (alpha.0).** Anthropic returns `/v1/messages` as gzipped SSE; the proxy was trying to JSON.parse it to extract R1's tool_use_id and silently failing, so SR rows never materialized in real conversations even though unit tests passed. Fixed by reading R1's parsed assistant content from R2's request body (uncompressed JSON) instead.
+- **Permission prompts on every retcon MCP tool call (alpha.2).** Added `mcp__retcon__*` to the inlined `permissions.allow` list.
+- **Bare-vs-prefixed name mismatch in `detectParallelTools` (alpha.2).** Claude Code dispatches retcon's tools as `mcp__retcon__rewind_to` while the parallel-tool guard matched bare `rewind_to`. Now matches both forms.
+- **branch_views_v1 phantom rows for failed rewinds (alpha.4).** Projector subscribed to `fork.back_requested` (request-time) instead of `fork.forked` (success-time), creating auto fork-point views for rewinds that never actually applied. Switched to fork.forked. `fork.back_requested` is now audit-only.
+
+### Migration
+
+- `@playtiss/core` bumped 0.2.0-alpha.0 → 0.2.0 in lockstep.
+- No schema migration. `proxy.db` files from alpha.5 work with 0.5.0 unchanged.
+- Existing branch_views from past `fork.back_requested` events stay where they are (including any phantoms from past failed rewinds); the alpha.4 fix applies going forward only. SQL to clean up phantoms: see [0.5.0-alpha.4] entry below.
+
 ## [0.5.0-alpha.5] - 2026-05-03
 
 Follow-up to alpha.4 — small enhancement to the submit_file rules-return text. The "forget the pink elephant" workflow sanitizes the /v1/messages context the receiving AI sees, but doesn't touch long-lived files (CLAUDE.md, ~/.claude/projects/*/memory/, project notes, TODOS.md, IDE-open files, scratch dumps). If contaminating content was written to any of those, the next session re-leaks it on first read. The previous workflow guidance left this gap implicit.
