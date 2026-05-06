@@ -302,10 +302,77 @@ describe('recall (list mode)', () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real second turn' }])
     const aardvarkTurn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real third turn' }])
     emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: predict next input]' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'The user stepped away and is coming back. Recap in under 40 words.' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
     // current_head_turn_id reflects the most-recent non-injection settled
-    // turn (so bookmark / dump_to_file default to the right place).
+    // turn (so bookmark / dump_to_file default to the right place). Three
+    // injection-pattern turns at the tail (SUGGESTION + recap + bare system-
+    // reminder) all get walked past.
     const r = await call(fx, 'recall', {}) as { current_head_turn_id: string | null }
     expect(r.current_head_turn_id).toBe(aardvarkTurn.id)
+  })
+
+  // False-positive guard: claude commonly prefixes a real user prompt with a
+  // <system-reminder> block (file-opened reminder, date change reminder, "you
+  // opened the file in IDE", etc.) followed by the user's actual instruction
+  // on the next line. That's a REAL turn — its `<system-reminder>` opener
+  // shouldn't get the whole turn nuked from navigation. Only system-reminder
+  // turns whose ENTIRE content is the reminder block (msgs=1 probe-style)
+  // are injection.
+  it('system-reminder PREFIX + real user content is NOT treated as injection', async () => {
+    const realFirst = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first real prompt' }])
+    // Mid: system-reminder PREFIX with real user content underneath. This is the
+    // shape claude code uses for "user opened file X in IDE" reminders.
+    const reminderPlusReal = emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe user opened the file /tmp/foo.md in the IDE.\n</system-reminder>\nupdate the timeline section in foo.md' }])
+    // Tail to anchor a head so the prior turn is rewindable.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'tail prompt' }])
+    // turn_back_n=1 should land on `reminderPlusReal` (NOT walk past it to
+    // realFirst, since reminderPlusReal contains real user content after the
+    // reminder block).
+    const r1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, preview: string } }
+    expect(r1.turn.turn_id).toBe(reminderPlusReal.id)
+    // turn_back_n=2 reaches realFirst.
+    const r2 = await call(fx, 'recall', { turn_back_n: 2 }) as { turn: { turn_id: string } }
+    expect(r2.turn.turn_id).toBe(realFirst.id)
+  })
+
+  // The test 3 production fixture exposed a SECOND bug downstream of the
+  // turn_back_n skip: even after the rewind targets ZEBRA correctly,
+  // reconstructForkMessages used to call firstChild(target) for the messages
+  // prefix. ZEBRA's only direct child is the system-reminder probe, whose
+  // body is `msgs=1` (just the reminder) — slicing the last off produces []
+  // and baseMessages collapses to just the synthetic departure message.
+  // The real continuation (AARDVARK) is a GRANDCHILD via system-reminder.
+  // firstChild now does a bounded DFS, recursing into injection children
+  // until it finds a real conversational descendant.
+  it('firstChild walks past injection descendant to find a real continuation', async () => {
+    // Build the fixture using the same emitTurn helper used elsewhere; each
+    // call emits proxy.request_received → proxy.response_completed and the
+    // events_v1 projector wires up parent_revision_id from the previous turn.
+    // ZEBRA → system-reminder probe → AARDVARK → AARDVARK's child (head).
+    const zebra = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
+    const sysRem = emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
+    const aardvark = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'next prompt' }]) // anchor head
+    // Prove the DAG shape we set up actually has system-reminder between
+    // ZEBRA and AARDVARK (parent chain).
+    const aardRow = fx.db.prepare('SELECT parent_revision_id FROM revisions WHERE id = ?')
+      .get(aardvark.id) as { parent_revision_id: string }
+    expect(aardRow.parent_revision_id).toBe(sysRem.id)
+    const sysRemRow = fx.db.prepare('SELECT parent_revision_id FROM revisions WHERE id = ?')
+      .get(sysRem.id) as { parent_revision_id: string }
+    expect(sysRemRow.parent_revision_id).toBe(zebra.id)
+    // recall(turn_back_n=2) targets ZEBRA. Detail mode runs through the same
+    // firstChild + reconstructForkMessages-adjacent code paths the real
+    // rewind_to invokes. Verifying the surrounding turns include AARDVARK
+    // proves firstChild walked PAST sysRem to find aardvark as a navigation
+    // peer.
+    const r = await call(fx, 'recall', { turn_back_n: 2, surrounding: 2 }) as {
+      turn: { turn_id: string, preview: string }
+      surrounding_turns?: Array<{ turn_id: string }>
+    }
+    expect(r.turn.turn_id).toBe(zebra.id)
+    expect(r.turn.preview).toContain('ZEBRA')
   })
 })
 
