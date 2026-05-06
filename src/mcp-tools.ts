@@ -131,11 +131,22 @@ function mostRecentRevision(db: DB, taskId: string): RevisionRow | undefined {
 }
 
 function mostRecentForkableRevision(db: DB, taskId: string): RevisionRow | undefined {
-  return db.prepare(`
+  // Walk DESC by sealed_at and return the first non-injection closed_forkable.
+  // "Most recent forkable" is the user-visible "current head" — it should match
+  // what `effectiveHead` returns and what `turn_back_n=1` lands on. Without the
+  // skip, claude-harness pseudo-prompts (SUGGESTION MODE / system-reminder) sit
+  // at the tail and `bookmark` / `dump_to_file` would default to those instead
+  // of the real conversational head.
+  const rows = db.prepare(`
     SELECT * FROM revisions
      WHERE task_id = ? AND classification = 'closed_forkable' AND sealed_at IS NOT NULL
-     ORDER BY sealed_at DESC, id DESC LIMIT 1
-  `).get(taskId) as RevisionRow | undefined
+     ORDER BY sealed_at DESC, id DESC
+     LIMIT 64
+  `).all(taskId) as RevisionRow[]
+  for (const r of rows) {
+    if (!isHarnessInjectionRevision(db, r.id)) return r
+  }
+  return undefined
 }
 
 /**
@@ -186,34 +197,131 @@ function requestBodyCidFor(db: DB, revisionId: string): string | null {
 }
 
 /**
- * Find the EARLIEST child of a Revision. Fork-point reconstruction needs the
- * child's request body to recover the messages[] prefix at the fork point.
- * Ordering by created_at/id gives deterministic behavior across SQLite builds
- * and across projection rebuilds — same events → same reconstructed messages.
+ * Find the EARLIEST non-injection DESCENDANT of a Revision. Fork-point
+ * reconstruction needs a descendant's request body to recover the messages[]
+ * prefix at the fork point — the algorithm assumes child.body =
+ * [...history, target_response, child_user_input], which holds for normal
+ * user-prompt children.
+ *
+ * Two ways harness injections break direct-child lookup:
+ *   1. Standalone probe injections (system-reminder, /v1 quota check) often
+ *      ship with body=[probe_user_msg] — msgs=1, no conversation history.
+ *      Picking that as the child produces an empty `slice(0, -1)`.
+ *   2. The target's only direct child can BE an injection, in which case the
+ *      "real continuation" turn is a grandchild. (Empirical case: ZEBRA →
+ *      system-reminder probe → AARDVARK. ZEBRA's direct child is the probe;
+ *      we need AARDVARK two hops down.)
+ *
+ * Walk via DFS: at each level, return the first non-injection child; for any
+ * injection child, recurse into ITS children to skip past the probe. Bounded
+ * depth (RECALL_MAX_DEPTH) and visited set guard against cycles.
  */
 function firstChild(db: DB, parentRevisionId: string): RevisionRow | undefined {
-  return db.prepare(`
-    SELECT * FROM revisions WHERE parent_revision_id = ?
-     ORDER BY created_at ASC, id ASC LIMIT 1
-  `).get(parentRevisionId) as RevisionRow | undefined
+  const visited = new Set<string>()
+  function walk(parentId: string, depth: number): RevisionRow | undefined {
+    if (depth > RECALL_MAX_DEPTH) return undefined
+    if (visited.has(parentId)) return undefined
+    visited.add(parentId)
+    const rows = db.prepare(`
+      SELECT * FROM revisions WHERE parent_revision_id = ?
+       ORDER BY created_at ASC, id ASC LIMIT 32
+    `).all(parentId) as RevisionRow[]
+    let firstInjection: RevisionRow | undefined
+    for (const r of rows) {
+      if (isHarnessInjectionRevision(db, r.id)) {
+        if (!firstInjection) firstInjection = r
+        continue
+      }
+      return r
+    }
+    // No non-injection direct child. Recurse into the first injection's
+    // descendants to find a non-injection one further down.
+    if (firstInjection) {
+      const grand = walk(firstInjection.id, depth + 1)
+      if (grand) return grand
+      return firstInjection // last resort: return the injection itself
+    }
+    return undefined
+  }
+  return walk(parentRevisionId, 0)
 }
 
 /**
- * Walk past `open` and `in_flight` revisions from the most recent revision
- * to find the nearest settled (non-in-flight) ancestor. This is the F4 guard
- * extracted into a helper so both `recall` and `rewind_to` can reuse it.
+ * Synchronous probe: does this revision's request body's last user message
+ * match a known harness pseudo-prompt? Used by effectiveHead / nthForkableBack /
+ * countForkableBack / forkableSequence to skip injection turns when computing
+ * "N back" — the user's mental model counts conversational turns, not raw
+ * revisions, and harness injections (SUGGESTION MODE, system-reminder recap)
+ * shouldn't shift the index.
  *
- * Returns undefined if no settled revision is reachable. Cycle-safe: a
- * corrupt parent_revision_id chain (e.g., self-loop or A→B→A) terminates
- * via the visited set and depth cap rather than spinning forever.
+ * Read path: requestBodyCidFor → blobs (top blob with messages link list) →
+ * blobs (last user leaf). All sync via better-sqlite3. Returns false on any
+ * lookup miss / parse failure (defensive: don't block legitimate navigation
+ * because of a corrupt blob).
+ */
+function isHarnessInjectionRevision(db: DB, revisionId: string): boolean {
+  const cid = requestBodyCidFor(db, revisionId)
+  if (!cid) return false
+  const top = db.prepare('SELECT bytes FROM blobs WHERE cid = ?').get(cid) as { bytes: Buffer } | undefined
+  if (!top) return false
+  let parsed: { messages?: unknown[] }
+  try {
+    parsed = JSON.parse(top.bytes.toString('utf8'))
+  }
+  catch { return false }
+  if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) return false
+  // Walk last user message in the messages array.
+  for (let i = parsed.messages.length - 1; i >= 0; i--) {
+    const m = parsed.messages[i]
+    let leaf: { role?: string, content?: unknown } | null = null
+    if (m && typeof m === 'object' && '/' in m && typeof (m as { '/': unknown })['/'] === 'string') {
+      const leafBlob = db.prepare('SELECT bytes FROM blobs WHERE cid = ?').get((m as { '/': string })['/']) as { bytes: Buffer } | undefined
+      if (!leafBlob) continue
+      try {
+        leaf = JSON.parse(leafBlob.bytes.toString('utf8'))
+      }
+      catch { continue }
+    }
+    else if (m && typeof m === 'object' && 'role' in m) {
+      leaf = m as { role?: string, content?: unknown }
+    }
+    if (!leaf || leaf.role !== 'user') continue
+    let text = ''
+    if (typeof leaf.content === 'string') text = leaf.content
+    else if (Array.isArray(leaf.content)) {
+      const block = (leaf.content as Array<{ type?: string, text?: string }>).find(
+        b => b && b.type === 'text',
+      )
+      text = block?.text ?? ''
+    }
+    if (!text) return false
+    return isInjectionText(text)
+  }
+  return false
+}
+
+/**
+ * Walk past `open` and `in_flight` revisions AND past harness-injection
+ * `closed_forkable` revisions (SUGGESTION MODE / recap pseudo-prompts) from
+ * the most recent revision to find the nearest "navigable" ancestor — i.e.,
+ * a settled, non-injection revision the user thinks of as a real turn.
+ * Both `recall` and `rewind_to` use this so `turn_back_n=1` consistently
+ * means "one user-prompt back" rather than "one transport-revision back".
+ *
+ * Returns undefined if no settled non-injection revision is reachable. Cycle-
+ * safe: a corrupt parent_revision_id chain terminates via the visited set
+ * and depth cap rather than spinning forever.
  */
 function effectiveHead(db: DB, taskId: string): RevisionRow | undefined {
   let head: RevisionRow | undefined = mostRecentRevision(db, taskId)
   const visited = new Set<string>()
   for (let i = 0; i < RECALL_MAX_DEPTH; i++) {
-    if (!head || (head.classification !== 'open' && head.classification !== 'in_flight')) return head
+    if (!head) return undefined
     if (visited.has(head.id)) return undefined
     visited.add(head.id)
+    const isOpen = head.classification === 'open' || head.classification === 'in_flight'
+    const isInjection = head.classification === 'closed_forkable' && isHarnessInjectionRevision(db, head.id)
+    if (!isOpen && !isInjection) return head
     if (!head.parent_revision_id) return undefined
     head = loadRevision(db, head.parent_revision_id)
   }
@@ -221,9 +329,10 @@ function effectiveHead(db: DB, taskId: string): RevisionRow | undefined {
 }
 
 /**
- * Walk backward from `start` (inclusive) collecting the first N closed_forkable
- * revisions. Returns the Nth (1-indexed) or undefined if fewer than N exist.
- * The returned revision is the FORK POINT for rewind_to.
+ * Walk backward from `start` (exclusive) collecting the first N closed_forkable
+ * revisions, SKIPPING harness-injection turns. Returns the Nth (1-indexed) or
+ * undefined if fewer than N qualifying revisions exist. The returned revision
+ * is the FORK POINT for rewind_to.
  *
  * `start` itself is "where we are" — it is NOT counted, even if it's closed_forkable.
  *
@@ -240,7 +349,7 @@ function nthForkableBack(db: DB, start: RevisionRow, n: number): RevisionRow | u
     visited.add(cursor)
     const rev = loadRevision(db, cursor)
     if (!rev) break
-    if (rev.classification === 'closed_forkable') {
+    if (rev.classification === 'closed_forkable' && !isHarnessInjectionRevision(db, rev.id)) {
       target = rev
       walked++
       if (walked >= n) break
@@ -252,9 +361,10 @@ function nthForkableBack(db: DB, start: RevisionRow, n: number): RevisionRow | u
 }
 
 /**
- * Count how many closed_forkable revisions are reachable backward from
- * `start` (exclusive). Used to produce a helpful error message when
- * `nthForkableBack` returns undefined. Cycle-safe like its siblings.
+ * Count how many non-injection closed_forkable revisions are reachable backward
+ * from `start` (exclusive). Used for the "only N rewindable turns available"
+ * error message. Counting must match nthForkableBack's filter, otherwise a user
+ * sees "X available" but `rewind_to(turn_back_n=X)` returns undefined.
  */
 function countForkableBack(db: DB, start: RevisionRow): number {
   let count = 0
@@ -266,7 +376,7 @@ function countForkableBack(db: DB, start: RevisionRow): number {
     visited.add(cursor)
     const rev = loadRevision(db, cursor)
     if (!rev) break
-    if (rev.classification === 'closed_forkable') count++
+    if (rev.classification === 'closed_forkable' && !isHarnessInjectionRevision(db, rev.id)) count++
     cursor = rev.parent_revision_id
   }
   return count
@@ -274,22 +384,42 @@ function countForkableBack(db: DB, start: RevisionRow): number {
 
 /**
  * Recognize claude-harness pseudo-prompts that get spliced into messages[]
- * as user-role turns. Two we observe in the wild:
+ * as user-role turns. Three we observe in the wild:
  *   - "The user stepped away and is coming back. Recap in under 40 words…"
  *     fires when the user's terminal idles, asks the AI for a short recap.
  *   - "[SUGGESTION MODE: Suggest what the user might naturally type next…"
  *     fires before claude shows its predictive-suggest UI.
- * Both are noise when answering "what triggered this turn?" — the real user
- * input is usually one or two messages earlier in the array. turnPreview
- * skips matches and walks back until it finds something else.
+ *   - "<system-reminder>…</system-reminder>" with no body after — pure
+ *     reminder turns (file-opened, task-tool nudge, date change). When a
+ *     system-reminder is followed by real user content, that's a normal
+ *     user prompt and we leave it alone.
  *
- * Pattern set kept narrow (anchor-at-start, no false-positive risk in
- * real user prose). New harness injections can be added here as observed.
+ * All three are noise for navigation purposes. `isInjectionText` and
+ * downstream callers (effectiveHead, nthForkableBack, countForkableBack,
+ * mostRecentForkableRevision) skip them so `turn_back_n=1` consistently
+ * means "one user-prompt back."
+ *
+ * Patterns kept narrow (anchor-at-start, no false-positive risk in real
+ * user prose). New harness injections can be added here as observed.
  */
 const HARNESS_INJECTION_PATTERNS: readonly RegExp[] = [
   /^The user stepped away and is coming back\b/,
   /^\[SUGGESTION MODE:/,
 ]
+
+function isInjectionText(text: string): boolean {
+  if (HARNESS_INJECTION_PATTERNS.some(re => re.test(text))) return true
+  // System-reminder turns are injection ONLY when nothing substantive remains
+  // after stripping the <system-reminder> blocks. A user prompt prefixed by a
+  // system-reminder (claude harness pattern when the user opens a file in
+  // the IDE, hits a date change, etc.) keeps the real user content after
+  // the closing tag — that's a real turn.
+  if (text.startsWith('<system-reminder>')) {
+    const stripped = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '').trim()
+    if (stripped === '') return true
+  }
+  return false
+}
 
 /**
  * Extract a ≤80-char content preview from a revision's request body. Used by
@@ -333,7 +463,7 @@ async function turnPreview(
     }
     text = text.replace(/\s+/g, ' ').trim()
     if (text.length === 0) continue
-    if (HARNESS_INJECTION_PATTERNS.some(re => re.test(text))) {
+    if (isInjectionText(text)) {
       // Remember the most-recent injection text in case we never find a
       // real user message; loop continues to look for one.
       if (firstInjectionMatch === null) firstInjectionMatch = text

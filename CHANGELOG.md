@@ -2,6 +2,47 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.2] - 2026-05-06
+
+Follow-up to 0.5.1 — same-day. Investigating cli-tmux-integration test 3's intermittent failures revealed `turn_back_n` was counting claude-harness pseudo-prompts (system-reminder probes, SUGGESTION MODE injections, recap hooks) as conversational turns. The AI's mental model of "go back 1 turn" diverged from retcon's "walk 1 closed_forkable revision back" whenever an injection sat between real turns.
+
+### Root cause (with captured production fixture)
+
+Forensic dump from session `fb34e619` 5/4 20:57 showed the actual revision DAG retcon was navigating:
+
+```
+000004  ZEBRA prompt          end_turn  (real)
+000006  <system-reminder>     end_turn  (injection — body=msgs:1, reminder only)
+000008  AARDVARK prompt       end_turn  (real)
+000010  [SUGGESTION MODE: …]  end_turn  (injection)
+000012  rewind_to tool_use    open
+```
+
+When the AI called `rewind_to(turn_back_n=1)`:
+
+- `effectiveHead` returned `000010` (the SUGGESTION turn — most recent settled).
+- `nthForkableBack(000010, 1)` walked 1 closed_forkable back → `000008` (AARDVARK).
+- `firstChild(000008)` returned `000010` (SUGGESTION) for messages reconstruction; SUGGESTION's body was `msgs=1` with just the injection text, so `slice(0, -1)` produced `[]`.
+- Result: rewind targeted AARDVARK (off by one) AND `baseMessages` was empty. AI in the rewound branch saw only `[synthetic_question]`, answered "AARDVARK" or "unknown" depending on training-data leak, polluting `branch_context_json`.
+
+### Fixed
+
+- **Navigation helpers skip harness-injection revisions.** `effectiveHead`, `nthForkableBack`, `countForkableBack`, and `mostRecentForkableRevision` walk past closed_forkable revisions whose request body's last user message matches an injection pattern. `turn_back_n=1` now consistently means "one user-prompt back," matching the AI's mental model. `bookmark` and `dump_to_file`'s default-to-current-head also skip injections, so they default to the real conversational head instead of the SUGGESTION turn that happens to be most-recent settled.
+- **`firstChild` walks past injection descendants.** Fork-point reconstruction needs a child whose request body carries the conversation history (target's response + new user input). Injection probes (system-reminder bodies sometimes ship with `msgs=1`, no history) break that assumption. `firstChild` now does a bounded DFS, recursing into injection children to find the first real conversational descendant. Recovers the AARDVARK-as-grandchild case where ZEBRA → system-reminder → AARDVARK.
+- **Injection-pattern detector handles `<system-reminder>`.** New `isInjectionText` recognizes pure-reminder turns (system-reminder block with nothing substantive after) while leaving real user prompts that *prefix* with a system-reminder (e.g., file-opened reminder before the user's actual instruction) as real turns. Strips `<system-reminder>…</system-reminder>` blocks and trims; if anything remains, it's a real turn.
+
+### Tests
+
+- Updated mcp-tools tests with the captured production fixture: ZEBRA → system-reminder → AARDVARK → SUGGESTION MODE in sequence. Asserts:
+  - `recall(turn_back_n=1)` from head returns ZEBRA (skipping system-reminder), not AARDVARK.
+  - `recall(turn_back_n=2)` errors with "fewer than 2 turns" (only 2 real turns count, injections excluded).
+  - `current_head_turn_id` reflects the most-recent non-injection turn.
+- All 459 unit tests pass; integration suite (cli-tmux-integration) passes 3/3 in 24-48s when the AI cooperates with the tool-invocation prompt (independent flakiness when the AI declines to invoke `rewind_to`).
+
+### Why it matters
+
+The bug was deterministic given a particular DAG shape: any rewind whose target had a harness-injection revision between it and the head would land off by one and reconstruct an empty prefix. Empirically observed in dogfooding (~50% of dogfooded rewinds had a SUGGESTION MODE injection just before the user's rewind instruction). With the fix, `turn_back_n` semantics is consistent with the user's mental model regardless of harness behavior.
+
 ## [0.5.1] - 2026-05-06
 
 Two-day post-launch dogfooding revealed a major audit gap: of 9 fork.back_requested events across 3 days, only 2 produced fork.forked. **All 7 failures had the same shape — the splice landed (TOBE was consumed), but the post-rewind first turn closed with `stop_reason='tool_use'` instead of `end_turn`.** The SR pipeline only emitted fork.forked on `end_turn`, so the rewind happened but no audit trail materialized — `recall` and `list_branches` showed nothing about it.

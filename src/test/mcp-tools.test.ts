@@ -260,33 +260,52 @@ describe('recall (list mode)', () => {
     expect('parent_revision_id' in t).toBe(false)
   })
 
-  // Harness pseudo-prompts (recap and SUGGESTION MODE injections) commonly
-  // sit at the tail of messages[]. Without skip-walk-back, recall's preview
-  // shows the injection text instead of the user's actual input. The patterns
-  // are narrow and anchor-at-start, so they don't catch user prose.
-  it('preview skips claude-harness injections and walks back to the real user input', async () => {
-    const messages = [
-      { role: 'user', content: 'fix the build' },
-      { role: 'assistant', content: '...' },
-      { role: 'user', content: 'The user stepped away and is coming back. Recap in under 40 words…' },
-    ]
-    emitTurn(fx, 'end_turn', messages)
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'next' }]) // anchor a head so the above is rewindable
-    const r = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
-    expect(r.turn.preview).toBe('fix the build')
+  // Harness pseudo-prompts (recap and SUGGESTION MODE injections) get inserted
+  // by claude as user-role turns mid-conversation. They land in the revisions
+  // table as ordinary closed_forkable rows, which silently broke `turn_back_n`
+  // counting — `nthForkableBack(1)` from a head sitting after a SUGGESTION
+  // injection would land ON the injection (or one turn earlier than the user
+  // intended). Fix: navigation helpers (effectiveHead, nthForkableBack,
+  // countForkableBack) skip injection-pattern revisions so `turn_back_n=1`
+  // consistently means "one user-prompt back," matching the AI's mental model.
+  //
+  // Captured shape from production dogfooding (cli-tmux-integration test 3):
+  //   rev_zebra      end_turn  "Remember the secret word ZEBRA. Reply OK."
+  //   rev_sysremind  end_turn  "<system-reminder> ..."        ← injection
+  //   rev_aardvark   end_turn  "Remember the secret word AARDVARK. Reply OK."
+  //   rev_suggest    end_turn  "[SUGGESTION MODE: ...]"        ← injection
+  //   (head)
+  // Old behavior: turn_back_n=1 → rev_aardvark (skipping head's injection but
+  // landing on the prior real turn's *successor*). New: turn_back_n=1 from
+  // head walks past rev_suggest → rev_aardvark, then back 1 → rev_zebra.
+  it('rewind_to(turn_back_n=N) skips harness-injection revisions when counting', async () => {
+    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nReminder body...\n</system-reminder>\n' }])
+    const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]' }])
+    // From the new head (the SUGGESTION turn, which effectiveHead skips → AARDVARK):
+    //   turn_back_n=1 → ZEBRA (skipping system-reminder injection between them)
+    const recall1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, preview: string } }
+    expect(recall1.turn.turn_id).toBe(t1.id)
+    expect(recall1.turn.preview).toContain('ZEBRA')
+    // turn_back_n=2 falls off the front (only ZEBRA + AARDVARK count; system-
+    // reminder + SUGGESTION are skipped). Error message reports actual count.
+    const recall2 = await call(fx, 'recall', { turn_back_n: 2 }) as { error: string }
+    expect(recall2.error).toMatch(/fewer than|only \d/)
+    // Sanity: t3 (AARDVARK) is the new effectiveHead; the head turn is excluded
+    // from recall list mode.
+    void t3
   })
 
-  it('preview falls back to the harness injection text when no real user input is in scope', async () => {
-    // Pure-injection conversation: the only user message is a SUGGESTION MODE
-    // hook. Better to surface it than return "(no user message)" — the AI can
-    // still tell what kind of turn this is.
-    const messages = [
-      { role: 'user', content: '[SUGGESTION MODE: predict the user\'s next input...]' },
-    ]
-    emitTurn(fx, 'end_turn', messages)
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'after' }])
-    const r = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
-    expect(r.turn.preview).toMatch(/SUGGESTION MODE/)
+  it('current head skips harness-injection revisions', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real first turn' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real second turn' }])
+    const aardvarkTurn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real third turn' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: predict next input]' }])
+    // current_head_turn_id reflects the most-recent non-injection settled
+    // turn (so bookmark / dump_to_file default to the right place).
+    const r = await call(fx, 'recall', {}) as { current_head_turn_id: string | null }
+    expect(r.current_head_turn_id).toBe(aardvarkTurn.id)
   })
 })
 
