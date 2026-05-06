@@ -93,7 +93,9 @@ For tools that don't satisfy all three, simpler patterns suffice. recall returns
 
 retcon only swaps `messages[]`. The system prompt and `tools[]` come from claude's outgoing body unchanged. This is a deliberate scope reduction: rewriting `tools[]` would let us add tools mid-conversation but at the cost of every rewind-affected turn diverging from claude's local view of what tools exist. We don't do that. The model's tool set is whatever claude's harness configured for the current invocation; the rewind only edits history.
 
-The `message` arg the calling AI passes is delivered VERBATIM. No prefix, no wrapping, no `[retcon: this is a rewound context]` metadata. The dual-secret guardrail above is what ensures the AI writes a self-contained message in the first place; once that's verified, retcon stays out of the way.
+The `message` arg the calling AI passes is delivered VERBATIM. The text is its own content block in the user-role message, byte-equal to what the AI sent. The dual-secret guardrail above is what ensures the AI writes a self-contained message in the first place; once that's verified, retcon stays out of the way of the user's text.
+
+There is one adjacent addition: a `<retcon-active>` system-reminder-style block sits as a *sibling* content block before the user's message in the synthetic landing turn. It carries two directives the post-rewind AI is asked to apply — a user-facing one (tell the user that claude code's `/rewind` won't release this fork; use `/clear`, `/compact`, or another `rewind_to`) and an AI-internal one (re-Read files referenced earlier, since disk may have advanced past the rewound branch's view). The user's text is unmodified; only the surrounding context grows. This is the only channel retcon has to surface UI-level warnings to the human in claude code (more in "Why claude code's `/rewind` is the channel-of-last-resort" below).
 
 ## Split reality across the proxy boundary
 
@@ -120,6 +122,20 @@ That LLM call is the key. It goes through our proxy like any other `/v1/messages
 After /compact, claude's local jsonl is therefore *aligned* with the forked branch via the summary it just received. The split reality has collapsed. There's nothing left to translate between, because both sides agree on history. Continuing to override at this point would just splice the full uncompacted fork history onto a body whose head is already a compacted view of that same history — a shape mismatch with no upside. So we step out of the way.
 
 The deeper insight: **retcon doesn't introspect claude's jsonl to know when to stop overriding.** claude tells us via the hook. One bit: "reset your override." We trust the harness on its own state, which keeps coupling minimal. The /compact case happens to be the one where stepping out is also the right thing semantically, but we don't know that from inspecting the new body — we know it because the harness signaled it.
+
+## Why claude code's `/rewind` is the channel-of-last-resort
+
+`/clear` and `/compact` route through the SessionStart hook — one bit, harness-signaled, easy to act on. claude code's `/rewind` slash command does not. It truncates claude's local jsonl entirely client-side, fires no hook, sends no `/v1/messages`. retcon has zero direct signal that the user invoked it. Without intervention, the next user prompt produces a body in a shape the persistent-fork splice wasn't designed for; the AI may answer a stale synthetic prompt or upstream may 400.
+
+That leaves two indirect channels, and retcon uses both:
+
+**The reminder block — the only way to reach the user proactively.** When `rewind_to`/`submit_file` activates the fork, the synthetic landing turn carries a `<retcon-active>` reminder block adjacent to the user's verbatim message. The AI in the rewound branch sees it and, because claude is trained on similar `<system-reminder>` shape, surfaces the warning to the user in its response: "while this fork is active, don't use claude code's `/rewind`." The AI's response is the only text from retcon's side that actually reaches claude code's UI for the human to read; pre-splice tool results are discarded by the splice itself. So the channel is "AI response post-fork-establish" — primed once on the way in.
+
+**Asst-text continuity — the only way to detect after the fact.** branch_context's most-recent assistant text is something we sent upstream and got back; claude appends it to its local jsonl on every successful turn. So in normal operation, that text MUST appear in claude's next `/v1/messages` body. If it doesn't, claude truncated past it — almost certainly via `/rewind`. retcon walks `branch_context` backward for the last assistant, walks claude's body for matching text, and on miss releases the fork (NULLs `branch_context_json`, emits `session.branch_context_released`). Pass-through; the user's prompt reaches the AI cleanly.
+
+The asst-text approach has a known false-negative for short, ambiguous responses (if both sides have an "OK" assistant somewhere, the check passes by accident). The user notices the AI talking past their prompt, runs `/clear`, recovers. Acceptable trade-off.
+
+Both halves landed in v0.5.3. Together they shift `/rewind` interop from "silent wrong answer or 400" to "user warned proactively, fork released cleanly if they invoke `/rewind` anyway."
 
 ## Assumptions we make about the harness
 

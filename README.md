@@ -52,13 +52,15 @@ The branch survives daemon restarts, `claude --resume`, and `claude --continue`.
 
 ### `/rewind` and an active retcon fork
 
-Claude Code's built-in `/rewind` slash command **does not interoperate with an active retcon fork**. `/rewind` truncates claude's local jsonl entirely client-side — no hook fires, no `/v1/messages` is sent for retcon to intercept. retcon has no direct signal the user invoked it. The next user prompt produces a body in a shape the persistent-fork splice wasn't designed for; the AI may answer a stale synthetic prompt or upstream may 400 with "must end with user message".
+Claude Code's built-in `/rewind` slash command **doesn't interoperate with an active retcon fork**, but retcon now warns you about it BEFORE you hit the trap and detects the conflict reliably AFTER if you do hit it. The interaction has two halves:
 
-retcon catches the *narrow* case where claude's post-`/rewind` body has fewer than 2 user messages (early-conversation `/rewind` or a startup probe). In that case retcon NULLs `branch_context_json`, emits a `session.branch_context_released` audit event, and forwards claude's body unchanged. Future turns operate on claude's view. The user gets the answer they expected; the fork is gone.
+**Proactive warning.** When retcon's `rewind_to` (or `submit_file`) activates a fork, the synthetic user message that lands in the rewound branch carries a small `<retcon-active>` reminder block alongside your verbatim message. The AI sees it as a system-style note (claude is trained on similar `<system-reminder>` shape) and tells you in its response: "while this fork is active, don't use claude code's `/rewind` — use `/clear`, `/compact`, or another `rewind_to` to switch contexts." That's the only channel retcon has to reach you in claude's UI. `/rewind` itself never reaches the LLM (claude code captures it client-side), so the AI can't warn at the moment of `/rewind` — but it primes you on the way IN to the fork.
 
-The *long-conversation* case isn't caught: after `/rewind` to turn 30 of a 50-turn session, claude's body still has 30+ user messages and the penultimate-user pivot keeps slicing — but it produces a Frankenstein body that mixes retcon's forked prefix with claude's truncated tail. The AI sees an incoherent conversation. There's no clean signal for retcon to detect this case without tracking per-turn upstream-response identity, which 0.5.x doesn't do yet.
+**Detection if you /rewind anyway.** retcon's persistent-fork splice runs an asst-text continuity check before each turn: `branch_context`'s most-recent assistant text must appear somewhere in claude's outgoing body (claude assembles every upstream response into its local jsonl, so it's always present in normal operation). When `/rewind` truncates claude's jsonl past that point, the text disappears, retcon detects the divergence, NULLs `branch_context_json`, emits a `session.branch_context_released` audit event, and forwards claude's body unchanged. The user's next prompt reaches the AI cleanly; the fork is released.
 
-Practical consequence: **once you give the AI control via retcon's `rewind_to`, let the AI steer until `/clear`, `/compact`, or another `rewind_to` runs**. If you need to manually rewind, do so BEFORE invoking retcon's tools, or release the fork via `/clear` first.
+The detection generalizes to long-conversation `/rewind` too — it's not a count heuristic, it's a content-anchor on something we know claude received. Edge case: if `branch_context`'s last asst text happens to also appear in claude's body at an earlier turn (rare for distinctive responses, possible for short ones like "OK"), the check passes and the splice produces a Frankenstein turn. You'll notice the AI talking past your prompt and can `/clear` to recover.
+
+Practical workflow: **once you give the AI control via retcon's `rewind_to`, let the AI steer until `/clear`, `/compact`, or another `rewind_to` runs.** If you need to manually rewind, do so BEFORE invoking retcon's tools, or release the fork via `/clear` first.
 
 ## Actors and cleanup
 
@@ -202,8 +204,8 @@ Provider credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, `OPE
 
 Two docs cover the design at depth:
 
-- [INSIGHTS.md](./INSIGHTS.md) — *why* retcon works the way it does. Composition over invasion, the read/write tool split, the SR thesis, progressive disclosure for context-dying tools, split reality across the proxy boundary, why /compact aligns the two realities, harness assumptions.
-- [IMPLEMENTATION.md](./IMPLEMENTATION.md) — *how* the non-trivial mechanisms work. TOBE pending file as one-shot baton, SR pipeline across three time points, persistent-fork penultimate-user splice, cache_control marker handling, resume binding, content-addressed body storage, event sourcing + projector chain.
+- [INSIGHTS.md](./INSIGHTS.md) — *why* retcon works the way it does. Composition over invasion, the read/write tool split, the SR thesis, progressive disclosure for context-dying tools, split reality across the proxy boundary, why /compact aligns the two realities, why claude code's `/rewind` is the channel-of-last-resort, harness assumptions.
+- [IMPLEMENTATION.md](./IMPLEMENTATION.md) — *how* the non-trivial mechanisms work. TOBE pending file as one-shot baton, SR pipeline across three time points, deferred fork.forked across tool_use chains, harness-injection skip in turn_back_n, state-divergence guard via asst-text continuity, the `<retcon-active>` reminder block, persistent-fork penultimate-user splice, cache_control marker handling, resume binding, content-addressed body storage, event sourcing + projector chain.
 
 If you're reading the code and want to understand why a piece is shaped a certain way, INSIGHTS.md. If you're tracing a specific pipeline (TOBE consumption, SR construction, splice mechanics), IMPLEMENTATION.md.
 

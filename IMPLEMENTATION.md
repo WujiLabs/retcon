@@ -103,6 +103,70 @@ The trade-off: at T0 we could have returned a friendly inline error to the calli
 
 A daemon upgrade mid-session can leave a v0.4-shaped TOBE pending file (no `synthetic` field) for the v0.5+ daemon to consume. proxy-handler logs a warning and skips fork.forked emission. The rewind/submit still applies; only the SR row doesn't materialize for that one operation. Documented gap, acceptable per pre-1.0 alpha policy.
 
+### Deferred fork.forked across tool_use chains
+
+The original SR pipeline gates `fork.forked` on `stop_reason='end_turn'` at T2. That works when the post-rewind AI types one final answer immediately, but breaks when the AI chains tool calls (Read, Bash, recall) before answering — `stop_reason='tool_use'` doesn't pass the gate, the TOBE was already consumed at T1, the rewind applied but no SR row materializes. Empirically (3-day dogfood signal): 7 of 9 fork.back_requested events produced no fork.forked, all 7 had tool_use as the post-rewind first stop_reason.
+
+v0.5.1 fixed this with deferred emission. When T2 sees `tobe_consumed && synthetic && status==2xx && stop_reason ∈ {tool_use, pause_turn}`, it persists the synthetic metadata to a new `sessions.pending_synthetic_json` column instead of emitting fork.forked. Subsequent `proxy.response_completed` events for the same session check the column; on the first `closed_forkable` stop_reason that arrives, retcon re-fetches the original (pre-splice) request body's bytes from `blobs` by CID, calls `buildSyntheticAsset`, and emits fork.forked with `to_revision_id` pointing at the FIRST post-rewind turn (the TOBE-consumer — that's the navigation handle the user thinks of as "where the fork landed").
+
+State transitions for `pending_synthetic_json`:
+
+- Set: T2 with `tobe_consumed && stop_reason ∈ {tool_use, pause_turn}` — defer.
+- Cleared on closed_forkable: emit fork.forked first.
+- Cleared on dangling (max_tokens, refusal, null): emit fork.synthesis_failed (the chain ended on a non-resumable stop_reason).
+- Cleared on supersede: a new rewind/submit that consumes a fresh TOBE clobbers the prior pending_synthetic, with a fork.synthesis_failed audit (`error_message: "superseded by a new rewind/submit before reaching end_turn"`).
+
+The schema migration is additive (`ALTER TABLE sessions ADD COLUMN pending_synthetic_json TEXT` in v5→v6). Existing rows get NULL. Backward-compat: a v0.5.0 daemon won't recognize the column but additive ALTER doesn't break basic queries; the deferred path is unavailable to that daemon (degrades to the original gate, same behavior as 0.5.0).
+
+The mechanism details (column shape, helper module `pending-synthetic.ts`, where the read/write happens in proxy-handler.ts T2) are derivable from the code.
+
+### Harness-injection skip in turn_back_n
+
+claude code splices pseudo-prompts into messages[] as user-role turns: `<system-reminder>` probes (file-opened reminders, idle nudges), `[SUGGESTION MODE: ...]` predict-next prompts, `"The user stepped away..."` recap hooks. They become ordinary `closed_forkable` revisions in the projector — but they're not user-conversational turns. Without a skip, `turn_back_n=1` would land on the most recent injection, off by one from what the user means.
+
+v0.5.2 added `isHarnessInjectionRevision(db, revisionId)` — a synchronous probe that reads the revision's request body, walks the last user message, and tests its text against a narrow pattern set:
+
+- `^The user stepped away and is coming back\b` (recap hook)
+- `^\[SUGGESTION MODE:` (predict-next)
+- Pure system-reminder turn (only `<system-reminder>...</system-reminder>` text, nothing substantive after stripping)
+
+The pattern set is anchored-at-start with near-zero false-positive risk on real user prose. The system-reminder check is content-aware: `<system-reminder>` PREFIX with real user content underneath (claude's standard shape for IDE-open / date-change reminders) is NOT marked injection — substantive content remains after stripping the reminder block.
+
+Navigation helpers `effectiveHead`, `nthForkableBack`, `countForkableBack`, and `mostRecentForkableRevision` all consult `isHarnessInjectionRevision` and skip matching revisions when counting. `firstChild` (used by reconstructForkMessages for fork-point base derivation) does a bounded DFS through injection grandchildren — needed because injection probes sometimes ship with `msgs=1` (no conversation history), and the real continuation might be the grandchild via the probe.
+
+### State-divergence guard via asst-text continuity
+
+Persistent-fork's penultimate-user pivot assumes claude's body always contains the conversation we sent last turn. Claude code's `/rewind` slash command breaks that assumption — it truncates claude's local jsonl client-side, fires no hook, sends no separate /v1/messages. retcon has no direct signal.
+
+`applyBranchContextRewrite` runs an asst-text continuity check before splicing: walk `branch_context` backward for the most-recent assistant message, extract its text (stripping cache_control flags), and walk claude's body for any assistant with the same text. In normal operation that text is always present (claude assembles every upstream response into its local jsonl as an assistant turn). When `/rewind` truncates past it, the text is gone, retcon NULLs `branch_context_json`, emits `session.branch_context_released{reason: 'rewind_or_state_divergence'}`, and returns null so dispatch passes claude's body through unchanged. The user's next prompt reaches the AI cleanly.
+
+The check skips when `branch_context` has no assistant at all (rare — happens only when reconstructForkMessages fell back to the target's own body). Edge: when the matched asst text is short and ambiguous (e.g., both turns responded "OK"), the check passes against a different occurrence; splice produces a Frankenstein body. Documented in INSIGHTS as the "channel-of-last-resort" trade-off.
+
+The `userIndices.length < 2` branch (claude's body has 0-1 user messages) was previously the release trigger but is now pass-through: the asst-text check already verified continuity, so a 0/1-user body is a probe (startup, system-reminder), not /rewind.
+
+### `<retcon-active>` reminder block in synthetic landing turn
+
+The synthetic user-role message that lands at the rewound branch (= TOBE.messages.last) is constructed as a content-array with two text blocks:
+
+```
+{
+  role: 'user',
+  content: [
+    { type: 'text', text: '<retcon-active>...directives...</retcon-active>' },
+    { type: 'text', text: <user's message arg verbatim> }
+  ]
+}
+```
+
+The reminder block carries two directives:
+
+- **User-facing**: tell the user once after answering that claude code's `/rewind` doesn't release this fork; use `/clear`, `/compact`, or another `rewind_to`.
+- **AI-internal** (do NOT echo): re-Read files referenced earlier — disk may have advanced past the rewound branch's view.
+
+The user-facing directive is retcon's only proactive channel into claude's UI for the human (`/rewind` never reaches the LLM, pre-splice tool results are discarded by the splice itself, retcon can't modify claude's UI directly). Verified end-to-end: both Opus 4.7 and Sonnet 4.6 surface the user-facing warning and silently apply the file-staleness directive.
+
+Decision #6 in INSIGHTS.md ("message delivered VERBATIM") is preserved: the user's text is its own content block, byte-equal to what they passed. The reminder is a sibling block, not a wrapper. retcon's `isInjectionText` recognizes the pattern (`<system-reminder>`-style with substantive content remaining) and treats the turn as a real user prompt, not an injection.
+
 ## Persistent fork: the penultimate-user splice
 
 After rewind_to, retcon doesn't just rewrite one `/v1/messages` and stop. It keeps the forked branch alive across every subsequent turn until you explicitly release it. Each session row carries a `branch_context_json` column: a JSON array holding the full conversation in the active forked branch.

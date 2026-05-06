@@ -31,6 +31,20 @@ I tried a more aggressive content-match approach during development: walk claude
   - Normal post-rewind operation NOT released: even though branch_context's tail (synthetic_user) differs from claude's penultimate user, the splice proceeds correctly and branch_context grows.
 - All 462 unit tests pass; integration suite (cli-tmux-integration) 3/3 in 48s.
 
+### Follow-up: full coverage via asst-text continuity check + proactive AI warning
+
+The "partial coverage" framing above describes the mid-cycle landing of the < 2 users heuristic. After more probing, retcon ended up with a complete answer to the `/rewind` interop problem before 0.5.3 published — both halves are in this release.
+
+- **Asst-text continuity check replaces the `< 2 users` heuristic.** `applyBranchContextRewrite` now walks `branch_context` backward for the most-recent assistant message, extracts its text, and checks claude's body for any assistant with the same text. claude assembles every upstream response into its local jsonl as an assistant turn, so that text is always present in normal operation. When `/rewind` truncates past it, the text is gone — retcon NULLs `branch_context_json`, emits `session.branch_context_released`, passes claude's body through. Catches long-conversation `/rewind` (the case the heuristic missed) using the same code path. Edge case: short ambiguous responses (both turns said "OK") can match against the wrong occurrence; documented as a known false-negative trade-off, user notices and `/clear`s.
+- **`<retcon-active>` reminder block in the synthetic landing turn.** The synthetic user-role message that lands in the rewound branch now carries a `<retcon-active>` system-reminder-style block as a sibling content block to the user's verbatim message. It directs the AI to surface a one-time user-facing warning ("don't use claude code's `/rewind` while this fork is active — use `/clear`, `/compact`, or another `rewind_to`") in its post-rewind response, and to apply an AI-internal directive (re-Read files referenced earlier — disk may have advanced past the rewound branch's view) silently. Decision #6's verbatim contract is preserved: the user's text is its own block, byte-equal. Verified end-to-end with both Opus 4.7 and Sonnet 4.6.
+- **CLAUDE.md** captures the version-bump and push cadence rules for retcon work: commit incrementally, bump version only at release time after CHANGELOG + doc updates land in a single release commit, don't push during partial-fix iteration.
+
+The first part is retcon's only proactive channel into claude code's UI for the human user (`/rewind` never reaches the LLM, retcon can't modify claude's UI directly, pre-splice tool results are discarded). The second part is the safety net if the user invokes `/rewind` anyway. Together they shift `/rewind` interop from "silent wrong answer or 400" to "user warned proactively, fork released cleanly if they `/rewind` regardless."
+
+Documentation: README's `/rewind` section is rewritten to describe the new mechanism, and INSIGHTS.md adds a "Why claude code's `/rewind` is the channel-of-last-resort" section explaining the design.
+
+466 unit tests pass; integration suite 3/3.
+
 ## [0.5.2] - 2026-05-06
 
 Follow-up to 0.5.1 — same-day. Investigating cli-tmux-integration test 3's intermittent failures revealed `turn_back_n` was counting claude-harness pseudo-prompts (system-reminder probes, SUGGESTION MODE injections, recap hooks) as conversational turns. The AI's mental model of "go back 1 turn" diverged from retcon's "walk 1 closed_forkable revision back" whenever an injection sat between real turns.
