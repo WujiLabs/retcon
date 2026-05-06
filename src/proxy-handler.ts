@@ -28,6 +28,11 @@ import { blobRefFromBytes, blobRefFromMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
 import type { BlobRef, EventProducer } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
+import {
+  clearPendingSynthetic,
+  getPendingSynthetic,
+  setPendingSynthetic,
+} from './pending-synthetic.js'
 import { redactHeaders } from './redaction.js'
 import { computeRevisionAsset } from './revisions-v1.js'
 import { buildSyntheticAsset, detectParallelTools } from './rewind-marker-v1.js'
@@ -555,6 +560,78 @@ async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Pr
   return buf
 }
 
+/**
+ * Build the SR's content-addressed body and emit fork.forked, or emit
+ * fork.synthesis_failed on any failure path. Shared between the immediate-
+ * fire path (TOBE just consumed, end_turn returned) and the deferred-fire
+ * path (TOBE consumed turns ago in a tool_use chain that has now closed
+ * with end_turn). The two paths differ in where originalBodyBytes comes
+ * from (in-memory blob vs re-fetched from blobs by CID); after that,
+ * everything downstream is the same.
+ */
+async function tryEmitForkForked(opts: {
+  producer: EventProducer
+  sessionId: string
+  synthetic: import('./tobe.js').SyntheticDepartureMeta
+  parent_revision_id: string
+  target_revision_id: string
+  to_revision_id: string
+  originalBodyBytes: Uint8Array
+}): Promise<void> {
+  const { producer, sessionId, synthetic: s } = opts
+  try {
+    const built = await buildSyntheticAsset({
+      originalBody: opts.originalBodyBytes,
+      kind: s.kind,
+      syntheticToolResultText: s.synthetic_tool_result_text,
+      syntheticAssistantText: s.synthetic_assistant_text,
+    })
+    if (built) {
+      producer.emit(
+        'fork.forked',
+        {
+          kind: s.kind,
+          synthetic_revision_id: s.synthetic_revision_id,
+          parent_revision_id: opts.parent_revision_id,
+          target_revision_id: opts.target_revision_id,
+          to_revision_id: opts.to_revision_id,
+          synthetic_tool_result_text: s.synthetic_tool_result_text,
+          synthetic_assistant_text: s.synthetic_assistant_text,
+          synthetic_user_message: s.synthetic_user_message,
+          target_view_id: s.target_view_id,
+          sealed_at: s.back_requested_at,
+          synthetic_asset_cid: built.topCid,
+        },
+        sessionId,
+        built.refs,
+      )
+    }
+    else {
+      producer.emit(
+        'fork.synthesis_failed',
+        {
+          parent_revision_id: opts.parent_revision_id,
+          target_revision_id: opts.target_revision_id,
+          error_message: 'buildSyntheticAsset returned null (originalBody missing last assistant or operation tool_use)',
+        },
+        sessionId,
+      )
+    }
+  }
+  catch (synthErr) {
+    const errMsg = (synthErr as Error).message ?? String(synthErr)
+    producer.emit(
+      'fork.synthesis_failed',
+      {
+        parent_revision_id: opts.parent_revision_id,
+        target_revision_id: opts.target_revision_id,
+        error_message: `buildSyntheticAsset threw: ${errMsg}`,
+      },
+      sessionId,
+    )
+  }
+}
+
 export async function handleProxyRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -990,100 +1067,147 @@ async function dispatch(
               [respHeaderBlob.ref, respBodyBlob.ref, { cid: asset.cid, bytes: asset.bytes }],
             )
 
-            // Synthetic departure Revision (SR) — v0.5.0-alpha.1. Gate on:
-            // TOBE consumed (and not aborted by parallel-tool guard above),
-            // status 2xx (4xx means the rewind didn't actually progress),
-            // stop_reason='end_turn' (mid-tool-use turns aren't forkable
-            // navigation points), pending.synthetic populated (pre-v0.5
-            // daemon TOBEs lack it), and we have an originalBody to
-            // extract R1's parsed content from.
+            // Synthetic departure Revision (SR). Gate on TOBE consumed (no
+            // parallel-tool abort) + status 2xx + originalBody captured.
+            // Stop_reason determines whether we fire now, defer, or audit-fail:
             //
-            // The work happens here (not inside emitTerminal) because
-            // building the synthetic body requires async hashing.
+            //   - closed_forkable (end_turn, stop_sequence): fire fork.forked
+            //     immediately. SR materializes with to_revision_id=this turn.
+            //   - open (tool_use, pause_turn): persist synthetic metadata to
+            //     sessions.pending_synthetic_json and re-check on each
+            //     subsequent response_completed for this session. Recovers
+            //     SRs for the empirically-common "post-rewind AI chains tools
+            //     before answering" pattern that previously dropped silently.
+            //   - dangling_unforkable (max_tokens, refusal, null, unknown):
+            //     emit fork.synthesis_failed; the rewind landed but the chain
+            //     ended on a non-resumable stop_reason.
             //
-            // Failure is loud-but-non-fatal: if the synthetic body can't
-            // be built, emit fork.synthesis_failed for the audit trail
-            // and skip the SR. The rewind itself still applied (TOBE was
-            // consumed, R_new exists) — we just won't have a navigation
-            // marker for it.
-            if (
-              pending
-              && !spliceAborted
-              && pending.synthetic
-              && status >= 200
-              && status < 300
-              && stopReason === 'end_turn'
-              && originalBodyBlob
-            ) {
+            // When this turn has NO TOBE but pending_synthetic_json is set,
+            // a prior rewind is in flight in a tool_use chain; same three-way
+            // dispatch on stop_reason, except the "fire" path re-fetches the
+            // original (pre-splice) body bytes from blobs by CID instead of
+            // reusing originalBodyBlob (which is null this turn).
+            //
+            // status non-2xx: leave everything alone. TOBE wasn't committed
+            // and pending_synthetic_json should survive for claude's retry.
+            const isClosedForkable = stopReason === 'end_turn' || stopReason === 'stop_sequence'
+            const isOpen = stopReason === 'tool_use' || stopReason === 'pause_turn'
+            const tobeConsumed = pending && !spliceAborted && status >= 200 && status < 300
+
+            if (tobeConsumed && pending && pending.synthetic && originalBodyBlob) {
               const s = pending.synthetic
-              try {
-                // We hashed `originalBody` into originalBodyBlob already, so
-                // the BlobRef has the bytes. Reuse them directly — no need
-                // to re-fetch from the storage provider.
-                const built = await buildSyntheticAsset({
-                  originalBody: originalBodyBlob.ref.bytes,
-                  kind: s.kind,
-                  syntheticToolResultText: s.synthetic_tool_result_text,
-                  syntheticAssistantText: s.synthetic_assistant_text,
-                })
-                if (built) {
-                  ctx.producer.emit(
-                    'fork.forked',
-                    {
-                      kind: s.kind,
-                      synthetic_revision_id: s.synthetic_revision_id,
-                      parent_revision_id: s.parent_revision_id,
-                      target_revision_id: pending.fork_point_revision_id,
-                      to_revision_id: requestEvent.id,
-                      synthetic_tool_result_text: s.synthetic_tool_result_text,
-                      synthetic_assistant_text: s.synthetic_assistant_text,
-                      synthetic_user_message: s.synthetic_user_message,
-                      target_view_id: s.target_view_id,
-                      sealed_at: s.back_requested_at,
-                      synthetic_asset_cid: built.topCid,
-                    },
-                    sessionId,
-                    built.refs,
-                  )
-                }
-                else {
+
+              // A new rewind clobbers any prior deferred SR. Audit + clear.
+              if (ctx.db) {
+                const prior = getPendingSynthetic(ctx.db, sessionId)
+                if (prior) {
                   ctx.producer.emit(
                     'fork.synthesis_failed',
                     {
-                      parent_revision_id: s.parent_revision_id,
-                      target_revision_id: pending.fork_point_revision_id,
-                      error_message: 'buildSyntheticAsset returned null (originalBody missing last assistant or operation tool_use)',
+                      parent_revision_id: prior.synthetic.parent_revision_id,
+                      target_revision_id: prior.fork_point_revision_id,
+                      error_message: 'superseded by a new rewind/submit before reaching end_turn',
                     },
                     sessionId,
                   )
+                  clearPendingSynthetic(ctx.db, sessionId)
                 }
               }
-              catch (synthErr) {
-                const errMsg = (synthErr as Error).message ?? String(synthErr)
+
+              if (isClosedForkable) {
+                await tryEmitForkForked({
+                  producer: ctx.producer,
+                  sessionId,
+                  synthetic: s,
+                  parent_revision_id: s.parent_revision_id,
+                  target_revision_id: pending.fork_point_revision_id,
+                  to_revision_id: requestEvent.id,
+                  originalBodyBytes: originalBodyBlob.ref.bytes,
+                })
+              }
+              else if (isOpen && ctx.db) {
+                // Defer: persist for fire on the next end_turn.
+                setPendingSynthetic(ctx.db, sessionId, {
+                  synthetic: s,
+                  to_revision_id: requestEvent.id,
+                  fork_point_revision_id: pending.fork_point_revision_id,
+                  original_body_cid: originalBodyBlob.cid,
+                  first_seen_at: Date.now(),
+                })
+              }
+              else {
+                // Dangling stop_reason or no DB: audit-fail.
                 ctx.producer.emit(
                   'fork.synthesis_failed',
                   {
                     parent_revision_id: s.parent_revision_id,
                     target_revision_id: pending.fork_point_revision_id,
-                    error_message: `buildSyntheticAsset threw: ${errMsg}`,
+                    error_message: ctx.db
+                      ? `post-rewind first turn ended with stop_reason=${stopReason ?? 'null'}; no SR materialized`
+                      : `proxy-handler context has no DB; cannot defer SR through tool_use chains`,
                   },
                   sessionId,
                 )
               }
             }
-            else if (
-              pending
-              && !spliceAborted
-              && !pending.synthetic
-              && status >= 200
-              && status < 300
-              && stopReason === 'end_turn'
-            ) {
+            else if (tobeConsumed && pending && !pending.synthetic && stopReason === 'end_turn') {
               console.warn(
                 `[proxy-handler] TOBE consumed for session=${sessionId} but `
                 + `pending.synthetic is missing — likely written by a pre-v0.5 daemon. `
                 + `Skipping fork.forked emission; no SR will materialize.`,
               )
+            }
+            else if (!pending && status >= 200 && status < 300 && ctx.db) {
+              // No TOBE this turn — a prior rewind may still be waiting on
+              // an end_turn. Re-check the persisted synthetic.
+              const persisted = getPendingSynthetic(ctx.db, sessionId)
+              if (persisted) {
+                if (isClosedForkable) {
+                  // Re-fetch original body bytes from blobs and fire.
+                  const blobRow = ctx.db
+                    .prepare('SELECT bytes FROM blobs WHERE cid=?')
+                    .get(persisted.original_body_cid) as { bytes: Uint8Array } | undefined
+                  if (!blobRow) {
+                    ctx.producer.emit(
+                      'fork.synthesis_failed',
+                      {
+                        parent_revision_id: persisted.synthetic.parent_revision_id,
+                        target_revision_id: persisted.fork_point_revision_id,
+                        error_message: `deferred fire: original_body_cid=${persisted.original_body_cid} missing from blobs`,
+                      },
+                      sessionId,
+                    )
+                  }
+                  else {
+                    await tryEmitForkForked({
+                      producer: ctx.producer,
+                      sessionId,
+                      synthetic: persisted.synthetic,
+                      parent_revision_id: persisted.synthetic.parent_revision_id,
+                      target_revision_id: persisted.fork_point_revision_id,
+                      to_revision_id: persisted.to_revision_id,
+                      originalBodyBytes: blobRow.bytes,
+                    })
+                  }
+                  clearPendingSynthetic(ctx.db, sessionId)
+                }
+                else if (isOpen) {
+                  // Still chaining; leave persisted in place.
+                }
+                else {
+                  // Dangling stop_reason mid-chain.
+                  ctx.producer.emit(
+                    'fork.synthesis_failed',
+                    {
+                      parent_revision_id: persisted.synthetic.parent_revision_id,
+                      target_revision_id: persisted.fork_point_revision_id,
+                      error_message: `deferred fire abandoned: subsequent turn ended with stop_reason=${stopReason ?? 'null'}`,
+                    },
+                    sessionId,
+                  )
+                  clearPendingSynthetic(ctx.db, sessionId)
+                }
+              }
             }
           }
           resolve()

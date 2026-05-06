@@ -273,10 +273,31 @@ function countForkableBack(db: DB, start: RevisionRow): number {
 }
 
 /**
+ * Recognize claude-harness pseudo-prompts that get spliced into messages[]
+ * as user-role turns. Two we observe in the wild:
+ *   - "The user stepped away and is coming back. Recap in under 40 words…"
+ *     fires when the user's terminal idles, asks the AI for a short recap.
+ *   - "[SUGGESTION MODE: Suggest what the user might naturally type next…"
+ *     fires before claude shows its predictive-suggest UI.
+ * Both are noise when answering "what triggered this turn?" — the real user
+ * input is usually one or two messages earlier in the array. turnPreview
+ * skips matches and walks back until it finds something else.
+ *
+ * Pattern set kept narrow (anchor-at-start, no false-positive risk in
+ * real user prose). New harness injections can be added here as observed.
+ */
+const HARNESS_INJECTION_PATTERNS: readonly RegExp[] = [
+  /^The user stepped away and is coming back\b/,
+  /^\[SUGGESTION MODE:/,
+]
+
+/**
  * Extract a ≤80-char content preview from a revision's request body. Used by
  * `recall` to show the AI what each forkable turn was about without dumping
- * the full conversation. Resolves the body via the events table and grabs
- * the LAST user message's text content.
+ * the full conversation. Resolves the body via the events table and walks
+ * back through user messages, skipping harness pseudo-prompts (recap and
+ * suggest-mode injections), to find the user's actual input that drove
+ * this turn.
  *
  * Returns a short placeholder string if the body is unavailable, empty, or
  * carries only non-text content blocks (images, tool_use, etc.). Failures
@@ -291,7 +312,11 @@ async function turnPreview(
   if (!cid) return '(no body)'
   const messages = await hydrateMessages(deps, cid as AssetId)
   if (!messages || messages.length === 0) return '(empty body)'
-  // Last user message — that's the prompt that produced this turn's response.
+  // Walk back through user messages until we find one that isn't a harness
+  // injection. Fall back to the most-recent injection text if every user
+  // message in scope is one (better than empty placeholder so the AI sees
+  // SOMETHING when listing turns).
+  let firstInjectionMatch: string | null = null
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i] as { role?: string, content?: unknown } | undefined
     if (m?.role !== 'user') continue
@@ -307,8 +332,19 @@ async function turnPreview(
       text = block?.text ?? '(non-text content)'
     }
     text = text.replace(/\s+/g, ' ').trim()
-    if (text.length === 0) return '(empty user message)'
+    if (text.length === 0) continue
+    if (HARNESS_INJECTION_PATTERNS.some(re => re.test(text))) {
+      // Remember the most-recent injection text in case we never find a
+      // real user message; loop continues to look for one.
+      if (firstInjectionMatch === null) firstInjectionMatch = text
+      continue
+    }
     return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text
+  }
+  if (firstInjectionMatch !== null) {
+    return firstInjectionMatch.length > maxLen
+      ? `${firstInjectionMatch.slice(0, maxLen - 1)}…`
+      : firstInjectionMatch
   }
   return '(no user message)'
 }
@@ -481,6 +517,7 @@ function rewindRulesText(tokens: ConfirmTokenPair): string {
     '  4. Be framed from the user\'s POV. It becomes a user-role turn. For user-initiated rewinds, write what the user would have said if they\'d retyped at the rewound point. For AI-initiated rewinds, write the user-shaped instruction the user WOULD have given if they\'d been steering you.',
     '  5. NOT re-introduce the thing being forgotten. If the user said "forget about the pink elephant" and your `message` says "no pink elephants here", the post-rewind AI sees the elephant again and the rewind was wasted. For sensitive content (passwords, leaked credentials, PII), describe the removal in general terms ("(I removed the leaked credential from the earlier turn)") rather than echoing the actual value. The whole point of forgetting is to NOT name the thing.',
     '  6. Pack stacked instructions. When the user says "rewind to X, then answer Y", the post-rewind AI lands at X with no awareness of Y. Put Y in `message` so it has something to do — otherwise the receiving AI sees only history-up-to-X and a placeholder turn, and may produce a confused "what would you like?" response instead of answering.',
+    '  7. Tell the post-rewind AI to RE-READ files before relying on remembered content. Files on disk may have changed between the fork point and now (commits landed, edits happened in this branch but on the rewound branch they didn\'t). The system prompt\'s gitstatus and IDE-open files reflect CURRENT disk state, not the rewound branch state — which can mislead the post-rewind AI into recapping or referencing files it never actually saw in its rewound context. If `message` mentions any files, paths, or code state, append a verify-before-trust note: "Re-Read any files I mention before relying on cached memory of them — disk may have advanced past the rewound point."',
     '',
     'EXAMPLES:',
     '  User: "I want to change my previous answer from A to B."',
@@ -631,6 +668,7 @@ function submitRulesText(tokens: ConfirmTokenPair): string {
     '  4. Be framed from the user\'s POV. It becomes a user-role turn.',
     '  5. NOT re-introduce the thing you just removed from the dump. If the workflow is "forget about the pink elephant" and your `message` says "no pink elephants, please", the post-submit AI sees the elephant again — your edits to the JSONL were wasted. For sensitive content (passwords, leaked credentials, PII), describe the removal in general terms ("(I removed the leaked credential from earlier turns)") rather than echoing the actual value. The whole point of forgetting is to NOT name the thing.',
     '  6. Pack stacked instructions. When the user says "submit the cleaned dump, then answer Y", put Y in `message` so the post-submit AI has something to do — otherwise it sees a fresh user turn with no instruction and may produce a confused "what next?" response.',
+    '  7. Tell the post-submit AI to RE-READ files before relying on remembered content. The dumped JSONL is a frozen snapshot, but the receiving AI\'s system prompt still reflects CURRENT disk state — gitstatus, IDE-open files, recent commits — which may have advanced past what the JSONL captured. If `message` mentions any files, paths, or code state, append a verify-before-trust note: "Re-Read any files I mention before relying on cached memory of them — disk may have advanced past the dumped state."',
     '',
     'EXAMPLES:',
     '  After editing a dump to fix a wrong calculation:',
@@ -1723,7 +1761,13 @@ export function createMcpToolsWithTokens(
         turn_id: target.id,
         message_count: messages.length,
         is_branch_view: usedBranchView,
-        next_steps: 'Use the Read tool to inspect this dump (one Anthropic message per line). Use Edit to modify any line — keep the {role, content} shape intact. The LAST line MUST remain an assistant-role message; submit_file will reject otherwise. When ready, call `submit_file` with `path` set to this file and `message` set to your new user instruction.',
+        next_steps: [
+          'Use the Read tool to inspect this dump (one Anthropic message per line). Use Edit to modify any line — keep the {role, content} shape intact. The LAST line MUST remain an assistant-role message; submit_file will reject otherwise.',
+          '',
+          'TIME-WINDOW WARNING: any tool calls you run between this dump and your `submit_file` are SCRATCH WORK from the post-submit AI\'s perspective — that AI sees the (possibly-edited) JSONL + your `message` arg as a single user turn and has NO memory of any Read/Edit/Bash/recall calls you made in between. Their *file-system side effects* persist (commits land, files get written); the *AI awareness* of running them does not.',
+          'Two safe patterns: (1) finish edits quickly and submit (the post-submit AI inherits the dump as-is, no awareness of the edit ritual); (2) for complex edits, write a script BEFORE the final dump, run the script, then dump → Read to verify the dump captures the post-script state → submit. Pattern 2 keeps the AI awareness aligned with disk reality.',
+          'When ready, call `submit_file` with `path` set to this file and `message` set to your new user instruction.',
+        ].join('\n'),
       }
     },
   })

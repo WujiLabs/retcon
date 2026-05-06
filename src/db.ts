@@ -33,13 +33,20 @@ export type DB = Database.Database
 // same logical content. A v4→v5 migration would need to re-hash every
 // message blob; not written yet, so attempting to upgrade a v4 DB throws
 // with the backup path in the error.
-export const CURRENT_SCHEMA_VERSION = 5
+//
+// v6 = sessions.pending_synthetic_json column. Stores SR-construction
+// metadata that survives a tool_use-chained post-rewind turn, so fork.forked
+// can fire when an end_turn eventually arrives instead of dropping silently.
+// Backfill is just a NULL column add — additive, no data rewrite.
+export const CURRENT_SCHEMA_VERSION = 6
 
 // Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N
 // and brings it to N+1. Add an entry whenever you bump
-// CURRENT_SCHEMA_VERSION. Empty for now since v5 is the only release.
+// CURRENT_SCHEMA_VERSION.
 const MIGRATIONS: Record<number, (db: DB) => void> = {
-  // 4: (db) => { db.exec('...'); /* re-hash blobs, etc. */ },
+  5: (db) => {
+    db.exec('ALTER TABLE sessions ADD COLUMN pending_synthetic_json TEXT')
+  },
 }
 
 // Single source of truth for the schema_version table DDL. Used in two
@@ -102,7 +109,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- branch's tail is an assistant turn). Updated after every 2xx
   -- response. Survives daemon restarts and --resume so cross-resume
   -- forks stay coherent.
-  branch_context_json TEXT
+  branch_context_json TEXT,
+  -- Deferred SR-construction metadata. NULL when no rewind/submit is
+  -- waiting for an end_turn. Set when a TOBE-consuming /v1/messages
+  -- closes with stop_reason=tool_use (the splice landed but the post-
+  -- rewind first turn chained more tool calls instead of finishing).
+  -- Cleared on the next end_turn (fork.forked fires then) or on a
+  -- dangling stop_reason (max_tokens/refusal — fork.synthesis_failed
+  -- fires) or when overwritten by a new rewind/submit. Carries the
+  -- synthetic metadata, the post-rewind first turn's revision id (=
+  -- to_revision_id in fork.forked), the fork-point revision id, and
+  -- the original (pre-splice) request body's CID so buildSyntheticAsset
+  -- can reconstruct the SR's content from blobs at fire-time.
+  pending_synthetic_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_actor ON sessions(actor);
 

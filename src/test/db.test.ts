@@ -87,6 +87,14 @@ describe('db migrations', () => {
 //
 // User said "do not wipe out database on migration from now on. backup the
 // database before each migration call." These tests pin that behavior.
+//
+// UNREGISTERED_FROM points at a schema_version step that genuinely has NO
+// MIGRATIONS[N] entry. The "no migration registered" tests need this to
+// trigger the registry-miss path. Currently 4 (i.e., 4→5 has no migration —
+// v5 was the only-release-in-the-wild bump and was never written). Update
+// this if a 4→5 migration ever lands.
+const UNREGISTERED_FROM = 4
+
 describe('migrate(): backup + per-version registry', () => {
   let tmpDir: string
   let dbPath: string
@@ -127,11 +135,11 @@ describe('migrate(): backup + per-version registry', () => {
 
   it('refuses to upgrade when no migration is registered AND leaves live DB untouched', () => {
     // Seed v5 (current) then force schema to v4 to simulate an older install.
-    seedDbAtVersion(CURRENT_SCHEMA_VERSION - 1, true)
+    seedDbAtVersion(UNREGISTERED_FROM, true)
 
     const upgradedDb = openDb({ path: dbPath })
     expect(() => migrate(upgradedDb, dbPath)).toThrow(
-      new RegExp(`No migration registered for schema_version ${CURRENT_SCHEMA_VERSION - 1} → ${CURRENT_SCHEMA_VERSION}`),
+      new RegExp(`No migration registered for schema_version ${UNREGISTERED_FROM} → ${UNREGISTERED_FROM + 1}`),
     )
     closeDb(upgradedDb)
 
@@ -139,14 +147,14 @@ describe('migrate(): backup + per-version registry', () => {
     // the fingerprint row we planted is still there.
     const verifyDb = openDb({ path: dbPath, readonly: true })
     const v = (verifyDb.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number }).v
-    expect(v).toBe(CURRENT_SCHEMA_VERSION - 1)
+    expect(v).toBe(UNREGISTERED_FROM)
     const fp = verifyDb.prepare('SELECT cid FROM blobs WHERE cid=?').get('bafy-fingerprint') as { cid: string } | undefined
     expect(fp?.cid).toBe('bafy-fingerprint')
     closeDb(verifyDb)
   })
 
   it('writes a backup file BEFORE attempting migration', () => {
-    seedDbAtVersion(CURRENT_SCHEMA_VERSION - 1, true)
+    seedDbAtVersion(UNREGISTERED_FROM, true)
 
     const upgradedDb = openDb({ path: dbPath })
     expect(() => migrate(upgradedDb, dbPath)).toThrow()
@@ -155,7 +163,7 @@ describe('migrate(): backup + per-version registry', () => {
     const backups = fs.readdirSync(tmpDir).filter(f => f.startsWith('proxy.db.bak.v'))
     expect(backups.length).toBe(1)
     // Filename should include the OLD version number.
-    expect(backups[0]).toContain(`.v${CURRENT_SCHEMA_VERSION - 1}.`)
+    expect(backups[0]).toContain(`.v${UNREGISTERED_FROM}.`)
 
     // Backup is a real, openable SQLite file with the original fingerprint.
     const backupPath = path.join(tmpDir, backups[0])
@@ -166,7 +174,7 @@ describe('migrate(): backup + per-version registry', () => {
   })
 
   it('error message tells the user where the backup is', () => {
-    seedDbAtVersion(CURRENT_SCHEMA_VERSION - 1, false)
+    seedDbAtVersion(UNREGISTERED_FROM, false)
 
     const upgradedDb = openDb({ path: dbPath })
     let err: Error | null = null

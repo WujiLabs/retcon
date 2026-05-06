@@ -259,6 +259,35 @@ describe('recall (list mode)', () => {
     expect('asset_cid' in t).toBe(false)
     expect('parent_revision_id' in t).toBe(false)
   })
+
+  // Harness pseudo-prompts (recap and SUGGESTION MODE injections) commonly
+  // sit at the tail of messages[]. Without skip-walk-back, recall's preview
+  // shows the injection text instead of the user's actual input. The patterns
+  // are narrow and anchor-at-start, so they don't catch user prose.
+  it('preview skips claude-harness injections and walks back to the real user input', async () => {
+    const messages = [
+      { role: 'user', content: 'fix the build' },
+      { role: 'assistant', content: '...' },
+      { role: 'user', content: 'The user stepped away and is coming back. Recap in under 40 words…' },
+    ]
+    emitTurn(fx, 'end_turn', messages)
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'next' }]) // anchor a head so the above is rewindable
+    const r = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
+    expect(r.turn.preview).toBe('fix the build')
+  })
+
+  it('preview falls back to the harness injection text when no real user input is in scope', async () => {
+    // Pure-injection conversation: the only user message is a SUGGESTION MODE
+    // hook. Better to surface it than return "(no user message)" — the AI can
+    // still tell what kind of turn this is.
+    const messages = [
+      { role: 'user', content: '[SUGGESTION MODE: predict the user\'s next input...]' },
+    ]
+    emitTurn(fx, 'end_turn', messages)
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'after' }])
+    const r = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
+    expect(r.turn.preview).toMatch(/SUGGESTION MODE/)
+  })
 })
 
 describe('recall (detail mode)', () => {

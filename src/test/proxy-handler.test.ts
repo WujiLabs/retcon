@@ -418,6 +418,199 @@ describe('proxy pass-through + event emission', () => {
     expect(found.length).toBe(0)
   })
 
+  // ── Phase 2 (v0.5.1): deferred fork.forked across tool_use chains ─────────
+  // Empirical signal from dogfooding: post-rewind AI commonly chains tool
+  // calls (Read, Bash, recall) before answering, so the first post-rewind
+  // turn closes with stop_reason=tool_use, not end_turn. The naive gate
+  // (only emit on end_turn) drops the SR silently in those cases.
+  // Defer-and-fire-on-eventual-end_turn pins the recovery.
+
+  it('fork.forked: deferred when first post-rewind turn is tool_use, fires on a later end_turn', async () => {
+    // Three /v1/messages calls. First consumes TOBE, response=tool_use
+    // (defer). Second is a follow-up with no TOBE, response=tool_use
+    // (still pending). Third is no-TOBE, response=end_turn (fire).
+    //
+    // pending_synthetic_json lives on the sessions table — we need the
+    // sessions_v1 projector wired up so the row exists.
+    const localDb = openDb({ path: ':memory:' })
+    migrate(localDb)
+    const localProducer = createEventProducer(localDb, defaultProjectors())
+
+    let callCount = 0
+    mock = await startMock((_req, res) => {
+      callCount += 1
+      const stopReason = callCount < 3 ? 'tool_use' : 'end_turn'
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: stopReason, content: [{ type: 'text', text: 'ok' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: localProducer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+      db: localDb,
+    })
+
+    const sessionId = 'sess-deferred-happy'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'rewritten' }],
+      fork_point_revision_id: 'ver-fork-deferred',
+      source_view_id: 'view-deferred',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'view-target-deferred',
+        synthetic_revision_id: 'rev-synth-deferred',
+        synthetic_tool_result_text: 'Rewind initiated. Target: rev_deferred.',
+        synthetic_assistant_text: 'Rewind initiated. Jumping to rev_deferred.',
+        synthetic_user_message: 'go',
+        parent_revision_id: 'rev-r1-deferred',
+        back_requested_at: 9999,
+      },
+    })
+
+    const claudeBody = (turn: number) => ({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: `q${turn}` },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: `toolu_${turn}`, name: 'rewind_to', input: { turn_back_n: 1, message: 'go' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: `toolu_${turn}`, content: 'scheduled' }],
+        },
+      ],
+    })
+
+    // Turn 1: consumes TOBE, response stop_reason=tool_use → defer.
+    await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(claudeBody(1)),
+    })).text()
+
+    // After turn 1: pending_synthetic_json is set, no fork.forked yet.
+    await waitForEvent(localDb, 'proxy.response_completed')
+    let consumer = createEventConsumer(localDb)
+    expect(consumer.poll('_probe_defer_t1', ['fork.forked'], 1).length).toBe(0)
+    const persistedAfter1 = (localDb
+      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
+      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
+    expect(persistedAfter1).toBeTruthy()
+    expect(JSON.parse(persistedAfter1!).synthetic.synthetic_revision_id).toBe('rev-synth-deferred')
+
+    // Turn 2: no TOBE, response stop_reason=tool_use → still deferred.
+    await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(claudeBody(2)),
+    })).text()
+    consumer = createEventConsumer(localDb)
+    expect(consumer.poll('_probe_defer_t2', ['fork.forked'], 1).length).toBe(0)
+
+    // Turn 3: no TOBE, response stop_reason=end_turn → fork.forked fires.
+    await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(claudeBody(3)),
+    })).text()
+
+    const forkedPayload = await waitForEvent(localDb, 'fork.forked') as {
+      synthetic_revision_id?: string
+      target_view_id?: string
+      to_revision_id?: string
+      sealed_at?: number
+    }
+    // SR id and target_view_id come from the deferred metadata.
+    expect(forkedPayload.synthetic_revision_id).toBe('rev-synth-deferred')
+    expect(forkedPayload.target_view_id).toBe('view-target-deferred')
+    expect(forkedPayload.sealed_at).toBe(9999)
+    // to_revision_id points at the FIRST post-rewind turn (the TOBE-consumer),
+    // not the eventual end_turn turn — that's the navigation handle the user
+    // thinks of as "where the fork landed."
+    expect(forkedPayload.to_revision_id).toMatch(/.+/)
+
+    // pending_synthetic_json is cleared on fire.
+    const persistedAfter3 = (localDb
+      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
+      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
+    expect(persistedAfter3).toBeNull()
+  })
+
+  it('fork.synthesis_failed: deferred SR abandoned when chain ends on max_tokens', async () => {
+    // First call: TOBE → tool_use (defer). Second call: no TOBE → max_tokens
+    // (dangling_unforkable; abandon).
+    const localDb = openDb({ path: ':memory:' })
+    migrate(localDb)
+    const localProducer = createEventProducer(localDb, defaultProjectors())
+
+    let callCount = 0
+    mock = await startMock((_req, res) => {
+      callCount += 1
+      const stopReason = callCount === 1 ? 'tool_use' : 'max_tokens'
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ stop_reason: stopReason, content: [{ type: 'text', text: '...' }] }))
+    })
+    proxy = await startServer({
+      port: 0,
+      producer: localProducer,
+      tobeStore: fx.tobeStore,
+      upstream: `http://127.0.0.1:${mock.port}`,
+      db: localDb,
+    })
+
+    const sessionId = 'sess-deferred-abandon'
+    fx.tobeStore.write(sessionId, {
+      messages: [{ role: 'user', content: 'r' }],
+      fork_point_revision_id: 'ver-fork-abandon',
+      source_view_id: 'view-abandon',
+      synthetic: {
+        kind: 'rewind',
+        target_view_id: 'tv-abandon',
+        synthetic_revision_id: 'rev-abandon',
+        synthetic_tool_result_text: 't',
+        synthetic_assistant_text: 'a',
+        synthetic_user_message: 'u',
+        parent_revision_id: 'r1-abandon',
+        back_requested_at: 1,
+      },
+    })
+
+    const body = (n: number) => ({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: `t${n}`, name: 'rewind_to', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${n}`, content: 'scheduled' }] },
+      ],
+    })
+
+    await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(body(1)),
+    })).text()
+    await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify(body(2)),
+    })).text()
+
+    // No fork.forked.
+    await waitForEvent(localDb, 'fork.synthesis_failed')
+    const consumer = createEventConsumer(localDb)
+    expect(consumer.poll('_probe_abandon_no_forked', ['fork.forked'], 1).length).toBe(0)
+
+    // pending_synthetic_json cleared.
+    const persisted = (localDb
+      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
+      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
+    expect(persisted).toBeNull()
+  })
+
   it('fork.forked: NOT emitted on 4xx upstream (not 2xx)', async () => {
     mock = await startMock((_req, res) => {
       res.writeHead(429, { 'content-type': 'application/json' })

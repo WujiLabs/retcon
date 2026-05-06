@@ -2,6 +2,41 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.1] - 2026-05-06
+
+Two-day post-launch dogfooding revealed a major audit gap: of 9 fork.back_requested events across 3 days, only 2 produced fork.forked. **All 7 failures had the same shape — the splice landed (TOBE was consumed), but the post-rewind first turn closed with `stop_reason='tool_use'` instead of `end_turn`.** The SR pipeline only emitted fork.forked on `end_turn`, so the rewind happened but no audit trail materialized — `recall` and `list_branches` showed nothing about it.
+
+This release defers fork.forked emission past `tool_use` chains so the SR row materializes when the post-rewind AI eventually closes a real answer. Plus a few smaller fixes flagged by the same dogfooding analysis.
+
+### Schema migration (v5 → v6)
+
+- **Added `sessions.pending_synthetic_json` column.** Stores SR-construction metadata for in-flight rewinds whose post-rewind first turn ended in `tool_use`. The proxy persists synthetic + `to_revision_id` + `original_body_cid` here at T2 commit time, then re-checks on each subsequent `proxy.response_completed` and fires `fork.forked` when the chain finally closes with `end_turn` (or `fork.synthesis_failed` if it dangles on `max_tokens`/`refusal`).
+- Migration is additive (`ALTER TABLE sessions ADD COLUMN pending_synthetic_json TEXT`) — no data rewrite. Existing v5 DBs migrate automatically; backups follow the standard policy (`<dbPath>.bak.v5.<ts>`).
+
+### Fixed
+
+- **fork.forked deferred across tool_use chains.** Previously: rewind → tool_use → end_turn produced no SR (gate was `stop_reason==='end_turn'`, but tool_use closed the first turn). Now: the synthetic metadata persists across the chain and fires fork.forked on the eventual end_turn, with `to_revision_id` pointing at the FIRST post-rewind turn (the TOBE-consumer) — that's what the user thinks of as "where the fork landed." `target_view_id`, `synthetic_revision_id`, `sealed_at` all preserved.
+- **Dangling stop_reasons mid-chain emit `fork.synthesis_failed`.** When a deferred rewind's chain ends on `max_tokens`, `refusal`, or `null`, the SR doesn't materialize but the audit trail records why instead of dropping silently.
+- **A new rewind/submit clobbers an in-flight deferred SR.** When the post-rewind AI calls `rewind_to` again before the previous chain reaches `end_turn`, the prior pending_synthetic emits `fork.synthesis_failed{error_message: 'superseded'}` for audit and gets replaced. Only the most recent intent matters; the user's latest call wins.
+- **`recall` previews skip claude-harness pseudo-prompts.** When the last user-role message is a `"The user stepped away..."` recap hook or `"[SUGGESTION MODE: ..."` predict-next injection, `turnPreview` now walks back to find the user's actual input. Falls back to the injection text if every user message in scope is a hook (better than empty placeholder). Pattern set is narrow and anchor-at-start; no false positives in user prose.
+
+### Changed
+
+- **`rewind_to` and `submit_file` rules-return text: new rule 7 about file-state staleness.** When `message` references files, paths, or code state, the post-rewind AI's system prompt still reflects CURRENT disk (gitstatus, IDE-open files, recent commits) — which can advance past the rewound branch's view and mislead the AI into recapping or referencing files it never actually saw. Rules now tell the calling AI to append a "re-Read before relying on cached memory of these files" note in such cases.
+- **`dump_to_file`'s `next_steps` now includes a TIME-WINDOW WARNING about scratch-work loss.** Tool calls between dump and submit_file are discarded from the post-submit AI's perspective — file-system side effects persist, AI awareness of running them does not. Two safe patterns documented: (1) finish edits quickly and submit, (2) for complex edits, write a script BEFORE the final dump, run it, then dump → verify → submit so the dump captures the post-script state.
+
+### Tests
+
+- Two new proxy-handler integration tests for the deferred pipeline:
+  - `fork.forked: deferred when first post-rewind turn is tool_use, fires on a later end_turn` — exercises the persist-then-fire path across 3 /v1/messages calls (tool_use → tool_use → end_turn).
+  - `fork.synthesis_failed: deferred SR abandoned when chain ends on max_tokens` — exercises the dangling-stop-reason cleanup.
+- Two new mcp-tools tests for harness-injection skipping in `turnPreview`.
+- 459 tests pass; lint + build clean.
+
+### Why it matters
+
+In the dogfooded data, every "post-rewind AI did Read/Bash/recall before answering" rewind dropped its SR. With v0.5.1, the same chain materializes the SR when the chain closes — so `list_branches` and `recall` show navigation handles for rewinds the user actually made, not just the lucky ones that landed in a clean end_turn.
+
 ## [0.5.0] - 2026-05-04
 
 First non-alpha release of `@playtiss/retcon` — retcon makes AI conversations rewindable. Pre-1.0 hardening across the v0.5.0 alpha series (alpha.0 → alpha.5) is rolled into a single shipped version. New external surface unchanged from alpha.5; this entry summarizes what's in 0.5.0 vs the last 0.4.x release.
