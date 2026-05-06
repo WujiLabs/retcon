@@ -50,6 +50,16 @@ Once you run `rewind_to`, retcon doesn't just rewrite one /v1/messages call — 
 
 The branch survives daemon restarts, `claude --resume`, and `claude --continue`. Run a fresh `rewind_to` to switch branches. Run `/clear` or `/compact` inside claude to release the fork and let claude's local view drive future turns.
 
+### `/rewind` and an active retcon fork
+
+Claude Code's built-in `/rewind` slash command **does not interoperate with an active retcon fork**. `/rewind` truncates claude's local jsonl entirely client-side — no hook fires, no `/v1/messages` is sent for retcon to intercept. retcon has no direct signal the user invoked it. The next user prompt produces a body in a shape the persistent-fork splice wasn't designed for; the AI may answer a stale synthetic prompt or upstream may 400 with "must end with user message".
+
+retcon catches the *narrow* case where claude's post-`/rewind` body has fewer than 2 user messages (early-conversation `/rewind` or a startup probe). In that case retcon NULLs `branch_context_json`, emits a `session.branch_context_released` audit event, and forwards claude's body unchanged. Future turns operate on claude's view. The user gets the answer they expected; the fork is gone.
+
+The *long-conversation* case isn't caught: after `/rewind` to turn 30 of a 50-turn session, claude's body still has 30+ user messages and the penultimate-user pivot keeps slicing — but it produces a Frankenstein body that mixes retcon's forked prefix with claude's truncated tail. The AI sees an incoherent conversation. There's no clean signal for retcon to detect this case without tracking per-turn upstream-response identity, which 0.5.x doesn't do yet.
+
+Practical consequence: **once you give the AI control via retcon's `rewind_to`, let the AI steer until `/clear`, `/compact`, or another `rewind_to` runs**. If you need to manually rewind, do so BEFORE invoking retcon's tools, or release the fork via `/clear` first.
+
 ## Actors and cleanup
 
 Every session is tagged with an actor name. The default actor is `default`; pass `--actor <name>` to scope a session under your own tag (1–64 characters, `[A-Za-z0-9_-]`).

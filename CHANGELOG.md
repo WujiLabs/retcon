@@ -2,6 +2,35 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.3] - 2026-05-06
+
+Same-day follow-up. Probed claude code's built-in `/rewind` slash command and found a silent failure mode that previous integration tests didn't surface: `/rewind` truncates claude's local jsonl entirely client-side, no hook, no `/v1/messages`. retcon's persistent fork has no direct signal to release. Depending on the post-`/rewind` body shape, retcon would 400 ("must end with user message") or feed the AI a stale synthetic prompt the user moved past — silently.
+
+### Partial coverage
+
+This release adds detection for the **early-conversation case** (claude's post-`/rewind` body has < 2 user messages — typically a startup probe or a single new prompt with no history). retcon NULLs `branch_context_json`, emits a `session.branch_context_released` audit event, and forwards claude's body unchanged.
+
+The **long-conversation case** (`/rewind` to a mid-point in a 50-turn session) is NOT caught: claude's body still has 30+ user messages so the penultimate-user pivot keeps slicing. The AI sees a Frankenstein body mixing retcon's fork with claude's truncated tail. Detecting this case requires tracking per-turn upstream-response identity, which 0.5.x doesn't do. A clean fix is on the v0.6 roadmap. For now: don't use `/rewind` mid-fork — use retcon's `rewind_to` or `/clear` first.
+
+I tried a more aggressive content-match approach during development: walk claude's body for branch_context's tail user, release if not found. It broke the very first follow-up turn after every successful `rewind_to` because the synthetic_user_message we put at branch_context's tail is INVISIBLE to claude (the TOBE swap is transparent — claude attaches our upstream response to its own local last-user, not to the synthetic). False positives across the board, all integration tests started failing. Reverted to the narrower < 2 user heuristic.
+
+### Fixed
+
+- **`applyBranchContextRewrite` releases the fork on the < 2 user signal.** Catches early-conversation `/rewind` and the legitimate hook-fires-first race (SessionStart hook lands after the first /v1/messages probe of a resumed session — letting the probe pass-through is safer than splicing a stale fork onto it).
+- **New audit event `session.branch_context_released`** with payload `{session_id, reason}`. Operators see the row when grepping `events` for unexpected fork releases.
+
+### Docs
+
+- New README section "`/rewind` and an active retcon fork" — documents both the partial detection and the long-conversation gap, plus the practical workflow ("once you give the AI control via `rewind_to`, let it steer until `/clear`, `/compact`, or another `rewind_to`").
+
+### Tests
+
+- Three new unit tests in `branch-context-rewrite.test.ts`:
+  - Realistic-context release: branch_context ends in user (the post-`rewind_to` shape), claude's body has just the new human prompt — assert the column is NULL'd and `releasedReason` is set.
+  - System-reminder probe case: branch_context active, claude's body is just `[<system-reminder>...]` (the post-`/rewind` startup probe shape) — same release behavior.
+  - Normal post-rewind operation NOT released: even though branch_context's tail (synthetic_user) differs from claude's penultimate user, the splice proceeds correctly and branch_context grows.
+- All 462 unit tests pass; integration suite (cli-tmux-integration) 3/3 in 48s.
+
 ## [0.5.2] - 2026-05-06
 
 Follow-up to 0.5.1 — same-day. Investigating cli-tmux-integration test 3's intermittent failures revealed `turn_back_n` was counting claude-harness pseudo-prompts (system-reminder probes, SUGGESTION MODE injections, recap hooks) as conversational turns. The AI's mental model of "go back 1 turn" diverged from retcon's "walk 1 closed_forkable revision back" whenever an injection sat between real turns.

@@ -228,8 +228,16 @@ export const MAX_CACHE_CONTROL_BLOCKS = 4
  */
 
 export interface BranchContextRewriteResult {
-  /** Rewritten body to forward upstream. Empty buffer when overflow=true. */
+  /** Rewritten body to forward upstream. Empty buffer when overflow=true OR
+   *  releasedReason is set (caller forwards claude's original body in those
+   *  cases — the fork is no longer applied). */
   body: Buffer
+  /** Optional: branch_context was NULL'd because we detected claude's state
+   *  diverged from the fork (e.g., user invoked claude's `/rewind` slash
+   *  command, which truncates claude's local jsonl without notifying retcon).
+   *  Caller pass-through claude's body and emits a matching audit event so
+   *  operators see what happened. */
+  releasedReason?: 'rewind_or_state_divergence'
   /** True iff the fork's branch_context_json crossed BRANCH_CONTEXT_MAX_BYTES
    *  on this turn. Caller wipes the column, emits an audit event, and
    *  forwards the original (unrewritten) body. */
@@ -310,17 +318,45 @@ export function applyBranchContextRewrite(
 
   // Find the penultimate user-role message in claude's body. Everything
   // after it is what claude has added since our last upstream send.
+  //
+  // The pivot is positional, not content-matched, because branch_context's
+  // tail user (the synthetic_user_message from rewind_to) is INVISIBLE to
+  // claude — TOBE swap replaces messages out from under it, claude attaches
+  // our upstream response to its own local last-user. So branch_context's
+  // tail and claude's penultimate-user have different content even on the
+  // first follow-up turn after a successful rewind. The penultimate-user
+  // pivot still produces the right splice (claude's tail = [asst_response,
+  // new_user] which we append to branch_context).
   const userIndices: number[] = []
   for (let i = 0; i < parsedBody.messages.length; i++) {
     const m = parsedBody.messages[i] as { role?: string }
     if (m?.role === 'user') userIndices.push(i)
   }
   if (userIndices.length < 2) {
-    // Claude's body only has one user message — nothing has happened since
-    // fork_back from claude's POV. Send branch_context as-is (this is the
-    // hook-fires-first race; uncommon but defensible).
-    const messagesToSend = [...branchContext]
-    return finalizeRewrite(parsedBody, messagesToSend, db, sessionId, branchContext)
+    // KNOWN INCOMPATIBILITY: claude code's `/rewind` slash command + active
+    // retcon fork. /rewind truncates claude's local jsonl client-side,
+    // doesn't fire a hook, doesn't send a separate /v1/messages we can
+    // intercept. The next call has too few user messages for the
+    // penultimate-user splice to land safely:
+    //   - Sending branch_context as-is (the prior heuristic) either 400s
+    //     ("must end with user") if branch_context tail is assistant, or
+    //     silently feeds the AI a stale synthetic prompt the user moved
+    //     past — both worse than passthrough.
+    // Detection here is partial: it catches /rewind in early conversations
+    // (claude's body is just a probe or single user msg). Long-conversation
+    // /rewind to a mid-point keeps userIndices.length >= 2 and slips past;
+    // the user gets a Frankenstein conversation upstream until /clear,
+    // /compact, or another rewind_to runs. Documented in README under the
+    // "/rewind and an active retcon fork" section.
+    //
+    // Same release path also covers the legitimate hook-fires-first race
+    // (SessionStart hook lands after the first /v1/messages probe of a
+    // resumed session); branch_context from a prior session is set but
+    // claude's first probe is just msgs=1. Letting the probe pass through
+    // is safer than splicing a stale fork onto it.
+    db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
+      .run(sessionId)
+    return { body: Buffer.alloc(0), overflow: false, releasedReason: 'rewind_or_state_divergence' }
   }
   const penultimateIdx = userIndices[userIndices.length - 2]
   const claudeSuffix = parsedBody.messages.slice(penultimateIdx + 1)
@@ -741,6 +777,19 @@ async function dispatch(
       ctx.producer.emit(
         'session.branch_context_overflow',
         { session_id: sessionId, max_bytes: BRANCH_CONTEXT_MAX_BYTES },
+        sessionId,
+      )
+    }
+    else if (rewritten?.releasedReason) {
+      // Branch context was NULL'd because claude's state diverged from the
+      // fork (most commonly: user typed `/rewind` in claude, which truncates
+      // claude's local jsonl without notifying retcon — there's no hook for
+      // /rewind, so retcon detects it from the body shape: <2 user messages
+      // when an active fork would normally have many). Pass claude's body
+      // through unchanged; the operator sees the audit row.
+      ctx.producer.emit(
+        'session.branch_context_released',
+        { session_id: sessionId, reason: rewritten.releasedReason },
         sessionId,
       )
     }

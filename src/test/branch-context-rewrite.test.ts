@@ -120,33 +120,82 @@ describe('applyBranchContextRewrite', () => {
     expect(getBranchContext(db)).toEqual(claudeMessages)
   })
 
-  it('falls back to branch_context as-is when claude has only one user message', () => {
-    setBranchContext(db, [{ role: 'user', content: 'forked-q' }])
+  it('releases the fork when claude\'s body has fewer than 2 user messages', () => {
+    // The "<2 users" path used to send branch_context as-is, which broke
+    // claude code's `/rewind` slash command: claude truncates its local
+    // jsonl without notifying retcon, the next /v1/messages has just the
+    // user's new prompt, and retcon would dump branch_context (ending in
+    // user) as the upstream payload — the AI would respond to the OLD
+    // synthetic user message instead of what the human actually typed,
+    // silently. New behavior: NULL branch_context_json, signal the caller
+    // to pass-through claude's body unchanged, and emit an audit row.
+    setBranchContext(db, [
+      { role: 'user', content: 'old fork user prompt' },
+      { role: 'assistant', content: 'old assistant response' },
+      { role: 'user', content: 'old synthetic user from prior rewind' },
+    ])
     const r = applyBranchContextRewrite(
-      bodyOf([{ role: 'user', content: 'forked-q' }]),
+      bodyOf([{ role: 'user', content: 'NEW prompt the human just typed after /rewind' }]),
       SID,
       db,
     )
     expect(r).not.toBeNull()
     expect(r!.overflow).toBe(false)
-    const sent = JSON.parse(r!.body.toString('utf8')) as { messages: unknown[] }
-    expect(sent.messages).toEqual([{ role: 'user', content: 'forked-q' }])
+    expect(r!.releasedReason).toBe('rewind_or_state_divergence')
+    // body should be the empty-buffer signal — caller forwards claude's body
+    // unchanged (we don't rewrite when releasing).
+    expect(r!.body.length).toBe(0)
+    // branch_context_json must be cleared so subsequent turns are pass-through.
+    expect(getBranchContext(db)).toBeNull()
   })
 
-  it('does not write when single-user fallback hits (suffix is empty)', () => {
-    // userIndices.length < 2 path. messagesToSend = branchContext (no
-    // suffix to append), so messagesToSend.length === prev. The
-    // `length > prev` guard skips the write.
+  it('release path: also fires when claude sends a single-message system-reminder probe', () => {
+    // Empirically observed shape after /rewind: claude's first follow-up
+    // /v1/messages carries just a `<system-reminder>...</system-reminder>`
+    // probe (msgs=1, role=user, body just the reminder). Same release path
+    // applies — branch_context can't survive this state divergence.
     setBranchContext(db, [
-      { role: 'user', content: 'forked-q' },
-      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'fork user prompt' },
+      { role: 'assistant', content: 'fork asst' },
+      { role: 'user', content: 'fork user 2' },
     ])
-    applyBranchContextRewrite(
-      bodyOf([{ role: 'user', content: 'forked-q' }]),
+    const r = applyBranchContextRewrite(
+      bodyOf([{ role: 'user', content: '<system-reminder>\n## Auto Mode Active\n</system-reminder>\n' }]),
       SID,
       db,
     )
-    expect(getBranchContext(db)).toHaveLength(2)
+    expect(r!.releasedReason).toBe('rewind_or_state_divergence')
+    expect(getBranchContext(db)).toBeNull()
+  })
+
+  // Sanity: in normal operation post-rewind, branch_context's tail user
+  // (the synthetic_user_message) is INVISIBLE to claude — TOBE swap is
+  // transparent. claude's penultimate user is its own pre-rewind last
+  // user. Penultimate-user pivot still works: suffix = [asst_response,
+  // new_user] from claude's tail, appended to branch_context. Don't
+  // release on this case.
+  it('does NOT release when claude\'s body has >= 2 users, even though branch_context\'s tail differs (normal post-rewind operation)', () => {
+    setBranchContext(db, [
+      { role: 'user', content: 'fork u1' },
+      { role: 'assistant', content: 'fork a1' },
+      { role: 'user', content: 'SYNTHETIC_USER (invisible to claude)' },
+    ])
+    // claude's view: claude has its own pre-rewind history. claude's
+    // penultimate-user is claude's own latest pre-rewind user, NOT
+    // branch_context's synthetic user.
+    const claudeBody = [
+      { role: 'user', content: 'claude_user_1' },
+      { role: 'assistant', content: 'claude_asst_1' },
+      { role: 'user', content: 'claude_user_LATEST' },
+      { role: 'assistant', content: 'asst_response_to_synthetic' },
+      { role: 'user', content: 'human types this next' },
+    ]
+    const r = applyBranchContextRewrite(bodyOf(claudeBody), SID, db)
+    expect(r).not.toBeNull()
+    expect(r!.releasedReason).toBeUndefined()
+    expect(getBranchContext(db)).not.toBeNull()
+    // Splice extends branch_context by [asst_response_to_synthetic, new_user].
+    expect(getBranchContext(db)!.length).toBe(5)
   })
 
   it('overflow at the 8 MiB cap: NULLs the column and returns overflow=true', () => {
