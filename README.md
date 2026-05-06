@@ -9,7 +9,9 @@ You ask the AI to do something. It misunderstands. You correct it. But the messe
 `retcon` flips the model. Instead of you typing a `/rewind` command, `retcon` exposes MCP tools so the AI can edit its own history. You just tell it what you want in natural language:
 
 > **Human:** "Go back to where we started this discussion and try again with the new constraint."
+>
 > **AI:** [Called retcon 2 times… (ctrl+o to expand)]
+>
 > **AI:** "I've rewound the context and cleared the previous error. Continuing with the new constraint..."
 
 ## Architecture overview
