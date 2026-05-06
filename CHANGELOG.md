@@ -2,6 +2,41 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.4] - 2026-05-06
+
+Full coverage for claude code's `/rewind` interop. 0.5.3 shipped a partial detection (caught early-conversation `/rewind` only, missed long-conv); 0.5.4 closes the gap with two halves that work together — proactive AI warning before the user can hit the trap, reliable detection if they hit it anyway. End-to-end verified with both Opus 4.7 and Sonnet 4.6.
+
+### Added
+
+- **Asst-text continuity check replaces the `< 2 users` heuristic.** `applyBranchContextRewrite` now walks `branch_context` backward for the most-recent assistant message, extracts its text, and checks claude's body for any assistant with the same text. claude assembles every upstream response into its local jsonl as an assistant turn, so that text is always present in normal operation. When `/rewind` truncates past it, the text is gone — retcon NULLs `branch_context_json`, emits `session.branch_context_released`, passes claude's body through. Catches long-conversation `/rewind` (which the < 2 users heuristic in 0.5.3 missed) using the same code path.
+- **`<retcon-active>` reminder block in the synthetic landing turn.** The synthetic user-role message that lands in the rewound branch now carries a `<retcon-active>` system-reminder-style block as a sibling content block to the user's verbatim message. The AI in the rewound branch sees it (claude is trained on similar `<system-reminder>` shape), tells the user once after answering: "while this fork is active, don't use claude code's `/rewind` — use `/clear`, `/compact`, or another `rewind_to` to switch contexts." A second AI-internal directive (re-Read files referenced earlier — disk may have advanced past the rewound branch's view) is applied silently, not surfaced to the user. The reminder is the only proactive channel retcon has into claude code's UI for the human (`/rewind` never reaches the LLM, retcon can't modify claude's UI directly, pre-splice tool results are discarded by the splice itself).
+- **CLAUDE.md** captures the version-bump and push cadence rules for retcon work: commit incrementally, bump version only at release time after CHANGELOG + doc updates land in a single release commit, don't push during partial-fix iteration.
+
+### Changed
+
+- **The `userIndices.length < 2` branch in `applyBranchContextRewrite` is now pass-through, not release.** The asst-text continuity check above already verified continuity, so a 0/1-user body is a probe (startup, system-reminder), not `/rewind`. The hook-fires-first race on resumed sessions falls into the same path and works the same way (probe passes through, branch_context preserved for the next real turn).
+
+### Decision-history note
+
+Decision #6 in INSIGHTS.md ("message delivered VERBATIM, no wrapping") is preserved with a small clarification: the user's text is byte-verbatim in its own content block, and an adjacent `<retcon-active>` block is allowed as a sibling — not a wrapper. retcon's own `isInjectionText` recognizes the pattern and treats the turn as a real user prompt because substantive content remains after stripping the reminder.
+
+### Edge cases / known limitations
+
+- **Short, ambiguous assistant responses** (e.g., both turns responded "OK") can match against the wrong occurrence in claude's body, splice produces a Frankenstein turn. Documented as a known false-negative trade-off; user notices the AI talking past their prompt and runs `/clear` to recover.
+- **AI surfacing variance**: Opus and Sonnet reliably surface the user-facing `/rewind` warning in their post-rewind response, but the exact wording varies by model. The directive is "mention this once after answering," not a rigid string.
+
+### Tests
+
+- New unit test pinning the `<retcon-active>` reminder content (mentions `/rewind`, `/clear`, file-staleness, includes "after answering" directive, marked as system note). Existing tests updated to assert the new content-array shape (verbatim block + reminder block).
+- New unit tests for the asst-text continuity check: long-conv `/rewind` divergence release; normal post-rewind operation NOT released even though branch_context's tail user (synthetic_user_message) differs from claude's penultimate user; no-asst-in-branch_context skip; < 2 users pass-through.
+- 466 unit tests pass total; integration suite (cli-tmux-integration) 3/3 in clean runs.
+
+### Documentation
+
+- README's `/rewind` section rewritten to describe the new mechanism (proactive warning + asst-text detection catches long-conv too).
+- INSIGHTS.md adds a "Why claude code's `/rewind` is the channel-of-last-resort" section explaining the two-channel design (reminder block on the way IN, asst-text continuity on the way OUT).
+- IMPLEMENTATION.md adds four new sections in the SR-pipeline area: Deferred fork.forked across tool_use chains, Harness-injection skip in turn_back_n, State-divergence guard via asst-text continuity, `<retcon-active>` reminder block construction.
+
 ## [0.5.3] - 2026-05-06
 
 Same-day follow-up. Probed claude code's built-in `/rewind` slash command and found a silent failure mode that previous integration tests didn't surface: `/rewind` truncates claude's local jsonl entirely client-side, no hook, no `/v1/messages`. retcon's persistent fork has no direct signal to release. Depending on the post-`/rewind` body shape, retcon would 400 ("must end with user message") or feed the AI a stale synthetic prompt the user moved past — silently.
@@ -30,20 +65,6 @@ I tried a more aggressive content-match approach during development: walk claude
   - System-reminder probe case: branch_context active, claude's body is just `[<system-reminder>...]` (the post-`/rewind` startup probe shape) — same release behavior.
   - Normal post-rewind operation NOT released: even though branch_context's tail (synthetic_user) differs from claude's penultimate user, the splice proceeds correctly and branch_context grows.
 - All 462 unit tests pass; integration suite (cli-tmux-integration) 3/3 in 48s.
-
-### Follow-up: full coverage via asst-text continuity check + proactive AI warning
-
-The "partial coverage" framing above describes the mid-cycle landing of the < 2 users heuristic. After more probing, retcon ended up with a complete answer to the `/rewind` interop problem before 0.5.3 published — both halves are in this release.
-
-- **Asst-text continuity check replaces the `< 2 users` heuristic.** `applyBranchContextRewrite` now walks `branch_context` backward for the most-recent assistant message, extracts its text, and checks claude's body for any assistant with the same text. claude assembles every upstream response into its local jsonl as an assistant turn, so that text is always present in normal operation. When `/rewind` truncates past it, the text is gone — retcon NULLs `branch_context_json`, emits `session.branch_context_released`, passes claude's body through. Catches long-conversation `/rewind` (the case the heuristic missed) using the same code path. Edge case: short ambiguous responses (both turns said "OK") can match against the wrong occurrence; documented as a known false-negative trade-off, user notices and `/clear`s.
-- **`<retcon-active>` reminder block in the synthetic landing turn.** The synthetic user-role message that lands in the rewound branch now carries a `<retcon-active>` system-reminder-style block as a sibling content block to the user's verbatim message. It directs the AI to surface a one-time user-facing warning ("don't use claude code's `/rewind` while this fork is active — use `/clear`, `/compact`, or another `rewind_to`") in its post-rewind response, and to apply an AI-internal directive (re-Read files referenced earlier — disk may have advanced past the rewound branch's view) silently. Decision #6's verbatim contract is preserved: the user's text is its own block, byte-equal. Verified end-to-end with both Opus 4.7 and Sonnet 4.6.
-- **CLAUDE.md** captures the version-bump and push cadence rules for retcon work: commit incrementally, bump version only at release time after CHANGELOG + doc updates land in a single release commit, don't push during partial-fix iteration.
-
-The first part is retcon's only proactive channel into claude code's UI for the human user (`/rewind` never reaches the LLM, retcon can't modify claude's UI directly, pre-splice tool results are discarded). The second part is the safety net if the user invokes `/rewind` anyway. Together they shift `/rewind` interop from "silent wrong answer or 400" to "user warned proactively, fork released cleanly if they `/rewind` regardless."
-
-Documentation: README's `/rewind` section is rewritten to describe the new mechanism, and INSIGHTS.md adds a "Why claude code's `/rewind` is the channel-of-last-resort" section explaining the design.
-
-466 unit tests pass; integration suite 3/3.
 
 ## [0.5.2] - 2026-05-06
 
