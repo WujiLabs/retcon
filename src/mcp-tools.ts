@@ -111,6 +111,63 @@ interface RevisionRow {
   created_at: number
 }
 
+/**
+ * Build the synthetic user-role message that retcon delivers as the rewind/
+ * submit landing turn. Wraps the AI's `message` arg in a content array
+ * alongside a `<retcon-active>` reminder block. The AI parses the reminder
+ * (claude is trained on similar `<system-reminder>` shape) and applies the
+ * directives — one user-facing (surfaced in the response so the human sees
+ * it in claude code's UI), one AI-internal (a reasoning guideline only,
+ * not echoed back).
+ *
+ * The user-facing one is the only channel retcon has to reach the human
+ * in claude code's UI: claude's `/rewind` slash command never reaches the
+ * LLM, retcon can't modify claude's UI directly, and pre-splice tool
+ * results are discarded. The post-splice AI response IS the channel.
+ *
+ *   - User-facing warning: claude code's `/rewind` does not release retcon's
+ *     fork. The AI tells the user to use `/clear`, `/compact`, or another
+ *     `rewind_to`. (Without this notice users silently get Frankenstein
+ *     conversations — see CHANGELOG 0.5.3.)
+ *   - AI-internal directive: files referenced in earlier turns may have
+ *     advanced on disk past the rewound branch's view. Re-Read before
+ *     trusting cached memory. The AI applies this when making decisions;
+ *     not surfaced to the user (would be UX noise on every fork).
+ *
+ * Decision #6 in INSIGHTS.md says the user's `message` is delivered VERBATIM
+ * with no wrapping. This addition keeps the verbatim contract (the user's
+ * text is its own block, byte-equal to what they passed) but adds an
+ * adjacent system-reminder-style block at the start of the same user-role
+ * message. The verbatim text is unchanged; only the surrounding context
+ * grows. retcon's own injection skip logic (isInjectionText) recognizes the
+ * pattern and treats the turn as a real user prompt because substantive
+ * content remains after stripping the reminder block.
+ */
+function synthesizeUserMessageWithReminder(userMessage: string): {
+  role: 'user'
+  content: Array<{ type: 'text', text: string }>
+} {
+  const reminder = [
+    '<retcon-active>',
+    '[system note from retcon proxy — NOT from the user]',
+    'A retcon fork is now active. The user\'s actual message follows below.',
+    '',
+    'After answering the user\'s question, briefly mention this ONCE to the user:',
+    '- They should NOT use claude code\'s `/rewind` slash command — it cannot release this retcon fork. To switch contexts, use `/clear`, `/compact`, or another `rewind_to`.',
+    '',
+    'For your own reasoning ONLY (do NOT mention this to the user — it would be UX noise):',
+    '- Files referenced in earlier turns may have changed on disk between the rewound point and now. Re-Read any file you rely on before trusting cached memory of it.',
+    '</retcon-active>',
+  ].join('\n')
+  return {
+    role: 'user',
+    content: [
+      { type: 'text', text: reminder },
+      { type: 'text', text: userMessage },
+    ],
+  }
+}
+
 function loadSession(db: DB, sessionId: string): SessionRow | undefined {
   return db.prepare('SELECT task_id, harness FROM sessions WHERE id = ?').get(sessionId) as
     | SessionRow
@@ -1386,10 +1443,11 @@ export function createMcpToolsWithTokens(
       if (!baseMessages) {
         return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
       }
-      baseMessages.push({ role: 'user', content: message })
+      const newMessage = synthesizeUserMessageWithReminder(message)
+      baseMessages.push(newMessage)
 
       const newMessageBlob = await blobRefFromBytes(
-        Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
+        Buffer.from(JSON.stringify(newMessage), 'utf8'),
       )
 
       // Prior fork's outcome (A-R8): if the previous TOBE-applied request
@@ -2085,9 +2143,10 @@ export function createMcpToolsWithTokens(
       }
 
       // ── Phase 3: append message + write TOBE ──────────────────────────────
-      const finalMessages: unknown[] = [...messages, { role: 'user', content: message }]
+      const newMessage = synthesizeUserMessageWithReminder(message)
+      const finalMessages: unknown[] = [...messages, newMessage]
       const newMessageBlob = await blobRefFromBytes(
-        Buffer.from(JSON.stringify({ role: 'user', content: message }), 'utf8'),
+        Buffer.from(JSON.stringify(newMessage), 'utf8'),
       )
 
       // Load the session here (we deferred it past the validation/secret

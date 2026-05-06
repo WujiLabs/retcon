@@ -316,53 +316,122 @@ export function applyBranchContextRewrite(
     return null
   }
 
-  // Find the penultimate user-role message in claude's body. Everything
-  // after it is what claude has added since our last upstream send.
+  // STATE-DIVERGENCE GUARD via last-assistant continuity check.
   //
-  // The pivot is positional, not content-matched, because branch_context's
-  // tail user (the synthetic_user_message from rewind_to) is INVISIBLE to
-  // claude — TOBE swap replaces messages out from under it, claude attaches
-  // our upstream response to its own local last-user. So branch_context's
-  // tail and claude's penultimate-user have different content even on the
-  // first follow-up turn after a successful rewind. The penultimate-user
-  // pivot still produces the right splice (claude's tail = [asst_response,
-  // new_user] which we append to branch_context).
+  // branch_context's most-recent assistant message is what upstream
+  // returned in response to a prior splice (or, on the very first follow-
+  // up after rewind_to, the rewound branch's target_asst). claude
+  // assembles every upstream response into its local jsonl as an
+  // assistant message — so that text MUST appear somewhere in claude's
+  // next /v1/messages body in normal operation.
+  //
+  // When claude's `/rewind` slash command fires, claude truncates its
+  // local jsonl client-side past some point. Assistant messages after
+  // that point disappear from claude's body. retcon detects this here
+  // by walking branch_context backward for the most recent assistant,
+  // extracting its text, and checking claude's body for any assistant
+  // with the same text. Missing → /rewind detected → release the fork.
+  //
+  // This is more general than the previous "< 2 user messages" heuristic
+  // — it catches long-conversation /rewinds too (where claude's body
+  // still has many user messages, but the post-fork assistant content
+  // got truncated). False-positive risk is low: branch_context's
+  // assistants are upstream responses, typically distinctive enough that
+  // text-match is unambiguous. False-negative risk: branch_context's
+  // last assistant happens to share text with an earlier turn (e.g.,
+  // both responded "OK") — splice proceeds with stale fork upstream;
+  // user notices the AI talking past the new prompt, can /clear.
+  //
+  // Skipped on the first turn after rewind_to ONLY if branch_context
+  // has no assistant at all (reconstructForkMessages fell back to the
+  // target's own body, which doesn't include an asst response). In
+  // that edge, no continuity to verify; trust the fork.
+  const branchLastAsst = findLastAssistantMessage(branchContext)
+  if (branchLastAsst) {
+    const targetText = messageText(branchLastAsst)
+    if (targetText !== '') {
+      let found = false
+      for (const m of parsedBody.messages) {
+        const msg = m as { role?: string, content?: unknown }
+        if (msg?.role !== 'assistant') continue
+        if (messageText(msg) === targetText) {
+          found = true
+          break
+        }
+      }
+      if (!found) {
+        db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
+          .run(sessionId)
+        return { body: Buffer.alloc(0), overflow: false, releasedReason: 'rewind_or_state_divergence' }
+      }
+    }
+  }
+
+  // Find the penultimate user-role message in claude's body. Everything
+  // after it is what claude has added since our last upstream send. The
+  // pivot is positional, not content-matched, because branch_context's
+  // tail user (the synthetic_user_message from rewind_to) is INVISIBLE
+  // to claude — TOBE swap replaces messages out from under it, claude
+  // attaches our upstream response to its own local last-user. The
+  // penultimate-user pivot still produces the right splice (claude's
+  // tail = [asst_response, new_user] which we append to branch_context).
   const userIndices: number[] = []
   for (let i = 0; i < parsedBody.messages.length; i++) {
     const m = parsedBody.messages[i] as { role?: string }
     if (m?.role === 'user') userIndices.push(i)
   }
   if (userIndices.length < 2) {
-    // KNOWN INCOMPATIBILITY: claude code's `/rewind` slash command + active
-    // retcon fork. /rewind truncates claude's local jsonl client-side,
-    // doesn't fire a hook, doesn't send a separate /v1/messages we can
-    // intercept. The next call has too few user messages for the
-    // penultimate-user splice to land safely:
-    //   - Sending branch_context as-is (the prior heuristic) either 400s
-    //     ("must end with user") if branch_context tail is assistant, or
-    //     silently feeds the AI a stale synthetic prompt the user moved
-    //     past — both worse than passthrough.
-    // Detection here is partial: it catches /rewind in early conversations
-    // (claude's body is just a probe or single user msg). Long-conversation
-    // /rewind to a mid-point keeps userIndices.length >= 2 and slips past;
-    // the user gets a Frankenstein conversation upstream until /clear,
-    // /compact, or another rewind_to runs. Documented in README under the
-    // "/rewind and an active retcon fork" section.
-    //
-    // Same release path also covers the legitimate hook-fires-first race
-    // (SessionStart hook lands after the first /v1/messages probe of a
-    // resumed session); branch_context from a prior session is set but
-    // claude's first probe is just msgs=1. Letting the probe pass through
-    // is safer than splicing a stale fork onto it.
-    db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
-      .run(sessionId)
-    return { body: Buffer.alloc(0), overflow: false, releasedReason: 'rewind_or_state_divergence' }
+    // The asst-text continuity check above already passed (or branch_context
+    // had no asst), so claude isn't /rewound — this is a probe-shaped turn
+    // (e.g., hook-fires-first race on a resumed session, or a quota probe
+    // before claude's real conversation starts). Pass-through claude's body
+    // unchanged; preserve branch_context for the next real turn.
+    return null
   }
   const penultimateIdx = userIndices[userIndices.length - 2]
   const claudeSuffix = parsedBody.messages.slice(penultimateIdx + 1)
 
   const messagesToSend = [...branchContext, ...claudeSuffix]
   return finalizeRewrite(parsedBody, messagesToSend, db, sessionId, branchContext)
+}
+
+/** Walk a messages array backward and return the most-recent assistant-role
+ *  message. Used by the state-divergence guard to anchor on something claude
+ *  reflects back into its jsonl (every upstream response). */
+function findLastAssistantMessage(messages: unknown[]): { role?: string, content?: unknown } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string, content?: unknown } | undefined
+    if (m?.role === 'assistant') return m
+  }
+  return undefined
+}
+
+/** Extract a stable text representation from any role's message for cross-
+ *  turn equality matching. Strips cache_control flags and other annotations
+ *  that toggle between turns; concatenates text from each text-typed block.
+ *  thinking blocks are NOT included (their text shifts unpredictably and
+ *  isn't part of the user-visible response). tool_use input args are
+ *  included (a key fingerprint for tool-call assistants). */
+function messageText(msg: { role?: string, content?: unknown } | undefined): string {
+  if (!msg) return ''
+  const c = msg.content
+  if (typeof c === 'string') return c
+  if (!Array.isArray(c)) return ''
+  const parts: string[] = []
+  for (const block of c) {
+    if (!block || typeof block !== 'object') continue
+    const t = (block as { type?: string }).type
+    if (t === 'text') {
+      const txt = (block as { text?: unknown }).text
+      if (typeof txt === 'string') parts.push(txt)
+    }
+    else if (t === 'tool_use') {
+      const name = (block as { name?: unknown }).name
+      const input = (block as { input?: unknown }).input
+      parts.push(`[tool_use:${typeof name === 'string' ? name : '?'}:${JSON.stringify(input ?? null)}]`)
+    }
+  }
+  return parts.join('\n---\n')
 }
 
 /**

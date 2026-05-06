@@ -1184,12 +1184,56 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(res.fork_point).toBe(t1.id)
     const pending = fx.tobeStore.peek(fx.sessionId)
     expect(pending).toBeTruthy()
-    const lastMsg = pending!.messages[pending!.messages.length - 1] as { role: string, content: string }
+    // The last message is now a user-role turn whose content array contains
+    // a `<retcon-active>` reminder block + the AI's `message` arg verbatim
+    // (the verbatim contract is preserved — the user's text is its own
+    // content block, byte-equal to what they passed).
+    const lastMsg = pending!.messages[pending!.messages.length - 1] as {
+      role: string
+      content: Array<{ type: string, text: string }>
+    }
     expect(lastMsg.role).toBe('user')
-    expect(lastMsg.content).toBe('alternate')
+    expect(Array.isArray(lastMsg.content)).toBe(true)
+    expect(lastMsg.content.length).toBe(2)
+    expect(lastMsg.content[0]!.text).toMatch(/<retcon-active>/)
+    expect(lastMsg.content[1]!.text).toBe('alternate')
   })
 
-  it('synthetic-message verbatim test: message arg lands in TOBE without any wrapping', async () => {
+  it('retcon-active reminder: /rewind warning is user-facing, file-staleness is AI-internal', async () => {
+    // The reminder block carries two distinct directives:
+    //   1. User-facing: tell the user not to use claude's /rewind. This is
+    //      retcon's only channel into claude's UI for the human.
+    //   2. AI-internal: re-Read files before trusting cached memory. A
+    //      reasoning guideline — surfacing it to the user would be UX
+    //      noise on every fork.
+    // Pin the content so a future re-wording change doesn't accidentally
+    // drop a directive or merge them into one.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    await rewindTwoStep(fx, { turn_back_n: 1, message: 'change A to B' })
+    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const last = pending.messages[pending.messages.length - 1] as {
+      content: Array<{ type: string, text: string }>
+    }
+    const reminderText = last.content.find(b => b.text.includes('<retcon-active>'))!.text
+    // User-facing /rewind warning is present and clearly directed AT the user
+    expect(reminderText).toMatch(/\/rewind/)
+    expect(reminderText).toMatch(/\/clear|\/compact|rewind_to/)
+    expect(reminderText).toMatch(/mention.*to the user|tell.*the user/i)
+    // AI-internal file-staleness directive is present and explicitly NOT
+    // for the user — phrased as the AI's own reasoning, not a user note
+    expect(reminderText).toMatch(/[Ff]iles?/)
+    expect(reminderText).toMatch(/[Rr]e-?[Rr]ead|cached/)
+    expect(reminderText).toMatch(/do NOT mention|own reasoning|not.*the user/)
+    // Marked as system note, not user content
+    expect(reminderText).toMatch(/system note|NOT from the user/)
+  })
+
+  it('synthetic-message verbatim test: message arg lands in TOBE byte-equal in its own block', async () => {
     emitTurn(fx, 'end_turn', [{ role: 'user', content: 'orig' }])
     emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'orig' },
@@ -1199,9 +1243,21 @@ describe('rewind_to (dual-secret flow)', () => {
     const verbatim = 'EXACT VERBATIM 12345 (changing my earlier answer of A)'
     await rewindTwoStep(fx, { turn_back_n: 1, message: verbatim })
     const pending = fx.tobeStore.peek(fx.sessionId)!
-    const last = pending.messages[pending.messages.length - 1] as { role: string, content: string }
+    const last = pending.messages[pending.messages.length - 1] as {
+      role: string
+      content: Array<{ type: string, text: string }>
+    }
     expect(last.role).toBe('user')
-    expect(last.content).toBe(verbatim) // no prefix, no wrapping
+    // Verbatim contract: the AI's `message` arg appears as its own content
+    // block, byte-equal. The retcon-active reminder is a sibling block, not
+    // a wrapper of the user's text.
+    const userBlock = last.content.find(b => b.text === verbatim)
+    expect(userBlock).toBeTruthy()
+    // The reminder block must NOT contain the verbatim text (the AI's
+    // message is unmodified by retcon).
+    const reminderBlock = last.content.find(b => b.text.includes('<retcon-active>'))
+    expect(reminderBlock).toBeTruthy()
+    expect(reminderBlock!.text).not.toContain(verbatim)
   })
 
   it('meta_token → educational rejection + fresh token pair', async () => {
@@ -1496,9 +1552,14 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
     }
     expect(res.status).toBe('scheduled')
     const pending = fx.tobeStore.peek(fx.sessionId)!
-    const msgs = pending.messages as Array<{ content: string }>
+    const msgs = pending.messages as Array<{ content: string | Array<{ type: string, text: string }> }>
     expect(msgs[0]!.content).toBe('from-target')
-    expect(msgs[msgs.length - 1]!.content).toBe('retry')
+    // The last message is the synthetic user turn — content is now an array
+    // with reminder + user-message blocks. Find the verbatim block.
+    const lastContent = msgs[msgs.length - 1]!.content as Array<{ type: string, text: string }>
+    expect(Array.isArray(lastContent)).toBe(true)
+    const userBlock = lastContent.find(b => b.text === 'retry')
+    expect(userBlock).toBeTruthy()
   })
 
   it('errors when neither child nor target body resolves', async () => {
@@ -2008,9 +2069,17 @@ describe('submit_file (dual-secret + path safety)', () => {
     expect(res.message_count).toBe(3) // 2 dump + 1 appended user
     const pending = fx.tobeStore.peek(fx.sessionId)!
     expect(pending.messages.length).toBe(3)
-    const last = pending.messages[2] as { role: string, content: string }
+    const last = pending.messages[2] as {
+      role: string
+      content: Array<{ type: string, text: string }>
+    }
     expect(last.role).toBe('user')
-    expect(last.content).toBe('continue with X')
+    // Same shape as rewind_to: reminder block + user message block.
+    expect(Array.isArray(last.content)).toBe(true)
+    const userBlock = last.content.find(b => b.text === 'continue with X')
+    expect(userBlock).toBeTruthy()
+    const reminderBlock = last.content.find(b => b.text.includes('<retcon-active>'))
+    expect(reminderBlock).toBeTruthy()
   })
 
   it('errors when session has no forkable revision yet', async () => {

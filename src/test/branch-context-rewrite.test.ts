@@ -168,24 +168,25 @@ describe('applyBranchContextRewrite', () => {
     expect(getBranchContext(db)).toBeNull()
   })
 
-  // Sanity: in normal operation post-rewind, branch_context's tail user
-  // (the synthetic_user_message) is INVISIBLE to claude — TOBE swap is
-  // transparent. claude's penultimate user is its own pre-rewind last
-  // user. Penultimate-user pivot still works: suffix = [asst_response,
-  // new_user] from claude's tail, appended to branch_context. Don't
-  // release on this case.
-  it('does NOT release when claude\'s body has >= 2 users, even though branch_context\'s tail differs (normal post-rewind operation)', () => {
+  // Sanity: in normal post-rewind operation, branch_context's last
+  // assistant message text appears in claude's body (claude assembles
+  // every upstream response into its local jsonl as an assistant turn).
+  // The asst-text continuity check passes; the splice proceeds via the
+  // penultimate-user pivot. Note that branch_context's tail USER (the
+  // synthetic_user_message) does NOT appear in claude's body — that's
+  // expected and the check intentionally pivots on assistant, not user.
+  it('does NOT release when branch_context\'s last asst text appears in claude\'s body (normal post-rewind)', () => {
+    const FORK_ASST_TEXT = 'distinctive forked assistant response that anchors continuity'
     setBranchContext(db, [
       { role: 'user', content: 'fork u1' },
-      { role: 'assistant', content: 'fork a1' },
+      { role: 'assistant', content: FORK_ASST_TEXT },
       { role: 'user', content: 'SYNTHETIC_USER (invisible to claude)' },
     ])
-    // claude's view: claude has its own pre-rewind history. claude's
-    // penultimate-user is claude's own latest pre-rewind user, NOT
-    // branch_context's synthetic user.
+    // claude's body has the FORK_ASST_TEXT in it (claude received that
+    // text as a response to a prior splice and added it to its jsonl).
     const claudeBody = [
       { role: 'user', content: 'claude_user_1' },
-      { role: 'assistant', content: 'claude_asst_1' },
+      { role: 'assistant', content: FORK_ASST_TEXT },
       { role: 'user', content: 'claude_user_LATEST' },
       { role: 'assistant', content: 'asst_response_to_synthetic' },
       { role: 'user', content: 'human types this next' },
@@ -196,6 +197,72 @@ describe('applyBranchContextRewrite', () => {
     expect(getBranchContext(db)).not.toBeNull()
     // Splice extends branch_context by [asst_response_to_synthetic, new_user].
     expect(getBranchContext(db)!.length).toBe(5)
+  })
+
+  // The general /rewind detection: branch_context's last asst text is
+  // missing from claude's body. Catches both early-conversation /rewinds
+  // (claude's body too short) AND long-conversation /rewinds (claude's
+  // body still has plenty of users but the post-fork asst content got
+  // truncated).
+  it('releases the fork when branch_context\'s last asst text is missing from claude\'s body (long-conv /rewind)', () => {
+    const FORK_ASST_TEXT = 'an assistant response that the fork carries forward'
+    setBranchContext(db, [
+      { role: 'user', content: 'pre-fork user' },
+      { role: 'assistant', content: 'pre-fork asst' },
+      { role: 'user', content: 'fork user 1' },
+      { role: 'assistant', content: FORK_ASST_TEXT },
+      { role: 'user', content: 'fork user 2 (synthetic)' },
+    ])
+    // After /rewind, claude's body has many user messages (long conversation
+    // pre-fork) but FORK_ASST_TEXT is gone — truncated past it.
+    const claudeBody = [
+      { role: 'user', content: 'pre-fork user' },
+      { role: 'assistant', content: 'pre-fork asst' },
+      { role: 'user', content: 'old user 2' },
+      { role: 'assistant', content: 'old asst 2' },
+      { role: 'user', content: 'old user 3' },
+      { role: 'assistant', content: 'old asst 3' },
+      { role: 'user', content: 'NEW prompt after /rewind' },
+    ]
+    const r = applyBranchContextRewrite(bodyOf(claudeBody), SID, db)
+    expect(r!.releasedReason).toBe('rewind_or_state_divergence')
+    expect(getBranchContext(db)).toBeNull()
+  })
+
+  // Edge case: branch_context has no assistant message at all (rare —
+  // happens only when reconstructForkMessages falls back to target's
+  // own body, which doesn't include the target's asst response). No
+  // continuity to check; we trust the fork and don't release.
+  it('skips the asst-text check when branch_context has no assistant message', () => {
+    setBranchContext(db, [
+      { role: 'user', content: 'only user, no asst here' },
+    ])
+    const claudeBody = [
+      { role: 'user', content: 'pre' },
+      { role: 'assistant', content: 'a' },
+      { role: 'user', content: 'newest' },
+    ]
+    const r = applyBranchContextRewrite(bodyOf(claudeBody), SID, db)
+    expect(r).not.toBeNull()
+    expect(r!.releasedReason).toBeUndefined()
+  })
+
+  // Edge case: claude's body has < 2 user messages but the asst-text check
+  // PASSED (or no asst in branch_context to check). This is a probe-shaped
+  // turn (e.g., resumed-session startup probe). Pass through claude's body
+  // unchanged; don't release. branch_context preserved for the next real turn.
+  it('passes through (does NOT release) when claude\'s body has only 1 user and no continuity divergence', () => {
+    setBranchContext(db, [
+      // No assistant — skips the divergence check entirely.
+      { role: 'user', content: 'only user' },
+    ])
+    const claudeBody = [
+      { role: 'user', content: 'startup probe' },
+    ]
+    const r = applyBranchContextRewrite(bodyOf(claudeBody), SID, db)
+    // null = pass-through (no rewrite, no release)
+    expect(r).toBeNull()
+    expect(getBranchContext(db)).not.toBeNull()
   })
 
   it('overflow at the 8 MiB cap: NULLs the column and returns overflow=true', () => {
