@@ -2,6 +2,44 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.5.5] - 2026-05-08
+
+Fork lifecycle: closes a class of false-positive divergence releases, makes the released-state visible to the AI, and ships the multi-block-aware injection detection that the cli-tmux integration test had been quietly failing for. Same-day forensic on session b17275fb (3 healthy rewinds released within 4 minutes each on 2026-05-06) — three bugs found, one user-feature added on top.
+
+### Fixed
+
+- **Fresh-fork false-positive release.** The asst-text continuity check (0.5.4) anchors on `branch_context`'s most-recent assistant message. On the FIRST follow-up turn after `rewind_to`, that anchor is the rewound target's response — and if the fork point pre-dates a `/compact`, that text was summarized out of claude's local jsonl. The check would always miss. Every healthy fork released within one turn. Fix: detect "fresh fork" state by exact-equality match against a per-fork random token retcon now persists in `sessions.branch_context_fork_id`. When the tail entry of `branch_context` is still the synthetic landing turn (carrying the `fork-id="tok_..."` attribute on its `<retcon-active>` opening tag), skip the continuity check on this turn; the splice extends `branch_context` using claude's body as the source of truth, and subsequent turns anchor on claude's own version of the response. Tradeoff: one-turn detection delay if claude diverges immediately on the first follow-up. The next turn's check still catches it.
+- **`isHarnessInjectionRevision` was misclassifying real user turns as injection.** The walker only inspected the FIRST text block of each user message. claude code now splits content into multiple text blocks — one per `<system-reminder>` (skills list, file-opened, IDE state) and a separate block for the user's actual prompt. The first block was always a reminder; `isInjectionText` saw it alone, returned true, and `nthForkableBack` walked PAST real conversational turns as if they were noise. The cli-tmux integration test "rewind_to walks the revision DAG end-to-end" had been failing on master with "0 forkable turns available" — that's why. Fix: concat all text blocks before evaluating. Same fix applied to `turnPreview` (recall's content snippet) — the preview was showing the first reminder block instead of the real user prompt. Now shows what the user actually typed.
+- **Stale projection of `tool_use` revisions as `closed_forkable`.** Audit-migrated DBs (and any DB written before the 0.5.x classifier) had ~750 rows with `stop_reason='tool_use'` but `classification='closed_forkable'`. Today's classifier maps `tool_use` to `open`; the inconsistency caused cascade rewinds (rewind to a turn whose `firstChild` is a tool_use revision) to produce a request body with an unpaired `tool_use` block, which Anthropic 400'd. Fix: a one-shot data migration script (`scripts/reclassify-revisions.mjs`) reclassifies every revision against the current classifier, then auto-advances every stale `branch_views.head_revision_id` to the nearest `closed_forkable` ancestor via parent-chain walk. Operates on a copy (`~/.retcon/proxy.db.reclassified`) so you verify before swapping.
+
+### Added
+
+- **`<retcon-released>` reminder injection on divergence release.** The release path was previously silent from the AI's POV — Anthropic returned 200, no error, the AI didn't know the fork was gone. Now when the divergence guard fires, retcon prepends per-directive `<retcon-released>` text blocks to the request body's last user message before forwarding upstream. The reminder includes (a) what just happened, (b) the `turn_id` of the last successfully fork-applied revision so the AI can guide the user back via `recall` / `rewind_to` / `dump_to_file`, and (c) a propagation directive: "always include a brief mention in your response, regardless of whether the recipient is the user or — if you're a Task subagent — a parent agent reading your response as a tool result." Symmetric counterpart to the v0.5.4 `<retcon-active>` reminder.
+- **`recall` surfaces release/clear/overflow events as `release_marker` entries.** Inline with rewindable turns, sorted by timestamp. Each carries `kind: 'release_marker'`, `n_back: null` (releases aren't rewindable themselves — they're audit events on the session), `release_reason` (`rewind_or_state_divergence` / `compact` / `clear` / `overflow`), and a human-readable preview. Lets the AI reconstruct the timeline: "between turn N and turn N-1 the fork released because of /compact" — useful when the user asks why prior fork content isn't showing up.
+- **Per-fork random token in `<retcon-active>` opening tag.** `<retcon-active fork-id="tok_<12-hex>">` — 48 bits of entropy, generated per rewind/submit, persisted to `sessions.branch_context_fork_id`. Used internally for the fresh-fork detection above. Collision-resistant against user content that quotes `<retcon-active>` literally (e.g., conversations about retcon's own design — this codebase has many such references). Comparison is exact-equality against the DB column, not a regex pattern over the message text.
+- **Per-directive split for `<retcon-active>` and `<retcon-released>` reminders.** Each reminder is now multiple text blocks (one per logical directive) instead of one big block, matching claude code's `<system-reminder>`-per-block representation pattern. Activation header (with fork-id), /rewind warning, and file-staleness directive are now sibling blocks, not paragraphs in one block. The AI sees them the same way it sees claude's own multi-reminder turns.
+
+### Schema
+
+- v6 → v7: adds `sessions.branch_context_fork_id TEXT`. Additive, NULL for legacy rows. Cleared together with `branch_context_json` on every release/clear/overflow site.
+
+### Tests
+
+- 4 new unit tests in `branch-context-rewrite.test.ts`: fresh-fork-skip happy path (rewound target absent from claude's body, fork survives via skip+splice+extend); collision guard (user content quoting a token-shaped string with a different value doesn't false-match the stored one); release reminder names the last fork-applied turn id; release reminder omits the section gracefully when no forkable revision exists.
+- 2 new unit tests in `mcp-tools.test.ts`: `recall` interleaves release_marker entries between rewindable turns by timestamp; release_marker entry carries the `release_reason` extracted from event payload.
+- Existing release-path tests updated to assert the new multi-block injection shape (header block, propagation block, user verbatim last) and the per-fork token regex on the `<retcon-active>` opening tag.
+- All 473 unit tests pass; cli-tmux-integration suite 3/3 in 74 seconds (the rewind-DAG test had been failing on master pre-fix; now passes deterministically).
+
+### Documentation
+
+- INSIGHTS.md: extended "Why claude code's `/rewind` is the channel-of-last-resort" with the third channel (release-side reminder) and the per-fork-token detection mechanism.
+- IMPLEMENTATION.md: new subsections "Fresh-fork skip via per-fork token", "`<retcon-released>` reminder injection on divergence release", and "Multi-block isHarnessInjectionRevision text concat". Updated the existing `<retcon-active>` reminder section for the per-directive split.
+- README.md: refreshed the `/rewind` section to describe both halves of the new symmetry.
+
+### For contributors
+
+- New `scripts/reclassify-revisions.mjs` (data migration tool) and `scripts/inspect-divergence.mjs` (diagnostic for fork-state forensics). The reclassify script always operates on a copy; never modifies the source DB.
+
 ## [0.5.4] - 2026-05-06
 
 Full coverage for claude code's `/rewind` interop. 0.5.3 shipped a partial detection (caught early-conversation `/rewind` only, missed long-conv); 0.5.4 closes the gap with two halves that work together — proactive AI warning before the user can hit the trap, reliable detection if they hit it anyway. End-to-end verified with both Opus 4.7 and Sonnet 4.6.

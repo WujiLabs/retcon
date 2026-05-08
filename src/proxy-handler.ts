@@ -228,20 +228,147 @@ export const MAX_CACHE_CONTROL_BLOCKS = 4
  */
 
 export interface BranchContextRewriteResult {
-  /** Rewritten body to forward upstream. Empty buffer when overflow=true OR
-   *  releasedReason is set (caller forwards claude's original body in those
-   *  cases — the fork is no longer applied). */
+  /** Body to forward upstream.
+   *
+   *  - overflow=true: empty buffer; caller forwards rawBody unchanged.
+   *  - releasedReason set: rawBody with a `<retcon-released>` reminder
+   *    injected beside the last user message so the AI sees the release
+   *    on the same turn it triggered it. Falls back to unmodified rawBody
+   *    if the body shape doesn't permit injection.
+   *  - normal splice: the spliced body. */
   body: Buffer
   /** Optional: branch_context was NULL'd because we detected claude's state
    *  diverged from the fork (e.g., user invoked claude's `/rewind` slash
-   *  command, which truncates claude's local jsonl without notifying retcon).
-   *  Caller pass-through claude's body and emits a matching audit event so
-   *  operators see what happened. */
+   *  command, which truncates claude's local jsonl without notifying retcon;
+   *  or a Task subagent fired /v1/messages with a body that doesn't carry
+   *  the fork's tail). Caller forwards `body` upstream and emits a matching
+   *  audit event so operators see what happened. */
   releasedReason?: 'rewind_or_state_divergence'
   /** True iff the fork's branch_context_json crossed BRANCH_CONTEXT_MAX_BYTES
    *  on this turn. Caller wipes the column, emits an audit event, and
    *  forwards the original (unrewritten) body. */
   overflow: boolean
+}
+
+/**
+ * Find the most recent closed_forkable revision in the task that owns this
+ * session. At release time, branch_context_json was active up until the
+ * previous turn — so the most recent SEALED forkable revision IS the last
+ * turn where the splice successfully applied AND advanced the conversation.
+ * Pointing the AI at this turn lets it dive back into the fork content via
+ * `recall` / `rewind_to` / `dump_to_file` if the user wants to resume.
+ *
+ * The current /v1/messages (the one that triggered release) is in_flight at
+ * this point — not sealed, not closed_forkable yet — so it won't appear in
+ * the result. Returns the previous turn instead, which is what we want.
+ */
+function findLastForkAppliedTurn(db: DB, sessionId: string): string | null {
+  const row = db.prepare(`
+    SELECT r.id FROM revisions r
+      JOIN sessions s ON s.task_id = r.task_id
+     WHERE s.id = ?
+       AND r.classification = 'closed_forkable'
+       AND r.sealed_at IS NOT NULL
+     ORDER BY r.sealed_at DESC, r.id DESC
+     LIMIT 1
+  `).get(sessionId) as { id: string } | undefined
+  return row?.id ?? null
+}
+
+/**
+ * Build the text injected into the body that triggered fork release.
+ * Symmetric counterpart to mcp-tools.ts:synthesizeUserMessageWithReminder
+ * (the ON-fork reminder); this fires when retcon detected state divergence
+ * and just NULL'd branch_context_json.
+ *
+ * The release would otherwise be silent from the AI's POV — Anthropic
+ * returns 200, no error, no signal, and the AI never learns the fork is
+ * gone. Without this injection the user sees the AI talk past the prior
+ * fork's history with no acknowledgment. Solution: add a system-reminder-
+ * style block beside the user's own message in the very request that
+ * caused the release. The AI sees BOTH on the same turn and decides
+ * whether to mention the release before answering, after, or work it
+ * into the reply however it judges best — same calling-AI-decides
+ * pattern as the v0.5.4 `<retcon-active>` reminder.
+ */
+/**
+ * Build the `<retcon-released>` reminder as separate text blocks — one per
+ * logical section, matching claude code's `<system-reminder>`-per-block
+ * pattern. Mirrors mcp-tools.ts:buildActiveReminderBlocks. The user's
+ * actual message is appended as a separate UNWRAPPED block by the caller.
+ */
+function buildReleaseReminderBlocks(lastForkAppliedTurn: string | null): Array<{ type: 'text', text: string }> {
+  const blocks: Array<{ type: 'text', text: string }> = []
+  blocks.push({
+    type: 'text',
+    text: [
+      '<retcon-released>',
+      '[system note from retcon proxy — NOT from the user]',
+      'A retcon fork that was active has just been released. retcon detected your local conversation view diverged from the fork\'s history — most commonly because the user typed claude code\'s `/rewind`, OR a Task subagent fired /v1/messages with a body that doesn\'t carry the fork\'s tail.',
+      'What this means: the conversation you are now seeing is your local view, NOT the fork\'s history. Earlier turns from inside the fork are no longer in scope for retcon\'s splice.',
+      '</retcon-released>',
+    ].join('\n'),
+  })
+  if (lastForkAppliedTurn) {
+    blocks.push({
+      type: 'text',
+      text: [
+        '<retcon-released>',
+        'LAST FORK-APPLIED TURN:',
+        `  turn_id: ${lastForkAppliedTurn}`,
+        '  This was the most recent turn where the fork was successfully spliced and advanced the conversation. To dive back into that context (or as close as possible):',
+        `    - inspect what was there: recall(turn_id="${lastForkAppliedTurn}")`,
+        `    - resume the fork branch with a fresh user message: rewind_to(turn_id="${lastForkAppliedTurn}", message="...")`,
+        `    - inspect-and-edit before resuming: dump_to_file(turn_id="${lastForkAppliedTurn}") then edit + submit_file`,
+        '</retcon-released>',
+      ].join('\n'),
+    })
+  }
+  blocks.push({
+    type: 'text',
+    text: [
+      '<retcon-released>',
+      'PROPAGATION — important:',
+      'No matter how you handle the user\'s request (answer fully, decline, partial answer, anything), ALWAYS include a brief mention of this release in your response output. The recipient of your response may be the user directly, OR — if you are a Task subagent — a parent agent who reads your response as a tool result. Either way, the release notice has to propagate through the chain so the user eventually sees it. Best-effort relay: each link passes it along.',
+      'Recommended one-liner you can drop into your response (exact wording up to you, just say enough that a parent agent reading this can pass it on):',
+      lastForkAppliedTurn
+        ? `  "(retcon: prior fork released — last fork-applied turn was \`${lastForkAppliedTurn}\`; \`recall\`/\`rewind_to\` it to resume that context)"`
+        : '  "(retcon: a prior fork was just released — earlier fork history is no longer in scope; use `recall` + `rewind_to` to refork if needed)"',
+      '</retcon-released>',
+    ].join('\n'),
+  })
+  return blocks
+}
+
+/**
+ * Inject the release reminder blocks at the front of the last user message's
+ * content array. Returns true on success; false if the body shape is
+ * unexpected (last message not user-role, or content shape unrecognized).
+ * Mutates `parsedBody.messages[last]` in place.
+ *
+ * `lastForkAppliedTurn` (when non-null) gets included in the reminder as
+ * the suggested rewind target, so the AI can guide the user back into
+ * the (now-released) fork's content.
+ */
+function injectReleaseReminderInPlace(
+  parsedBody: { messages?: unknown[] },
+  lastForkAppliedTurn: string | null,
+): boolean {
+  if (!Array.isArray(parsedBody.messages) || parsedBody.messages.length === 0) return false
+  const last = parsedBody.messages[parsedBody.messages.length - 1] as
+    | { role?: string, content?: unknown }
+    | undefined
+  if (!last || last.role !== 'user') return false
+  const reminderBlocks = buildReleaseReminderBlocks(lastForkAppliedTurn)
+  if (typeof last.content === 'string') {
+    last.content = [...reminderBlocks, { type: 'text', text: last.content }]
+    return true
+  }
+  if (Array.isArray(last.content)) {
+    last.content.unshift(...reminderBlocks)
+    return true
+  }
+  return false
 }
 
 /**
@@ -290,8 +417,8 @@ export function applyBranchContextRewrite(
   db: DB,
 ): BranchContextRewriteResult | null {
   const row = db
-    .prepare('SELECT branch_context_json FROM sessions WHERE id = ?')
-    .get(sessionId) as { branch_context_json: string | null } | undefined
+    .prepare('SELECT branch_context_json, branch_context_fork_id FROM sessions WHERE id = ?')
+    .get(sessionId) as { branch_context_json: string | null, branch_context_fork_id: string | null } | undefined
   if (!row?.branch_context_json) return null
 
   let branchContext: unknown[]
@@ -332,37 +459,70 @@ export function applyBranchContextRewrite(
   // extracting its text, and checking claude's body for any assistant
   // with the same text. Missing → /rewind detected → release the fork.
   //
-  // This is more general than the previous "< 2 user messages" heuristic
-  // — it catches long-conversation /rewinds too (where claude's body
-  // still has many user messages, but the post-fork assistant content
-  // got truncated). False-positive risk is low: branch_context's
-  // assistants are upstream responses, typically distinctive enough that
-  // text-match is unambiguous. False-negative risk: branch_context's
-  // last assistant happens to share text with an earlier turn (e.g.,
-  // both responded "OK") — splice proceeds with stale fork upstream;
-  // user notices the AI talking past the new prompt, can /clear.
+  // EXCEPTION — fresh-fork skip: on the very first turn after rewind_to,
+  // branch_context's last asst is the rewound target's response (set by
+  // reconstructForkMessages). If the fork point is older than claude's
+  // last `/compact`, that target asst was summarized out of claude's
+  // local jsonl — the continuity check would always miss and false-
+  // positive-release every healthy fork (which is exactly the b17275fb
+  // pattern: 3 healthy rewinds on 5/6 all released within 4 minutes).
+  // Detect "fresh fork" by checking branch_context's tail: if it's still
+  // the synthetic_user_message (identifiable via a unique per-fork random
+  // token retcon embedded in the `<retcon-active fork-id="tok_...">`
+  // tag), no extension has happened yet, skip the check, and let the
+  // splice extend branch_context using claude's body as the source of
+  // truth. From the second post-rewind turn onward the tail is no longer
+  // the synthetic, the check anchors on claude's own version of the
+  // splice response, and divergence detection works as designed.
   //
-  // Skipped on the first turn after rewind_to ONLY if branch_context
-  // has no assistant at all (reconstructForkMessages fell back to the
-  // target's own body, which doesn't include an asst response). In
-  // that edge, no continuity to verify; trust the fork.
-  const branchLastAsst = findLastAssistantMessage(branchContext)
-  if (branchLastAsst) {
-    const targetText = messageText(branchLastAsst)
-    if (targetText !== '') {
-      let found = false
-      for (const m of parsedBody.messages) {
-        const msg = m as { role?: string, content?: unknown }
-        if (msg?.role !== 'assistant') continue
-        if (messageText(msg) === targetText) {
-          found = true
-          break
+  // Tradeoff: one-turn detection delay if claude diverges immediately
+  // on the first follow-up. The next turn's check still catches it.
+  //
+  // Token-based detection (vs. matching `<retcon-active>` literally) is
+  // collision-resistant: users discussing retcon's design in
+  // conversation might quote `<retcon-active>` text, but they can't
+  // predict the random per-fork token. Comparison is exact-equality
+  // against the DB column (the ground truth of what retcon issued for
+  // THIS fork) — not a regex pattern over an arbitrary token-shaped
+  // string in the user's text.
+  if (isSyntheticUserMessageTail(branchContext[branchContext.length - 1], row.branch_context_fork_id)) {
+    // fresh fork — skip continuity check; fall through to splice + extend
+  }
+  else {
+    const branchLastAsst = findLastAssistantMessage(branchContext)
+    if (branchLastAsst) {
+      const targetText = messageText(branchLastAsst)
+      if (targetText !== '') {
+        let found = false
+        for (const m of parsedBody.messages) {
+          const msg = m as { role?: string, content?: unknown }
+          if (msg?.role !== 'assistant') continue
+          if (messageText(msg) === targetText) {
+            found = true
+            break
+          }
         }
-      }
-      if (!found) {
-        db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
-          .run(sessionId)
-        return { body: Buffer.alloc(0), overflow: false, releasedReason: 'rewind_or_state_divergence' }
+        if (!found) {
+          // Capture the last fork-applied turn BEFORE NULL'ing branch_context.
+          // This is the most recent revision where the splice succeeded and
+          // advanced the conversation; the AI can guide the user back via
+          // recall/rewind_to/dump_to_file on this id to resume the fork's
+          // content (or get as close as possible).
+          const lastForkAppliedTurn = findLastForkAppliedTurn(db, sessionId)
+          db.prepare('UPDATE sessions SET branch_context_json = NULL, branch_context_fork_id = NULL WHERE id = ?')
+            .run(sessionId)
+          // Inject the release reminder beside the user's message in the same
+          // request that triggered this. The AI sees the reminder on this
+          // turn, decides whether to mention the release to the user, and
+          // proceeds. Falls back to unchanged rawBody if the body shape
+          // doesn't permit injection (rare — claude's bodies should always
+          // end in user-role); audit event still fires either way.
+          const injected = injectReleaseReminderInPlace(parsedBody, lastForkAppliedTurn)
+          const newBody = injected
+            ? Buffer.from(JSON.stringify(parsedBody), 'utf8')
+            : rawBody
+          return { body: newBody, overflow: false, releasedReason: 'rewind_or_state_divergence' }
+        }
       }
     }
   }
@@ -393,6 +553,43 @@ export function applyBranchContextRewrite(
 
   const messagesToSend = [...branchContext, ...claudeSuffix]
   return finalizeRewrite(parsedBody, messagesToSend, db, sessionId, branchContext)
+}
+
+/** Detect whether a branch_context entry is the synthetic_user_message
+ *  retcon constructs at rewind_to time — i.e. branch_context hasn't been
+ *  extended with claude's response yet. Identification is via exact-equality
+ *  match against the per-fork random token retcon issued at rewind_to time
+ *  and persisted to `sessions.branch_context_fork_id`. The token also
+ *  appears as a `fork-id="..."` attribute on the `<retcon-active>` tag
+ *  inside the synthetic's first text block (built by mcp-tools.ts:
+ *  synthesizeUserMessageWithReminder).
+ *
+ *  Why exact-equality, not pattern-match: a user could quote a token-
+ *  shaped string in conversation (e.g., when documenting retcon's design)
+ *  and a regex like `/tok_[a-f0-9]+/` would false-match on that user
+ *  content. The DB column is the only authoritative source of "the token
+ *  retcon issued for this fork." Returning false on storedForkId=null is
+ *  safe: that means no fork was set OR the fork was set by an old retcon
+ *  version that didn't persist the token (legacy forks fail the check
+ *  once on upgrade — acceptable, the user just makes a new rewind).
+ *
+ *  Used by the state-divergence guard to skip the asst-text continuity
+ *  check on the very first post-rewind /v1/messages: branch_context's last
+ *  asst at that point is the rewound target's response, which may have
+ *  been compacted out of claude's local view; the splice-then-extend
+ *  flow uses claude's body as the source of truth instead. */
+function isSyntheticUserMessageTail(entry: unknown, storedForkId: string | null): boolean {
+  if (!storedForkId) return false
+  if (!entry || typeof entry !== 'object') return false
+  const m = entry as { role?: string, content?: unknown }
+  if (m.role !== 'user') return false
+  if (!Array.isArray(m.content)) return false
+  const first = m.content[0] as { type?: string, text?: string } | undefined
+  if (!first || first.type !== 'text' || typeof first.text !== 'string') return false
+  // Exact substring match against the marker retcon issued for this fork.
+  // The `<retcon-active fork-id="...">` shape is constructed by
+  // mcp-tools.ts:buildForkIdMarker; the token portion comes from the DB.
+  return first.text.includes(`<retcon-active fork-id="${storedForkId}">`)
 }
 
 /** Walk a messages array backward and return the most-recent assistant-role
@@ -450,7 +647,7 @@ function finalizeRewrite(
   if (messagesToSend.length > prevBranchContext.length) {
     const json = JSON.stringify(messagesToSend)
     if (json.length > BRANCH_CONTEXT_MAX_BYTES) {
-      db.prepare('UPDATE sessions SET branch_context_json = NULL WHERE id = ?')
+      db.prepare('UPDATE sessions SET branch_context_json = NULL, branch_context_fork_id = NULL WHERE id = ?')
         .run(sessionId)
       return { body: Buffer.alloc(0), overflow: true }
     }
@@ -853,14 +1050,17 @@ async function dispatch(
       // Branch context was NULL'd because claude's state diverged from the
       // fork (most commonly: user typed `/rewind` in claude, which truncates
       // claude's local jsonl without notifying retcon — there's no hook for
-      // /rewind, so retcon detects it from the body shape: <2 user messages
-      // when an active fork would normally have many). Pass claude's body
-      // through unchanged; the operator sees the audit row.
+      // /rewind. Or a Task subagent fired /v1/messages whose body doesn't
+      // carry the fork's tail). The rewritten body has a `<retcon-released>`
+      // reminder injected beside the user's message so the AI sees the
+      // release on this same turn and can mention it to the user; emit the
+      // audit row either way.
       ctx.producer.emit(
         'session.branch_context_released',
         { session_id: sessionId, reason: rewritten.releasedReason },
         sessionId,
       )
+      bodyToForward = rewritten.body
     }
     else if (rewritten) {
       bodyToForward = rewritten.body

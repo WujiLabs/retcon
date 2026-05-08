@@ -145,8 +145,10 @@ export async function handleSessionStartHook(
   // wiped (clear). Either way, hand the wheel back to claude.
   if (source === 'clear' || source === 'compact') {
     const result = ctx.db
-      .prepare(`UPDATE sessions SET branch_context_json = NULL
-                WHERE id = ? AND branch_context_json IS NOT NULL`)
+      .prepare(`UPDATE sessions
+                   SET branch_context_json = NULL,
+                       branch_context_fork_id = NULL
+                 WHERE id = ? AND branch_context_json IS NOT NULL`)
       .run(sessionId)
     if (result.changes > 0) {
       ctx.producer.emit(

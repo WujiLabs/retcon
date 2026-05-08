@@ -138,34 +138,75 @@ Navigation helpers `effectiveHead`, `nthForkableBack`, `countForkableBack`, and 
 
 Persistent-fork's penultimate-user pivot assumes claude's body always contains the conversation we sent last turn. Claude code's `/rewind` slash command breaks that assumption — it truncates claude's local jsonl client-side, fires no hook, sends no separate /v1/messages. retcon has no direct signal.
 
-`applyBranchContextRewrite` runs an asst-text continuity check before splicing: walk `branch_context` backward for the most-recent assistant message, extract its text (stripping cache_control flags), and walk claude's body for any assistant with the same text. In normal operation that text is always present (claude assembles every upstream response into its local jsonl as an assistant turn). When `/rewind` truncates past it, the text is gone, retcon NULLs `branch_context_json`, emits `session.branch_context_released{reason: 'rewind_or_state_divergence'}`, and returns null so dispatch passes claude's body through unchanged. The user's next prompt reaches the AI cleanly.
+`applyBranchContextRewrite` runs an asst-text continuity check before splicing: walk `branch_context` backward for the most-recent assistant message, extract its text (stripping cache_control flags), and walk claude's body for any assistant with the same text. In normal operation that text is always present (claude assembles every upstream response into its local jsonl as an assistant turn). When `/rewind` truncates past it, the text is gone, retcon NULLs `branch_context_json` AND `branch_context_fork_id`, emits `session.branch_context_released{reason: 'rewind_or_state_divergence'}`, injects a `<retcon-released>` reminder block into the request body (see below), and returns the modified body. The user's next prompt reaches the AI cleanly with the release notice prepended.
 
-The check skips when `branch_context` has no assistant at all (rare — happens only when reconstructForkMessages fell back to the target's own body). Edge: when the matched asst text is short and ambiguous (e.g., both turns responded "OK"), the check passes against a different occurrence; splice produces a Frankenstein body. Documented in INSIGHTS as the "channel-of-last-resort" trade-off.
+The check skips when `branch_context` has no assistant at all (rare — happens only when reconstructForkMessages fell back to the target's own body) AND when the fresh-fork skip applies (see next subsection). Edge: when the matched asst text is short and ambiguous (e.g., both turns responded "OK"), the check passes against a different occurrence; splice produces a Frankenstein body. Documented in INSIGHTS as the "channel-of-last-resort" trade-off.
 
 The `userIndices.length < 2` branch (claude's body has 0-1 user messages) was previously the release trigger but is now pass-through: the asst-text check already verified continuity, so a 0/1-user body is a probe (startup, system-reminder), not /rewind.
 
-### `<retcon-active>` reminder block in synthetic landing turn
+### Fresh-fork skip via per-fork token
 
-The synthetic user-role message that lands at the rewound branch (= TOBE.messages.last) is constructed as a content-array with two text blocks:
+The asst-text continuity check has a structural blind spot: on the very first turn after `rewind_to`/`submit_file`, `branch_context`'s most-recent assistant message is the rewound target's response — set by `reconstructForkMessages` from the target's own body. claude has not yet sent any `/v1/messages` for the fork, so claude's local jsonl doesn't contain the splice's response yet. The check would anchor on the rewound target's text, which may have been compacted out of claude's view weeks earlier, and falsely release every healthy fork on its first follow-up turn.
+
+This actually happened. Forensic on session `b17275fb` (started 2026-04-13, hit `/compact` on 2026-05-01) showed three healthy `rewind_to` calls on 2026-05-06, all with successful `fork.forked`, all releasing within 4 minutes — exactly one follow-up turn each. The rewound targets were 4/13-era turns whose response text was no longer in claude's post-compact local view.
+
+Fix: detect "fresh fork" state and skip the continuity check on that one turn. Detection mechanism:
+
+- `rewind_to`/`submit_file` generates a per-fork token (`tok_<12-hex>`, 48 bits of entropy) at MCP-call time.
+- The token is embedded in the synthetic landing turn as a `fork-id="..."` attribute on the `<retcon-active>` opening tag.
+- The token is also persisted to `sessions.branch_context_fork_id` (schema v6→v7) — same UPDATE statement that writes `branch_context_json`.
+- `applyBranchContextRewrite` reads both columns. If the tail entry of `branch_context` is a user-role message whose first text block contains exactly `<retcon-active fork-id="${storedForkId}">`, this is the fresh state — no extension has happened yet — skip the check and proceed to the splice.
+- After the splice extends `branch_context` with claude's tail (the splice's response + claude's new user message), the tail is no longer the synthetic. Subsequent turns' continuity check anchors correctly on the splice's response, which IS in claude's body.
+
+The detection is exact-equality match against the DB column, not a regex pattern over arbitrary text. This is collision-resistant: a user can quote `<retcon-active fork-id="...">` in conversation (e.g., when documenting retcon's design — this codebase has many such references), and the check won't false-match unless they happen to predict the random per-fork token. The DB column is the only authoritative source.
+
+Tradeoff: one-turn detection delay if claude diverges immediately on the first follow-up (e.g., user types `/rewind` between `rewind_to` and their next message, or a Task subagent fires before any user follow-up). The next turn's check still catches it; we lose detection on the first turn but gain detection on the second. Net: divergence still surfaces, just one turn delayed, and we no longer false-positive-release on every healthy fork.
+
+### `<retcon-released>` reminder injection on divergence release
+
+When the divergence guard fires, retcon doesn't just NULL the column and pass through. It also mutates the body that triggered the release, prepending per-directive `<retcon-released>` text blocks to the last user message's content array. The AI sees the release notice on the same turn it caused the release.
+
+Three blocks (one optional):
+
+1. **Header**: what just happened — `branch_context` released, why (state divergence, /compact, or 8-MiB overflow), and the consequence (the conversation the AI is now seeing is its local view, not the fork's history).
+2. **LAST FORK-APPLIED TURN** (only when a forkable revision exists in this task): the `turn_id` of the most recent successfully-spliced revision, with concrete commands the AI can suggest to the user — `recall(turn_id="<id>")` to inspect, `rewind_to(turn_id="<id>", message="...")` to resume the fork's content with a fresh user message, `dump_to_file(turn_id="<id>")` + edit + `submit_file` to inspect-and-edit before resuming.
+3. **PROPAGATION directive**: "no matter how you handle the user's request (answer fully, decline, partial answer), ALWAYS include a brief mention of this release in your response output. The recipient may be the user directly OR — if you are a Task subagent — a parent agent reading your response as a tool result. Best-effort relay through whatever chain exists." Plus a recommended one-liner the AI can drop into its response.
+
+Block layout matches claude code's `<system-reminder>`-per-block representation pattern: each directive in its own text block, the user's verbatim message in a separate UNWRAPPED block at the end. Implementation in `proxy-handler.ts:buildReleaseReminderBlocks` and `injectReleaseReminderInPlace`. The injection mutates `parsedBody.messages[last].content` in place; if the body shape is unexpected (last message not user-role, or content shape unrecognized) the injection skips and rawBody forwards unchanged — the audit event still fires.
+
+Symmetric counterpart to `<retcon-active>` (mcp-tools.ts:buildActiveReminderBlocks). Both wrap the user's message with retcon-controlled context blocks: one on activation (way IN), one on release (way OUT).
+
+### Multi-block injection text concat
+
+`isHarnessInjectionRevision` (the navigation-helper that decides whether a revision should be skipped by `turn_back_n` counting) used to inspect only the FIRST text block of each user message via `.find()`. claude code now splits content into multiple text blocks — one per `<system-reminder>` (skills list, file-opened, IDE state) and a separate block for the user's actual prompt. The first block was always a reminder; `isInjectionText` saw it alone, returned true, and `nthForkableBack` walked PAST real conversational turns as if they were noise. The cli-tmux integration test "rewind_to walks the revision DAG end-to-end" had been failing on master with "0 forkable turns available" — that's why.
+
+Fix: concat all text blocks (newline-joined) before passing to `isInjectionText`. The strip-system-reminder regex inside `isInjectionText` already handles multiple `<system-reminder>` blocks via the `/g` flag, so a turn whose combined text is `<system-reminder>...</system-reminder>\n<system-reminder>...</system-reminder>\nReply with one word: APPLE` correctly strips both reminders, sees "Reply with one word: APPLE" remaining, and returns false (not injection). Same fix applied to `turnPreview` (the snippet `recall` shows for each turn) — the preview was previously showing the first reminder block instead of the real user prompt the user typed.
+
+### `<retcon-active>` reminder blocks in synthetic landing turn
+
+The synthetic user-role message that lands at the rewound branch (= TOBE.messages.last) is constructed as a content-array with multiple text blocks — one per logical directive, matching claude code's `<system-reminder>`-per-block representation pattern:
 
 ```
 {
   role: 'user',
   content: [
-    { type: 'text', text: '<retcon-active>...directives...</retcon-active>' },
+    { type: 'text', text: '<retcon-active fork-id="tok_<12-hex>">...activation header...</retcon-active>' },
+    { type: 'text', text: '<retcon-active>...user-facing /rewind warning...</retcon-active>' },
+    { type: 'text', text: '<retcon-active>...AI-internal file-staleness directive...</retcon-active>' },
     { type: 'text', text: <user's message arg verbatim> }
   ]
 }
 ```
 
-The reminder block carries two directives:
+The reminder blocks carry these directives:
 
-- **User-facing**: tell the user once after answering that claude code's `/rewind` doesn't release this fork; use `/clear`, `/compact`, or another `rewind_to`.
-- **AI-internal** (do NOT echo): re-Read files referenced earlier — disk may have advanced past the rewound branch's view.
+- **Activation header** (block 0, carries `fork-id`): "a retcon fork is now active." The `fork-id="tok_..."` attribute is the per-fork token used by the divergence guard's fresh-fork skip — see "Fresh-fork skip via per-fork token" above.
+- **User-facing** (block 1): tell the user once after answering that claude code's `/rewind` doesn't release this fork; use `/clear`, `/compact`, or another `rewind_to`.
+- **AI-internal** (block 2, do NOT echo): re-Read files referenced earlier — disk may have advanced past the rewound branch's view.
 
-The user-facing directive is retcon's only proactive channel into claude's UI for the human (`/rewind` never reaches the LLM, pre-splice tool results are discarded by the splice itself, retcon can't modify claude's UI directly). Verified end-to-end: both Opus 4.7 and Sonnet 4.6 surface the user-facing warning and silently apply the file-staleness directive.
+The user-facing directive is retcon's only proactive channel into claude's UI for the human (`/rewind` never reaches the LLM, pre-splice tool results are discarded by the splice itself, retcon can't modify claude's UI directly). Verified end-to-end with both Opus 4.7 and Sonnet 4.6: surfaces the user-facing warning and silently applies the file-staleness directive.
 
-Decision #6 in INSIGHTS.md ("message delivered VERBATIM") is preserved: the user's text is its own content block, byte-equal to what they passed. The reminder is a sibling block, not a wrapper. retcon's `isInjectionText` recognizes the pattern (`<system-reminder>`-style with substantive content remaining) and treats the turn as a real user prompt, not an injection.
+Decision #6 in INSIGHTS.md ("message delivered VERBATIM") is preserved: the user's text is its own content block, byte-equal to what they passed. The reminder is sibling blocks, not a wrapper. retcon's `isInjectionText` recognizes the pattern (`<system-reminder>`-style with substantive content remaining after stripping reminder blocks) and treats the turn as a real user prompt, not an injection. The multi-block injection text concat fix (see below) ensures `isInjectionText` sees the full combined text, not just the first reminder block.
 
 ## Persistent fork: the penultimate-user splice
 

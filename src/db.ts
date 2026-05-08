@@ -38,7 +38,7 @@ export type DB = Database.Database
 // metadata that survives a tool_use-chained post-rewind turn, so fork.forked
 // can fire when an end_turn eventually arrives instead of dropping silently.
 // Backfill is just a NULL column add — additive, no data rewrite.
-export const CURRENT_SCHEMA_VERSION = 6
+export const CURRENT_SCHEMA_VERSION = 7
 
 // Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N
 // and brings it to N+1. Add an entry whenever you bump
@@ -46,6 +46,18 @@ export const CURRENT_SCHEMA_VERSION = 6
 const MIGRATIONS: Record<number, (db: DB) => void> = {
   5: (db) => {
     db.exec('ALTER TABLE sessions ADD COLUMN pending_synthetic_json TEXT')
+  },
+  // v7: per-fork random token retcon issues at rewind_to time and persists
+  // alongside branch_context_json. Used by proxy-handler.ts's divergence
+  // guard to detect "branch_context tail is still the synthetic_user_message"
+  // (fresh fork, no extension yet) by exact-equality match against the token
+  // embedded in the synthetic's `<retcon-active fork-id="...">` attribute.
+  // Pattern-match alone would false-match if user content quotes a token-
+  // shaped string; the DB-stored value is the only ground truth.
+  // NULL when no fork active or for legacy rows; cleared together with
+  // branch_context_json on release/clear/overflow.
+  6: (db) => {
+    db.exec('ALTER TABLE sessions ADD COLUMN branch_context_fork_id TEXT')
   },
 }
 
@@ -121,7 +133,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- to_revision_id in fork.forked), the fork-point revision id, and
   -- the original (pre-splice) request body's CID so buildSyntheticAsset
   -- can reconstruct the SR's content from blobs at fire-time.
-  pending_synthetic_json TEXT
+  pending_synthetic_json TEXT,
+  -- Per-fork random token (tok_ + 12 hex chars) retcon issues at
+  -- rewind_to/submit_file time and embeds in the synthetic_user_message
+  -- as a fork-id attribute on the retcon-active tag. proxy-handler.ts
+  -- uses exact-equality against this column to detect "branch_context
+  -- tail is still the synthetic" (fresh fork, no extension yet) and
+  -- skip the asst-text continuity check on the first post-rewind turn
+  -- (otherwise the rewound target's response, which may be compacted
+  -- out of claude local view, anchors the check and false-positive-
+  -- releases healthy forks). NULL when no fork active.
+  branch_context_fork_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_actor ON sessions(actor);
 

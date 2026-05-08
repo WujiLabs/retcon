@@ -260,6 +260,65 @@ describe('recall (list mode)', () => {
     expect('parent_revision_id' in t).toBe(false)
   })
 
+  // Surface fork-release timeline events in recall so the AI can reconstruct
+  // what happened to past forks: state divergence, /compact, /clear, or 8 MiB
+  // overflow. Markers appear inline alongside rewindable turns, sorted by
+  // timestamp, with kind='release_marker' and n_back=null (they're audit events
+  // on the session, not revisions you can rewind to).
+  it('list mode interleaves release_marker entries between turns', async () => {
+    // q1, q2 [release happens here], q3, q4 — head q4 excluded.
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    // Emit a state-divergence release between q2 and q3.
+    fx.producer.emit(
+      'session.branch_context_released',
+      { session_id: fx.sessionId, reason: 'rewind_or_state_divergence' },
+      fx.sessionId,
+    )
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head, excluded
+
+    const res = await call(fx, 'recall', {}) as {
+      total: number
+      turns: Array<{ turn_id: string, kind: string, n_back: number | null, preview: string, release_reason?: string }>
+    }
+    // total counts only rewindable turns (q1, q2, q3); release_marker doesn't bump it.
+    expect(res.total).toBe(3)
+    // turns array has 4 entries in DESC order: [q3, release_marker, q2, q1].
+    // q4 is head, excluded. release_marker happened between q2 and q3.
+    expect(res.turns).toHaveLength(4)
+    expect(res.turns[0]!.kind).toBe('turn')
+    expect(res.turns[0]!.preview).toBe('q3')
+    expect(res.turns[0]!.n_back).toBe(1)
+    expect(res.turns[1]!.kind).toBe('release_marker')
+    expect(res.turns[1]!.n_back).toBeNull()
+    expect(res.turns[1]!.preview).toContain('released')
+    expect(res.turns[1]!.release_reason).toBe('rewind_or_state_divergence')
+    expect(res.turns[2]!.kind).toBe('turn')
+    expect(res.turns[2]!.preview).toBe('q2')
+    expect(res.turns[2]!.n_back).toBe(2)
+    expect(res.turns[3]!.kind).toBe('turn')
+    expect(res.turns[3]!.preview).toBe('q1')
+    expect(res.turns[3]!.n_back).toBe(3)
+  })
+
+  it('list mode surfaces compact / clear events as release_marker with reason from payload', async () => {
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    fx.producer.emit(
+      'session.branch_context_cleared',
+      { session_id: fx.sessionId, source: 'compact' },
+      fx.sessionId,
+    )
+    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    const res = await call(fx, 'recall', {}) as {
+      turns: Array<{ kind: string, preview: string, release_reason?: string }>
+    }
+    const marker = res.turns.find(t => t.kind === 'release_marker')
+    expect(marker).toBeDefined()
+    expect(marker!.preview).toContain('cleared by compact')
+    expect(marker!.release_reason).toBe('compact')
+  })
+
   // Harness pseudo-prompts (recap and SUGGESTION MODE injections) get inserted
   // by claude as user-role turns mid-conversation. They land in the revisions
   // table as ordinary closed_forkable rows, which silently broke `turn_back_n`
@@ -1194,9 +1253,14 @@ describe('rewind_to (dual-secret flow)', () => {
     }
     expect(lastMsg.role).toBe('user')
     expect(Array.isArray(lastMsg.content)).toBe(true)
-    expect(lastMsg.content.length).toBe(2)
-    expect(lastMsg.content[0]!.text).toMatch(/<retcon-active>/)
-    expect(lastMsg.content[1]!.text).toBe('alternate')
+    // Per the new per-directive split: 3 reminder blocks (header with fork-id,
+    // /rewind warning, file-staleness) + 1 user message block = 4 total.
+    expect(lastMsg.content.length).toBe(4)
+    // The first block carries the `fork-id="tok_..."` attribute (per-fork
+    // random token retcon uses to detect "fresh fork" in the divergence guard).
+    expect(lastMsg.content[0]!.text).toMatch(/<retcon-active\s+fork-id="tok_[a-f0-9]{12}">/)
+    // The user's verbatim text lands in the LAST block, unwrapped.
+    expect(lastMsg.content[lastMsg.content.length - 1]!.text).toBe('alternate')
   })
 
   it('retcon-active reminder: /rewind warning is user-facing, file-staleness is AI-internal', async () => {
@@ -1219,7 +1283,14 @@ describe('rewind_to (dual-secret flow)', () => {
     const last = pending.messages[pending.messages.length - 1] as {
       content: Array<{ type: string, text: string }>
     }
-    const reminderText = last.content.find(b => b.text.includes('<retcon-active>'))!.text
+    // Per-directive split: each `<retcon-active>` reminder lives in its own
+    // text block, mirroring claude code's `<system-reminder>`-per-block
+    // pattern. Concat all reminder blocks for the assertions; the directives
+    // can land in any order, but they all must be present.
+    const reminderText = last.content
+      .filter(b => (b.text ?? '').includes('<retcon-active'))
+      .map(b => b.text)
+      .join('\n')
     // User-facing /rewind warning is present and clearly directed AT the user
     expect(reminderText).toMatch(/\/rewind/)
     expect(reminderText).toMatch(/\/clear|\/compact|rewind_to/)
@@ -1255,7 +1326,7 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(userBlock).toBeTruthy()
     // The reminder block must NOT contain the verbatim text (the AI's
     // message is unmodified by retcon).
-    const reminderBlock = last.content.find(b => b.text.includes('<retcon-active>'))
+    const reminderBlock = last.content.find(b => (b.text ?? '').includes('<retcon-active'))
     expect(reminderBlock).toBeTruthy()
     expect(reminderBlock!.text).not.toContain(verbatim)
   })
@@ -2078,7 +2149,7 @@ describe('submit_file (dual-secret + path safety)', () => {
     expect(Array.isArray(last.content)).toBe(true)
     const userBlock = last.content.find(b => b.text === 'continue with X')
     expect(userBlock).toBeTruthy()
-    const reminderBlock = last.content.find(b => b.text.includes('<retcon-active>'))
+    const reminderBlock = last.content.find(b => (b.text ?? '').includes('<retcon-active'))
     expect(reminderBlock).toBeTruthy()
   })
 

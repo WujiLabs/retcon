@@ -143,26 +143,87 @@ interface RevisionRow {
  * pattern and treats the turn as a real user prompt because substantive
  * content remains after stripping the reminder block.
  */
-function synthesizeUserMessageWithReminder(userMessage: string): {
+/**
+ * Per-fork random token format. Embedded as a `fork-id="..."` attribute
+ * on the `<retcon-active>` opening tag inside the synthetic_user_message
+ * AND persisted to `sessions.branch_context_fork_id`. The proxy uses
+ * exact-equality match (proxy-handler.ts:isSyntheticUserMessageTail)
+ * between the column and the tail user message's first text block to
+ * detect "branch_context tail is still the synthetic" (fresh fork, no
+ * extension yet) — distinguishing retcon's synthetic from any user content
+ * that happens to mention `<retcon-active>` (e.g., conversations about
+ * retcon's own design — this very codebase has many such references).
+ *
+ * Token is 12 hex chars (48 bits, ~281 trillion possibilities). Random
+ * per rewind. The DB column is the ground truth; the in-text marker is
+ * the comparison subject. The AI never needs to echo it back.
+ */
+const FORK_ID_PREFIX = 'tok_'
+const FORK_ID_HEX_LEN = 12
+
+export function generateForkId(): string {
+  return `${FORK_ID_PREFIX}${randomBytes(FORK_ID_HEX_LEN / 2).toString('hex')}`
+}
+
+/** Build the `<retcon-active fork-id="...">` opening tag retcon embeds in
+ *  the synthetic_user_message. Exposed so the proxy-handler can build the
+ *  exact substring it needs to search for in branch_context's tail. */
+export function buildForkIdMarker(forkId: string): string {
+  return `<retcon-active fork-id="${forkId}">`
+}
+
+/**
+ * Build the `<retcon-active>` reminder text blocks. Returns an array of
+ * separate text blocks (one per logical directive) following claude code's
+ * `<system-reminder>`-per-block pattern. Mirroring claude's representation
+ * keeps the model's reading behavior consistent across the two reminder
+ * types it sees most.
+ *
+ * The FIRST block carries the `fork-id="..."` attribute that
+ * proxy-handler.ts:isSyntheticUserMessageTail detects via exact-equality
+ * against `sessions.branch_context_fork_id` — keep block[0] stable.
+ */
+export function buildActiveReminderBlocks(forkId: string): Array<{ type: 'text', text: string }> {
+  return [
+    {
+      type: 'text',
+      text: [
+        buildForkIdMarker(forkId),
+        '[system note from retcon proxy — NOT from the user]',
+        'A retcon fork is now active. The user\'s actual message follows in a later block.',
+        'The `fork-id` attribute on this tag is a retcon-internal marker — ignore it.',
+        '</retcon-active>',
+      ].join('\n'),
+    },
+    {
+      type: 'text',
+      text: [
+        '<retcon-active>',
+        'After answering the user\'s question, briefly mention this ONCE to the user:',
+        '- They should NOT use claude code\'s `/rewind` slash command — it cannot release this retcon fork. To switch contexts, use `/clear`, `/compact`, or another `rewind_to`.',
+        '</retcon-active>',
+      ].join('\n'),
+    },
+    {
+      type: 'text',
+      text: [
+        '<retcon-active>',
+        'For your own reasoning ONLY (do NOT mention this to the user — it would be UX noise):',
+        '- Files referenced in earlier turns may have changed on disk between the rewound point and now. Re-Read any file you rely on before trusting cached memory of it.',
+        '</retcon-active>',
+      ].join('\n'),
+    },
+  ]
+}
+
+function synthesizeUserMessageWithReminder(userMessage: string, forkId: string): {
   role: 'user'
   content: Array<{ type: 'text', text: string }>
 } {
-  const reminder = [
-    '<retcon-active>',
-    '[system note from retcon proxy — NOT from the user]',
-    'A retcon fork is now active. The user\'s actual message follows below.',
-    '',
-    'After answering the user\'s question, briefly mention this ONCE to the user:',
-    '- They should NOT use claude code\'s `/rewind` slash command — it cannot release this retcon fork. To switch contexts, use `/clear`, `/compact`, or another `rewind_to`.',
-    '',
-    'For your own reasoning ONLY (do NOT mention this to the user — it would be UX noise):',
-    '- Files referenced in earlier turns may have changed on disk between the rewound point and now. Re-Read any file you rely on before trusting cached memory of it.',
-    '</retcon-active>',
-  ].join('\n')
   return {
     role: 'user',
     content: [
-      { type: 'text', text: reminder },
+      ...buildActiveReminderBlocks(forkId),
       { type: 'text', text: userMessage },
     ],
   }
@@ -343,13 +404,20 @@ function isHarnessInjectionRevision(db: DB, revisionId: string): boolean {
       leaf = m as { role?: string, content?: unknown }
     }
     if (!leaf || leaf.role !== 'user') continue
+    // Concat ALL text blocks (joined by newline) — claude code can split a
+    // single user turn into multiple text blocks (e.g., `<system-reminder>`
+    // wrapper + `<system-reminder>` skills list + user's actual prompt as
+    // separate blocks). Picking only the first block would see the reminder
+    // alone and misclassify the turn as injection. Combining lets
+    // isInjectionText's strip-reminder logic see the whole thing and
+    // recognize the real prompt that survives stripping.
     let text = ''
     if (typeof leaf.content === 'string') text = leaf.content
     else if (Array.isArray(leaf.content)) {
-      const block = (leaf.content as Array<{ type?: string, text?: string }>).find(
-        b => b && b.type === 'text',
-      )
-      text = block?.text ?? ''
+      text = (leaf.content as Array<{ type?: string, text?: string }>)
+        .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+        .map(b => b.text!)
+        .join('\n')
     }
     if (!text) return false
     return isInjectionText(text)
@@ -507,16 +575,24 @@ async function turnPreview(
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i] as { role?: string, content?: unknown } | undefined
     if (m?.role !== 'user') continue
+    // Concat ALL text blocks — same reason as isHarnessInjectionRevision:
+    // claude code can split user content into multiple text blocks (system-
+    // reminder wrapper + real prompt as separate blocks). Picking just the
+    // first would show the reminder text in previews instead of the prompt
+    // the user actually typed.
     let text = ''
     if (typeof m.content === 'string') {
       text = m.content
     }
     else if (Array.isArray(m.content)) {
-      const block = m.content.find(
-        (b: unknown): b is { type: string, text: string } =>
-          typeof b === 'object' && b !== null && (b as { type?: unknown }).type === 'text',
-      )
-      text = block?.text ?? '(non-text content)'
+      const textBlocks = m.content
+        .filter((b: unknown): b is { type: string, text: string } =>
+          typeof b === 'object' && b !== null
+          && (b as { type?: unknown }).type === 'text'
+          && typeof (b as { text?: unknown }).text === 'string',
+        )
+        .map(b => b.text)
+      text = textBlocks.length > 0 ? textBlocks.join('\n') : '(non-text content)'
     }
     text = text.replace(/\s+/g, ' ').trim()
     if (text.length === 0) continue
@@ -1264,23 +1340,91 @@ export function createMcpToolsWithTokens(
           `).get(sess.task_id, headId) as { n: number }).n
         : 0
 
-      const turns = await Promise.all(rows.map(async (r, idx) => {
+      const turnEntries = await Promise.all(rows.map(async (r, idx) => {
         const preview = await turnPreview(deps, r.id)
         const lean = {
           turn_id: r.id,
-          kind: turnKindFor(r.stop_reason),
-          n_back: offset + idx + 1, // matches rewind_to(turn_back_n=N)
+          kind: turnKindFor(r.stop_reason) as 'turn' | 'rewind_marker' | 'submit_marker' | 'release_marker',
+          n_back: (offset + idx + 1) as number | null, // matches rewind_to(turn_back_n=N)
           preview,
-          stop_reason: r.stop_reason,
+          stop_reason: r.stop_reason as string | null,
           sealed_at: r.sealed_at,
+          release_reason: undefined as string | undefined,
         }
         if (!verbose) return lean
-        return { ...lean, created_at: r.created_at }
+        return { ...lean, created_at: r.created_at as number | undefined }
       }))
+
+      // Pull branch_context release/clear events for this session and inject
+      // them as release_marker entries interleaved with rewindable turns by
+      // timestamp. Releases are NOT rewindable (they're audit events on the
+      // session, not revisions), so n_back=null. Their position helps the AI
+      // reconstruct what happened: "between turn N and turn N-1 the fork got
+      // released by /compact" or "by state divergence (likely /rewind or a
+      // subagent that didn't carry the fork tail)".
+      //
+      // Source filter: events where session_id maps to this task's sessions.
+      // Time-bounded by the oldest visible turn so a long-history task with
+      // many releases doesn't dump them all here.
+      const oldestSealedAt = rows.length > 0
+        ? rows[rows.length - 1].sealed_at ?? 0
+        : 0
+      const releaseRows = deps.db.prepare(`
+        SELECT e.event_id, e.topic, e.created_at, e.payload, e.session_id
+          FROM events e
+          JOIN sessions s ON s.id = e.session_id
+         WHERE s.task_id = ?
+           AND e.topic IN ('session.branch_context_released', 'session.branch_context_cleared', 'session.branch_context_overflow')
+           AND e.created_at >= ?
+         ORDER BY e.created_at DESC
+      `).all(sess.task_id, oldestSealedAt) as Array<{
+        event_id: string
+        topic: string
+        created_at: number
+        payload: string
+        session_id: string
+      }>
+
+      const releaseEntries = releaseRows.map((r) => {
+        let reason = ''
+        try {
+          const p = JSON.parse(r.payload) as { reason?: string, source?: string }
+          reason = p.reason ?? p.source ?? ''
+        }
+        catch { /* keep '' */ }
+        const label = r.topic === 'session.branch_context_overflow'
+          ? `branch_context overflowed (8 MiB cap)`
+          : r.topic === 'session.branch_context_cleared'
+            ? `branch_context cleared by ${reason || 'unknown'}`
+            : `branch_context released: ${reason || 'unknown'}`
+        return {
+          turn_id: r.event_id,
+          kind: 'release_marker' as const,
+          n_back: null,
+          preview: label,
+          stop_reason: null,
+          sealed_at: r.created_at,
+          release_reason: reason || r.topic.replace('session.branch_context_', ''),
+          ...(verbose ? { created_at: r.created_at } : {}),
+        }
+      })
+
+      // Merge & sort: same DESC-by-sealed_at ordering as the turns query so
+      // releases land between the surrounding turns chronologically. Tie-
+      // break by turn_id DESC: turn_ids are event_ids, monotonic per
+      // producer (TraceIdGenerator sequence), so even when emits land in the
+      // same millisecond the lex order matches the emit order.
+      const turns = [...turnEntries, ...releaseEntries]
+        .sort((a, b) => {
+          const ta = a.sealed_at ?? 0
+          const tb = b.sealed_at ?? 0
+          if (ta !== tb) return tb - ta
+          return b.turn_id.localeCompare(a.turn_id)
+        })
 
       const nextSteps = turns.length === 0
         ? 'No rewindable turns yet. The current state is `current_head_turn_id`. After more turns close, call `recall` again.'
-        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). Entries with `kind: "rewind_marker"` or `"submit_marker"` are synthetic departure points from earlier rewinds/submits — you can rewind back to them or dump them just like real turns. To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
+        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). Entries with `kind: "rewind_marker"` or `"submit_marker"` are synthetic departure points from earlier rewinds/submits — you can rewind back to them or dump them just like real turns. Entries with `kind: "release_marker"` mark moments when an active branch_context was released (state divergence, /compact, /clear, or 8 MiB overflow); they\'re not rewindable themselves, but they tell you when forks ended. To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
 
       // rewind_events fields (rewind_events / rewind_events_total /
       // rewind_events_truncated) were dropped in v0.5.0. They've been replaced
@@ -1443,7 +1587,8 @@ export function createMcpToolsWithTokens(
       if (!baseMessages) {
         return { error: 'unable to reconstruct messages[] for fork_point (no usable source blob)' }
       }
-      const newMessage = synthesizeUserMessageWithReminder(message)
+      const forkId = generateForkId()
+      const newMessage = synthesizeUserMessageWithReminder(message, forkId)
       baseMessages.push(newMessage)
 
       const newMessageBlob = await blobRefFromBytes(
@@ -1488,8 +1633,15 @@ export function createMcpToolsWithTokens(
       })
 
       // Persistent fork branch context — see daemon for downstream consumers.
-      deps.db.prepare(`UPDATE sessions SET branch_context_json = ? WHERE id = ?`)
-        .run(JSON.stringify(baseMessages), ctx.sessionId)
+      // forkId is persisted alongside so the divergence guard can detect
+      // "fresh fork" (synthetic_user_message at branch_context's tail) by
+      // exact-equality match against the column.
+      deps.db.prepare(`
+        UPDATE sessions
+           SET branch_context_json = ?,
+               branch_context_fork_id = ?
+         WHERE id = ?
+      `).run(JSON.stringify(baseMessages), forkId, ctx.sessionId)
 
       ctx.producer.emit(
         'fork.back_requested',
@@ -2143,7 +2295,8 @@ export function createMcpToolsWithTokens(
       }
 
       // ── Phase 3: append message + write TOBE ──────────────────────────────
-      const newMessage = synthesizeUserMessageWithReminder(message)
+      const forkId = generateForkId()
+      const newMessage = synthesizeUserMessageWithReminder(message, forkId)
       const finalMessages: unknown[] = [...messages, newMessage]
       const newMessageBlob = await blobRefFromBytes(
         Buffer.from(JSON.stringify(newMessage), 'utf8'),
@@ -2212,9 +2365,14 @@ export function createMcpToolsWithTokens(
       })
 
       // Persist as branch context (same as rewind_to) so subsequent turns
-      // continue on the submitted branch.
-      deps.db.prepare(`UPDATE sessions SET branch_context_json = ? WHERE id = ?`)
-        .run(JSON.stringify(finalMessages), ctx.sessionId)
+      // continue on the submitted branch. forkId persisted alongside so the
+      // divergence guard can detect "fresh fork" via exact-equality match.
+      deps.db.prepare(`
+        UPDATE sessions
+           SET branch_context_json = ?,
+               branch_context_fork_id = ?
+         WHERE id = ?
+      `).run(JSON.stringify(finalMessages), forkId, ctx.sessionId)
 
       ctx.producer.emit(
         'fork.back_requested',
