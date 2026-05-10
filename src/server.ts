@@ -20,6 +20,7 @@ import http from 'node:http'
 import { handleActorRegister } from './actor-register.js'
 import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
+import { applyTask, type Task, taskRef } from './channel-types.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
@@ -37,7 +38,7 @@ import { VERSION } from './version.js'
 /**
  * Build the standard set of projectors wired into a v1 producer.
  *
- * Declared dispatch order:
+ * Declared dispatch order (LEGACY shape — array order is load-bearing):
  *   1. sessions_v1       — must run first so a session/task row exists before
  *                          revisions_v1 tries to reference it on FK.
  *   2. revisions_v1      — sets revisions.parent_revision_id on response_completed;
@@ -47,6 +48,11 @@ import { VERSION } from './version.js'
  *   4. rewind_marker_v1  — INSERTs synthetic departure Revisions on fork.forked.
  *                          Independent of the others (different topic), order is
  *                          immaterial relative to them, but kept last for clarity.
+ *
+ * @deprecated Step 1 of the channel refactor introduced {@link defaultTasks}
+ *   — Task-shaped registration with declarative TaskRef dependencies. Prefer
+ *   that for new wiring. This function stays for back-compat with code that
+ *   constructs an EventProducer directly without going through Tasks.
  */
 export function defaultProjectors(): Projection[] {
   return [
@@ -54,6 +60,88 @@ export function defaultProjectors(): Projection[] {
     new RevisionsV1Projector(),
     new BranchViewsV1Projector(),
     new RewindMarkerV1Projector(),
+  ]
+}
+
+/**
+ * Build the v1 projector set as Tasks with declarative TaskRef dependencies.
+ *
+ * Each projector becomes a Task whose `input.topics` mirrors the projector's
+ * `subscribedTopics`, and whose Input dict carries {@link TaskRef} values for
+ * upstream projectors it must run after. Dispatch order is then derived from
+ * the dependency graph (via topo-sort in the runner), not from array
+ * positions — a future contributor reordering registration calls cannot
+ * silently break dispatch.
+ *
+ * Dependency edges encoded here (matches the historical array order):
+ *   sessions_v1       — no upstream (root)
+ *   revisions_v1      — depends on sessions_v1 (FK on tasks.id; tx-shared write)
+ *   branch_views_v1   — depends on revisions_v1 (reads
+ *                       revisions.parent_revision_id set by revisions_v1)
+ *   rewind_marker_v1  — depends on revisions_v1 (the SR row needs revisions
+ *                       to have processed the parent it links to first)
+ *
+ * Async because `applyTask` content-hashes via `@playtiss/core`'s computeHash,
+ * which is async (Web Crypto / multiformats). Paid once at boot, never per-emit.
+ */
+export async function defaultTasks(): Promise<Task[]> {
+  const sessionsProj = new SessionsV1Projector()
+  const sessionsId = await applyTask('playtiss.proxy.sessions_v1', {
+    topics: sessionsProj.subscribedTopics as string[],
+  })
+
+  const revisionsProj = new RevisionsV1Projector()
+  const revisionsId = await applyTask('playtiss.proxy.revisions_v1', {
+    topics: revisionsProj.subscribedTopics as string[],
+    sessions: taskRef(sessionsId),
+  })
+
+  const branchViewsProj = new BranchViewsV1Projector()
+  const branchViewsId = await applyTask('playtiss.proxy.branch_views_v1', {
+    topics: branchViewsProj.subscribedTopics as string[],
+    revisions: taskRef(revisionsId),
+  })
+
+  const rewindMarkerProj = new RewindMarkerV1Projector()
+  const rewindMarkerId = await applyTask('playtiss.proxy.rewind_marker_v1', {
+    topics: rewindMarkerProj.subscribedTopics as string[],
+    revisions: taskRef(revisionsId),
+  })
+
+  return [
+    {
+      id: sessionsId,
+      action: 'playtiss.proxy.sessions_v1',
+      input: { topics: sessionsProj.subscribedTopics as string[] },
+      apply: (event, tx) => sessionsProj.apply(event, tx),
+    },
+    {
+      id: revisionsId,
+      action: 'playtiss.proxy.revisions_v1',
+      input: {
+        topics: revisionsProj.subscribedTopics as string[],
+        sessions: taskRef(sessionsId),
+      },
+      apply: (event, tx) => revisionsProj.apply(event, tx),
+    },
+    {
+      id: branchViewsId,
+      action: 'playtiss.proxy.branch_views_v1',
+      input: {
+        topics: branchViewsProj.subscribedTopics as string[],
+        revisions: taskRef(revisionsId),
+      },
+      apply: (event, tx) => branchViewsProj.apply(event, tx),
+    },
+    {
+      id: rewindMarkerId,
+      action: 'playtiss.proxy.rewind_marker_v1',
+      input: {
+        topics: rewindMarkerProj.subscribedTopics as string[],
+        revisions: taskRef(revisionsId),
+      },
+      apply: (event, tx) => rewindMarkerProj.apply(event, tx),
+    },
   ]
 }
 

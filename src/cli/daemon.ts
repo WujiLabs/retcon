@@ -37,7 +37,8 @@ import path from 'node:path'
 import { closeDb, migrate, openDb } from '../db.js'
 import { createMcpTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
-import { createDefaultProducer, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
+import { createChannel } from '../channel.js'
+import { defaultTasks, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile, retconTobeDir } from './paths.js'
@@ -108,7 +109,15 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   }, DUMPS_GC_INTERVAL_MS)
   dumpsGcTimer.unref()
 
-  const producer = createDefaultProducer(db)
+  // Step 1 of the @playtiss/core/channel refactor (2026-05-10): switch the
+  // daemon to the Channel-shaped wiring. defaultTasks() returns Task-shaped
+  // projector registrations with declarative TaskRef dependencies; the
+  // runner topo-sorts them before dispatch. Same on-disk schema, same
+  // transactional semantics — but dispatch order is now derived from
+  // declared deps, not implicit array order.
+  const tasks = await defaultTasks()
+  const channel = createChannel({ db, tasks })
+  const producer = channel.producer
   const tobeStore = createTobeStore(retconTobeDir())
   const storageProvider = new SqliteStorageProvider(db)
   const mcpTools = createMcpTools({ db, tobeStore, storageProvider, rewindEnabled: true })
