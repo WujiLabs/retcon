@@ -42,6 +42,11 @@ export type DB = Database.Database
 // metadata that survives a tool_use-chained post-rewind turn, so fork.forked
 // can fire when an end_turn eventually arrives instead of dropping silently.
 // Backfill is just a NULL column add — additive, no data rewrite.
+//
+// v8 = channel-refactor cutover: @playtiss/core/channel owns blobs / events /
+// task_metadata. The v7→v8 step copies projection_offsets rows into
+// task_metadata. projection_offsets stays for forensic value; nothing post-v8
+// reads it.
 export const CURRENT_SCHEMA_VERSION = 8
 
 // Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N

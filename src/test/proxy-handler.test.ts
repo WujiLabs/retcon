@@ -1022,6 +1022,104 @@ describe('proxy pass-through + event emission', () => {
     expect(stillPending!.fork_point_revision_id).toBe('v-keep')
   })
 
+  it('count_tokens skips applyBranchContextRewrite — no splice, no release on tiny body', async () => {
+    // Forensic: b17275fb 2026-05-08 11:55:25. claude code's count_tokens
+    // probe (121-byte body, no asst-text from branch_context) was hitting
+    // the divergence guard and false-triggering session.branch_context_released
+    // because `isMessagesPath = url.includes('/messages')` matched both
+    // /v1/messages and /v1/messages/count_tokens. The fix splits into
+    // isMessagesEndpoint (the real conversation endpoint) and isMessagesPath
+    // (any /messages-shaped path). count_tokens is now a pass-through.
+    const sessionId = 'sess-count-tokens'
+    const branchContext = [
+      { role: 'user', content: 'fork user' },
+      { role: 'assistant', content: 'distinctive forked asst response' },
+      { role: 'user', content: 'fork synthetic user' },
+    ]
+    fx.db.prepare(
+      'INSERT INTO sessions (id, task_id, actor, created_at, harness, branch_context_json) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      sessionId, 'task-ct', 'default', Date.now(), 'claude-code',
+      JSON.stringify(branchContext),
+    )
+
+    mock = await startMock((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ input_tokens: 1234 }))
+    })
+    proxy = await startServer({
+      port: 0,
+      channel: fx.channel,
+      tobeStore: fx.tobeStore,
+      db: fx.db,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    // Tiny count_tokens body: a single user message with text the asst-text
+    // continuity check would NEVER find. If the guard ran, it'd misfire.
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages/count_tokens?beta=true`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'a' }],
+      }),
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+
+    // No release event fired (guard didn't run on count_tokens).
+    const releaseRow = fx.db
+      .prepare('SELECT COUNT(*) AS n FROM events WHERE session_id=? AND topic=?')
+      .get(sessionId, 'session.branch_context_released') as { n: number }
+    expect(releaseRow.n).toBe(0)
+
+    // branch_context_json untouched.
+    const sessionRow = fx.db
+      .prepare('SELECT branch_context_json FROM sessions WHERE id=?')
+      .get(sessionId) as { branch_context_json: string | null }
+    expect(sessionRow.branch_context_json).not.toBeNull()
+    expect(JSON.parse(sessionRow.branch_context_json!)).toEqual(branchContext)
+  })
+
+  it('count_tokens passes through unchanged when no fork active', async () => {
+    // Sanity: count_tokens with no branch_context_json should also pass
+    // through with no body manipulation. (Existing behavior preserved.)
+    const sessionId = 'sess-count-tokens-no-fork'
+    fx.db.prepare(
+      'INSERT INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)',
+    ).run(sessionId, 'task-ct2', 'default', Date.now(), 'claude-code')
+
+    let receivedBody: string | undefined
+    mock = await startMock((_req, res, body) => {
+      receivedBody = body.toString('utf8')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ input_tokens: 42 }))
+    })
+    proxy = await startServer({
+      port: 0,
+      channel: fx.channel,
+      tobeStore: fx.tobeStore,
+      db: fx.db,
+      upstream: `http://127.0.0.1:${mock.port}`,
+    })
+
+    const sentBody = JSON.stringify({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'count this' }],
+    })
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages/count_tokens?beta=true`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
+      body: sentBody,
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+
+    // Body forwarded byte-equal (no manipulation).
+    expect(receivedBody).toBe(sentBody)
+  })
+
   it('emits session.branch_context_overflow when fork context grows past 8 MiB', async () => {
     // Seed a session whose branch_context_json is already at the cap, so
     // any suffix from claude's body pushes the next write over.

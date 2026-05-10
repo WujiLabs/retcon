@@ -176,7 +176,7 @@ describe('recall (list mode)', () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head — excluded
     const res = await call(fx, 'recall', {}) as {
       total: number
-      turns: Array<{ turn_id: string, n_back: number, preview: string, stop_reason: string | null }>
+      turns: Array<{ turn_id: string, n_back: number, user: string, prior_asst: string | null, stop_reason: string | null }>
       current_head_turn_id: string | null
     }
     // total = rewindable count (3 closed_forkable - 1 head = 2)
@@ -184,8 +184,8 @@ describe('recall (list mode)', () => {
     expect(res.turns.length).toBe(2)
     expect(res.turns.every(v => v.stop_reason === 'end_turn')).toBe(true)
     // n_back=1 is q3 (one before head); n_back=2 is q1.
-    expect(res.turns[0]!.preview).toBe('q3')
-    expect(res.turns[1]!.preview).toBe('q1')
+    expect(res.turns[0]!.user).toBe('q3')
+    expect(res.turns[1]!.user).toBe('q1')
     expect(res.turns[0]!.n_back).toBe(1)
     expect(res.turns[1]!.n_back).toBe(2)
     expect(res.current_head_turn_id).not.toBeNull()
@@ -199,10 +199,10 @@ describe('recall (list mode)', () => {
     const t2 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }]) // head — excluded
     const list = await call(fx, 'recall', {}) as {
-      turns: Array<{ turn_id: string, preview: string, n_back: number }>
+      turns: Array<{ turn_id: string, user: string, n_back: number }>
     }
     // n_back=1 = the turn whose `turn_id` rewind_to(turn_back_n=1) lands on.
-    expect(list.turns[0]!.preview).toBe('second')
+    expect(list.turns[0]!.user).toBe('second')
     expect(list.turns[0]!.n_back).toBe(1)
     expect(list.turns[0]!.turn_id).toBe(t2.id)
     // Now verify rewind_to(turn_back_n=1) targets the n_back=1 entry.
@@ -280,7 +280,7 @@ describe('recall (list mode)', () => {
 
     const res = await call(fx, 'recall', {}) as {
       total: number
-      turns: Array<{ turn_id: string, kind: string, n_back: number | null, preview: string, release_reason?: string }>
+      turns: Array<{ turn_id: string, kind: string, n_back: number | null, user?: string, preview?: string, release_reason?: string }>
     }
     // total counts only rewindable turns (q1, q2, q3); release_marker doesn't bump it.
     expect(res.total).toBe(3)
@@ -288,17 +288,18 @@ describe('recall (list mode)', () => {
     // q4 is head, excluded. release_marker happened between q2 and q3.
     expect(res.turns).toHaveLength(4)
     expect(res.turns[0]!.kind).toBe('turn')
-    expect(res.turns[0]!.preview).toBe('q3')
+    expect(res.turns[0]!.user).toBe('q3')
     expect(res.turns[0]!.n_back).toBe(1)
     expect(res.turns[1]!.kind).toBe('release_marker')
     expect(res.turns[1]!.n_back).toBeNull()
+    // release_marker still uses `preview` (label string for the release event)
     expect(res.turns[1]!.preview).toContain('released')
     expect(res.turns[1]!.release_reason).toBe('rewind_or_state_divergence')
     expect(res.turns[2]!.kind).toBe('turn')
-    expect(res.turns[2]!.preview).toBe('q2')
+    expect(res.turns[2]!.user).toBe('q2')
     expect(res.turns[2]!.n_back).toBe(2)
     expect(res.turns[3]!.kind).toBe('turn')
-    expect(res.turns[3]!.preview).toBe('q1')
+    expect(res.turns[3]!.user).toBe('q1')
     expect(res.turns[3]!.n_back).toBe(3)
   })
 
@@ -344,9 +345,9 @@ describe('recall (list mode)', () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]' }])
     // From the new head (the SUGGESTION turn, which effectiveHead skips → AARDVARK):
     //   turn_back_n=1 → ZEBRA (skipping system-reminder injection between them)
-    const recall1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, preview: string } }
+    const recall1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, user: string } }
     expect(recall1.turn.turn_id).toBe(t1.id)
-    expect(recall1.turn.preview).toContain('ZEBRA')
+    expect(recall1.turn.user).toContain('ZEBRA')
     // turn_back_n=2 falls off the front (only ZEBRA + AARDVARK count; system-
     // reminder + SUGGESTION are skipped). Error message reports actual count.
     const recall2 = await call(fx, 'recall', { turn_back_n: 2 }) as { error: string }
@@ -388,7 +389,7 @@ describe('recall (list mode)', () => {
     // turn_back_n=1 should land on `reminderPlusReal` (NOT walk past it to
     // realFirst, since reminderPlusReal contains real user content after the
     // reminder block).
-    const r1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, preview: string } }
+    const r1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, user: string } }
     expect(r1.turn.turn_id).toBe(reminderPlusReal.id)
     // turn_back_n=2 reaches realFirst.
     const r2 = await call(fx, 'recall', { turn_back_n: 2 }) as { turn: { turn_id: string } }
@@ -427,11 +428,241 @@ describe('recall (list mode)', () => {
     // proves firstChild walked PAST sysRem to find aardvark as a navigation
     // peer.
     const r = await call(fx, 'recall', { turn_back_n: 2, surrounding: 2 }) as {
-      turn: { turn_id: string, preview: string }
+      turn: { turn_id: string, user: string }
       surrounding_turns?: Array<{ turn_id: string }>
     }
     expect(r.turn.turn_id).toBe(zebra.id)
-    expect(r.turn.preview).toContain('ZEBRA')
+    expect(r.turn.user).toContain('ZEBRA')
+  })
+
+  // ── landing turn + paired SR rendering (v0.5.6) ─────────────────────────────
+  // After a successful rewind/submit, two related rows appear in recall:
+  //   1. The SR (synthetic departure Revision): kind='rewind_marker' /
+  //      'submit_marker', stop_reason ∈ {'rewind_synthetic','submit_synthetic'}.
+  //   2. The "landing turn": the first real Revision that landed inside the
+  //      forked branch (request_received with `tobe_applied_from`).
+  // List mode tags landing turns with `is_landing: true` + `landing_kind`, and
+  // exposes the SR's `synthetic_assistant_text` so the (R3' assist → R_new
+  // user) bridge is reconstructable from the recall result alone.
+
+  /** Emit a fork.forked event paired with a landing-turn Revision. Mirrors what
+   *  proxy-handler does post-rewind: target_turn → SR → landing_turn. The SR
+   *  row is materialized by the rewind_marker_v1 projector. */
+  async function emitForkPair(
+    fx: TestFixture,
+    opts: {
+      parent: Event // R1 — the closed_forkable rev that emitted tool_use
+      target: Event // The fork target (where the AI chose to land)
+      kind: 'rewind' | 'submit'
+      landingMessages: unknown[]
+      syntheticAssistantText: string
+      srSealedAt?: number // explicit sealed_at; default Date.now()
+    },
+  ): Promise<{ srId: string, landing: Event }> {
+    // Landing request_received carries tobe_applied_from in payload so the
+    // mcp-tools query for `is_landing` matches.
+    const bodyBytes = Buffer.from(JSON.stringify({ messages: opts.landingMessages }), 'utf8')
+    const bodyCid = `bafy-landing-${Math.random().toString(36).slice(2)}`
+    const { event: landing } = await fx.channel.submit(
+      'proxy.request_received',
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers_cid: 'h',
+        body_cid: bodyCid,
+        tobe_applied_from: { fork_point_revision_id: opts.target.id, source_view_id: 'view-test' },
+      },
+      fx.sessionId,
+      [{ cid: bodyCid, bytes: bodyBytes }],
+    )
+    await fx.channel.submit(
+      'proxy.response_completed',
+      {
+        request_event_id: landing.id,
+        status: 200,
+        headers_cid: 'h',
+        body_cid: 'bafy-resp',
+        stop_reason: 'end_turn',
+        asset_cid: 'bafy-asset',
+      },
+      fx.sessionId,
+    )
+    // Use TraceId-style id (hex prefix matching the channel's id format) so
+    // sealed_at-tied tiebreaks via `id DESC` order SR rows consistently with
+    // normal Revisions. A random `rev-sr-` prefix lex-sorts after hex UUIDs
+    // and confuses `mostRecentForkableRevision`'s head exclusion.
+    const srId = `01${Math.random().toString(16).slice(2, 10).padEnd(8, '0')}-sr00-0000-0000-${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`
+    await fx.channel.submit(
+      'fork.forked',
+      {
+        kind: opts.kind,
+        synthetic_revision_id: srId,
+        parent_revision_id: opts.parent.id,
+        target_revision_id: opts.target.id,
+        to_revision_id: landing.id,
+        synthetic_tool_result_text: 'OK',
+        synthetic_assistant_text: opts.syntheticAssistantText,
+        synthetic_user_message: 'X',
+        target_view_id: 'view-test',
+        sealed_at: opts.srSealedAt ?? Date.now(),
+        synthetic_asset_cid: `bafy-sr-${Math.random().toString(36).slice(2)}`,
+      },
+      fx.sessionId,
+    )
+    return { srId, landing }
+  }
+
+  it('list mode tags landing turn with is_landing + landing_kind, and exposes SR synthetic_assistant_text', async () => {
+    // Conversation: q1 (target), R1 (the assistant turn that calls rewind_to —
+    // we model it as a closed_forkable for simplicity), then SR + landing turn,
+    // then a tail closed_forkable as head.
+    const target = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'discuss auth' }])
+    const r1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'tangent' }])
+    const { srId, landing } = await emitForkPair(fx, {
+      parent: r1,
+      target,
+      kind: 'rewind',
+      landingMessages: [{ role: 'user', content: 'use postgres for auth' }],
+      syntheticAssistantText: 'OK rewinding.',
+    })
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'follow-up' }]) // head
+
+    const res = await call(fx, 'recall', {}) as {
+      turns: Array<{
+        turn_id: string
+        kind: string
+        user?: string
+        prior_asst?: string | null
+        is_landing?: boolean
+        landing_kind?: string
+        paired_sr_id?: string
+        synthetic_assistant_text?: string
+        paired_landing_id?: string
+      }>
+    }
+    // Expect (DESC by sealed_at): [landing, SR, r1, target]
+    const landingEntry = res.turns.find(t => t.turn_id === landing.id)!
+    expect(landingEntry).toBeDefined()
+    expect(landingEntry.is_landing).toBe(true)
+    expect(landingEntry.landing_kind).toBe('rewind')
+    expect(landingEntry.paired_sr_id).toBe(srId)
+    expect(landingEntry.user).toBe('use postgres for auth')
+
+    const srEntry = res.turns.find(t => t.turn_id === srId)!
+    expect(srEntry).toBeDefined()
+    expect(srEntry.kind).toBe('rewind_marker')
+    expect(srEntry.synthetic_assistant_text).toBe('OK rewinding.')
+    expect(srEntry.paired_landing_id).toBe(landing.id)
+    // SR rows skip body extraction when R3' is available.
+    expect(srEntry.user).toBeUndefined()
+  })
+
+  it('orphan landing (no fork.forked) is marked landing_kind=unknown', async () => {
+    // Landing without a matching fork.forked happens when the splice succeeded
+    // but the tool_use chain never closed (e.g., aborted mid-stream). The row
+    // still has `tobe_applied_from`, so list mode flags it as landing with
+    // kind='unknown' so the AI knows context discontinuity is possible here.
+    const target = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'old prompt' }])
+    // Emit landing directly without a fork.forked event.
+    const bodyBytes = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'orphan landing' }] }), 'utf8')
+    const bodyCid = `bafy-orphan-${Math.random().toString(36).slice(2)}`
+    const { event: landing } = await fx.channel.submit(
+      'proxy.request_received',
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers_cid: 'h',
+        body_cid: bodyCid,
+        tobe_applied_from: { fork_point_revision_id: target.id, source_view_id: 'view-orphan' },
+      },
+      fx.sessionId,
+      [{ cid: bodyCid, bytes: bodyBytes }],
+    )
+    await fx.channel.submit(
+      'proxy.response_completed',
+      {
+        request_event_id: landing.id,
+        status: 200,
+        headers_cid: 'h',
+        body_cid: 'bafy-resp',
+        stop_reason: 'end_turn',
+        asset_cid: 'bafy-asset',
+      },
+      fx.sessionId,
+    )
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'tail' }]) // head
+
+    const res = await call(fx, 'recall', {}) as {
+      turns: Array<{ turn_id: string, is_landing?: boolean, landing_kind?: string, paired_sr_id?: string }>
+    }
+    const landingEntry = res.turns.find(t => t.turn_id === landing.id)!
+    expect(landingEntry.is_landing).toBe(true)
+    expect(landingEntry.landing_kind).toBe('unknown')
+    expect(landingEntry.paired_sr_id).toBeUndefined()
+  })
+
+  it('cascading rewinds produce two paired SRs, each tagged independently', async () => {
+    // Sequence: target1 → r1 → SR1 + landing1 → r2 (built atop landing1) →
+    // SR2 + landing2 → head. Both SRs and both landings should appear, each
+    // with correct pairing.
+    //
+    // Explicit srSealedAt avoids ms-resolution ties between Date.now() calls
+    // when the test runs fast. mostRecentForkableRevision picks the row with
+    // largest (sealed_at, id) — without explicit ordering, which row counts
+    // as "head" is non-deterministic and can exclude an SR from the list.
+    const t0 = Date.now()
+    const target1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 't1' }])
+    const r1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'r1' }])
+    const pair1 = await emitForkPair(fx, {
+      parent: r1,
+      target: target1,
+      kind: 'rewind',
+      landingMessages: [{ role: 'user', content: 'land1' }],
+      syntheticAssistantText: 'SR1 said.',
+      srSealedAt: t0 - 2,
+    })
+    const r2 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'r2' }])
+    const pair2 = await emitForkPair(fx, {
+      parent: r2,
+      target: pair1.landing,
+      kind: 'submit',
+      landingMessages: [{ role: 'user', content: 'land2' }],
+      syntheticAssistantText: 'SR2 said.',
+      srSealedAt: t0 - 1,
+    })
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'head' }])
+
+    const res = await call(fx, 'recall', {}) as {
+      turns: Array<{
+        turn_id: string
+        kind: string
+        is_landing?: boolean
+        landing_kind?: string
+        paired_sr_id?: string
+        synthetic_assistant_text?: string
+        paired_landing_id?: string
+      }>
+    }
+    const land1 = res.turns.find(t => t.turn_id === pair1.landing.id)!
+    const land2 = res.turns.find(t => t.turn_id === pair2.landing.id)!
+    const sr1 = res.turns.find(t => t.turn_id === pair1.srId)!
+    const sr2 = res.turns.find(t => t.turn_id === pair2.srId)!
+
+    expect(land1.is_landing).toBe(true)
+    expect(land1.landing_kind).toBe('rewind')
+    expect(land1.paired_sr_id).toBe(pair1.srId)
+
+    expect(land2.is_landing).toBe(true)
+    expect(land2.landing_kind).toBe('submit')
+    expect(land2.paired_sr_id).toBe(pair2.srId)
+
+    expect(sr1.kind).toBe('rewind_marker')
+    expect(sr1.synthetic_assistant_text).toBe('SR1 said.')
+    expect(sr1.paired_landing_id).toBe(pair1.landing.id)
+
+    expect(sr2.kind).toBe('submit_marker')
+    expect(sr2.synthetic_assistant_text).toBe('SR2 said.')
+    expect(sr2.paired_landing_id).toBe(pair2.landing.id)
   })
 })
 
@@ -447,12 +678,12 @@ describe('recall (detail mode)', () => {
     const t2 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
     const t3 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
     const res = await call(fx, 'recall', { turn_id: t3.id, verbose: true }) as {
-      turn: { turn_id: string, classification: string, preview: string }
+      turn: { turn_id: string, classification: string, user: string }
       preceding_open_turns: string[]
     }
     expect(res.turn.turn_id).toBe(t3.id)
     expect(res.turn.classification).toBe('closed_forkable')
-    expect(res.turn.preview).toBe('q3')
+    expect(res.turn.user).toBe('q3')
     expect(res.preceding_open_turns).toEqual([t2.id, t1.id])
   })
 
@@ -462,10 +693,10 @@ describe('recall (detail mode)', () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }])
     // Most recent settled is "third"; turn_back_n=1 means walk one closed_forkable
     // back from there → "second".
-    const res = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
-    expect(res.turn.preview).toBe('second')
-    const res2 = await call(fx, 'recall', { turn_back_n: 2 }) as { turn: { preview: string } }
-    expect(res2.turn.preview).toBe('first')
+    const res = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { user: string } }
+    expect(res.turn.user).toBe('second')
+    const res2 = await call(fx, 'recall', { turn_back_n: 2 }) as { turn: { user: string } }
+    expect(res2.turn.user).toBe('first')
   })
 
   it('errors on turn_id from a different session', async () => {

@@ -977,8 +977,19 @@ async function dispatch(
   // peek (not consume) because we commit (delete) only after the upstream
   // call completes with 2xx. On 5xx / abort / upstream_error the TOBE stays
   // so Claude Code's retry loop re-applies it automatically.
-  const isMessagesPath = (req.url ?? '').includes('/messages')
-  const pending = isMessagesPath ? ctx.tobeStore.peek(sessionId) : null
+  // Two predicates because /v1/messages and /v1/messages/count_tokens are
+  // different endpoints with different semantics. count_tokens computes token
+  // cost of a message body — no AI invocation, no conversation mutation.
+  // Running TOBE swap, branch_context_rewrite (and the divergence guard
+  // inside it), or cache_control capping on count_tokens is wrong on every
+  // axis: pollutes responses, false-triggers releases (b17275fb 2026-05-08
+  // 11:55:25 forensic — the released fork was triggered by a count_tokens
+  // probe whose 121-byte body had no asst-text from branch_context, failing
+  // the continuity check), over-caps markers count_tokens doesn't respect.
+  const url = req.url ?? ''
+  const isMessagesPath = url.includes('/messages')
+  const isMessagesEndpoint = isMessagesPath && !url.includes('/count_tokens')
+  const pending = isMessagesEndpoint ? ctx.tobeStore.peek(sessionId) : null
   let bodyToForward = rawBody
   let tobeAppliedFrom: {
     fork_point_revision_id: string
@@ -1027,7 +1038,7 @@ async function dispatch(
       sessionId,
     )
   }
-  else if (isMessagesPath && ctx.db) {
+  else if (isMessagesEndpoint && ctx.db) {
     // No TOBE pending — check if this session is on a forked branch and, if
     // so, rewrite messages so the upstream sees the forked context plus
     // claude's new user input. Non-fork sessions skip this entirely.
@@ -1076,7 +1087,7 @@ async function dispatch(
   // latest markers (system + tools + tail messages) because the tail caches
   // a progressively longer prefix via Anthropic's 20-block lookback —
   // see capCacheControlBlocks doc for the why.
-  if (isMessagesPath) {
+  if (isMessagesEndpoint) {
     try {
       const parsed = JSON.parse(bodyToForward.toString('utf8')) as {
         system?: unknown

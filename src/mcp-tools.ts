@@ -365,6 +365,47 @@ function firstChild(db: DB, parentRevisionId: string): RevisionRow | undefined {
 }
 
 /**
+ * Concat all `type='text'` blocks of a leaf message's content (joined by
+ * newline). Handles both string content and array content. Naturally skips
+ * `thinking`, `tool_use`, and `tool_result` blocks because they're not
+ * `type='text'`. Returns empty string if no text content found.
+ *
+ * claude code can split a single user turn into multiple text blocks
+ * (`<system-reminder>` wrappers + the user's actual prompt as separate
+ * blocks). Picking only the first block would see the reminder alone;
+ * combining lets downstream callers see the whole thing.
+ */
+function messageText(msg: unknown): string {
+  if (!msg || typeof msg !== 'object') return ''
+  const m = msg as { content?: unknown }
+  if (typeof m.content === 'string') return m.content
+  if (!Array.isArray(m.content)) return ''
+  return (m.content as Array<{ type?: string, text?: string }>)
+    .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+    .map(b => b.text!)
+    .join('\n')
+}
+
+/**
+ * Resolve a possibly-link-shaped messages[] entry to its leaf object.
+ * Top-blob storage uses `{ '/': cid }` link refs; this fetches the leaf
+ * blob and parses. Returns null on any miss / parse failure (defensive).
+ */
+function resolveLeaf(db: DB, m: unknown): { role?: string, content?: unknown } | null {
+  if (!m || typeof m !== 'object') return null
+  if ('/' in m && typeof (m as { '/': unknown })['/'] === 'string') {
+    const leafBlob = db.prepare('SELECT bytes FROM blobs WHERE cid = ?').get((m as { '/': string })['/']) as { bytes: Buffer } | undefined
+    if (!leafBlob) return null
+    try {
+      return JSON.parse(leafBlob.bytes.toString('utf8'))
+    }
+    catch { return null }
+  }
+  if ('role' in m) return m as { role?: string, content?: unknown }
+  return null
+}
+
+/**
  * Synchronous probe: does this revision's request body's last user message
  * match a known harness pseudo-prompt? Used by effectiveHead / nthForkableBack /
  * countForkableBack / forkableSequence to skip injection turns when computing
@@ -390,35 +431,9 @@ function isHarnessInjectionRevision(db: DB, revisionId: string): boolean {
   if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) return false
   // Walk last user message in the messages array.
   for (let i = parsed.messages.length - 1; i >= 0; i--) {
-    const m = parsed.messages[i]
-    let leaf: { role?: string, content?: unknown } | null = null
-    if (m && typeof m === 'object' && '/' in m && typeof (m as { '/': unknown })['/'] === 'string') {
-      const leafBlob = db.prepare('SELECT bytes FROM blobs WHERE cid = ?').get((m as { '/': string })['/']) as { bytes: Buffer } | undefined
-      if (!leafBlob) continue
-      try {
-        leaf = JSON.parse(leafBlob.bytes.toString('utf8'))
-      }
-      catch { continue }
-    }
-    else if (m && typeof m === 'object' && 'role' in m) {
-      leaf = m as { role?: string, content?: unknown }
-    }
+    const leaf = resolveLeaf(db, parsed.messages[i])
     if (!leaf || leaf.role !== 'user') continue
-    // Concat ALL text blocks (joined by newline) — claude code can split a
-    // single user turn into multiple text blocks (e.g., `<system-reminder>`
-    // wrapper + `<system-reminder>` skills list + user's actual prompt as
-    // separate blocks). Picking only the first block would see the reminder
-    // alone and misclassify the turn as injection. Combining lets
-    // isInjectionText's strip-reminder logic see the whole thing and
-    // recognize the real prompt that survives stripping.
-    let text = ''
-    if (typeof leaf.content === 'string') text = leaf.content
-    else if (Array.isArray(leaf.content)) {
-      text = (leaf.content as Array<{ type?: string, text?: string }>)
-        .filter(b => b && b.type === 'text' && typeof b.text === 'string')
-        .map(b => b.text!)
-        .join('\n')
-    }
+    const text = messageText(leaf)
     if (!text) return false
     return isInjectionText(text)
   }
@@ -547,69 +562,87 @@ function isInjectionText(text: string): boolean {
 }
 
 /**
- * Extract a ≤80-char content preview from a revision's request body. Used by
- * `recall` to show the AI what each forkable turn was about without dumping
- * the full conversation. Resolves the body via the events table and walks
- * back through user messages, skipping harness pseudo-prompts (recap and
- * suggest-mode injections), to find the user's actual input that drove
- * this turn.
+ * Extract `user` and `prior_asst` previews from a revision's request body.
  *
- * Returns a short placeholder string if the body is unavailable, empty, or
- * carries only non-text content blocks (images, tool_use, etc.). Failures
- * are non-fatal — the preview is informational, not load-bearing.
+ * Conceptually each turn is a (user, assistant_response) pair where the user
+ * message is at the body's tail and the assistant_response is the next /v1/
+ * messages's response. For preview purposes we show the (user, prior_asst)
+ * tuple — the user message of THIS turn, and the assistant message that
+ * came BEFORE it (= the prior turn's response). Together these locate the
+ * turn in conversation flow without needing to fetch the next turn's body.
+ *
+ * Walks the body's messages array backward:
+ *   1. Find the last user-role message, skipping harness pseudo-prompts
+ *      (recap hooks, SUGGESTION MODE) when a real user message exists; fall
+ *      back to the injection text if every user is an injection.
+ *   2. From that user's index, walk further back to find the most recent
+ *      assistant-role message with non-empty text. That's `prior_asst`.
+ *
+ * Both fields are truncated to `maxLen` chars (default 100) with "…" suffix.
+ * `prior_asst` is null when no asst exists before the user (e.g., session
+ * start). On body lookup failure, returns placeholder strings so the recall
+ * list still has something to show.
  */
 async function turnPreview(
   deps: { db: DB, storageProvider: StorageProvider },
   revisionId: string,
-  maxLen = 80,
-): Promise<string> {
+  maxLen = 100,
+): Promise<{ user: string, prior_asst: string | null }> {
   const cid = requestBodyCidFor(deps.db, revisionId)
-  if (!cid) return '(no body)'
+  if (!cid) return { user: '(no body)', prior_asst: null }
   const messages = await hydrateMessages(deps, cid as AssetId)
-  if (!messages || messages.length === 0) return '(empty body)'
+  if (!messages || messages.length === 0) return { user: '(empty body)', prior_asst: null }
+
   // Walk back through user messages until we find one that isn't a harness
   // injection. Fall back to the most-recent injection text if every user
-  // message in scope is one (better than empty placeholder so the AI sees
-  // SOMETHING when listing turns).
-  let firstInjectionMatch: string | null = null
+  // message in scope is one.
+  let userIdx = -1
+  let firstInjection: { idx: number, text: string } | null = null
   for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as { role?: string, content?: unknown } | undefined
+    const m = messages[i] as { role?: string } | undefined
     if (m?.role !== 'user') continue
-    // Concat ALL text blocks — same reason as isHarnessInjectionRevision:
-    // claude code can split user content into multiple text blocks (system-
-    // reminder wrapper + real prompt as separate blocks). Picking just the
-    // first would show the reminder text in previews instead of the prompt
-    // the user actually typed.
-    let text = ''
-    if (typeof m.content === 'string') {
-      text = m.content
-    }
-    else if (Array.isArray(m.content)) {
-      const textBlocks = m.content
-        .filter((b: unknown): b is { type: string, text: string } =>
-          typeof b === 'object' && b !== null
-          && (b as { type?: unknown }).type === 'text'
-          && typeof (b as { text?: unknown }).text === 'string',
-        )
-        .map(b => b.text)
-      text = textBlocks.length > 0 ? textBlocks.join('\n') : '(non-text content)'
-    }
-    text = text.replace(/\s+/g, ' ').trim()
-    if (text.length === 0) continue
+    const text = messageText(messages[i]).replace(/\s+/g, ' ').trim()
+    if (!text) continue
     if (isInjectionText(text)) {
-      // Remember the most-recent injection text in case we never find a
-      // real user message; loop continues to look for one.
-      if (firstInjectionMatch === null) firstInjectionMatch = text
+      if (firstInjection === null) firstInjection = { idx: i, text }
       continue
     }
-    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text
+    userIdx = i
+    break
   }
-  if (firstInjectionMatch !== null) {
-    return firstInjectionMatch.length > maxLen
-      ? `${firstInjectionMatch.slice(0, maxLen - 1)}…`
-      : firstInjectionMatch
+  let userText: string
+  let userIdxFinal: number
+  if (userIdx >= 0) {
+    userText = messageText(messages[userIdx]).replace(/\s+/g, ' ').trim()
+    userIdxFinal = userIdx
   }
-  return '(no user message)'
+  else if (firstInjection) {
+    userText = firstInjection.text
+    userIdxFinal = firstInjection.idx
+  }
+  else {
+    return { user: '(no user message)', prior_asst: null }
+  }
+
+  // Walk further back from the user's index to find the most recent assistant
+  // message with non-empty text. That's the prior_asst (= the response BEFORE
+  // this turn's user message arrived).
+  let priorAsstText: string | null = null
+  for (let i = userIdxFinal - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string } | undefined
+    if (m?.role !== 'assistant') continue
+    const text = messageText(messages[i]).replace(/\s+/g, ' ').trim()
+    if (text) {
+      priorAsstText = text
+      break
+    }
+  }
+
+  const truncate = (s: string) => s.length > maxLen ? `${s.slice(0, maxLen - 1)}…` : s
+  return {
+    user: truncate(userText),
+    prior_asst: priorAsstText ? truncate(priorAsstText) : null,
+  }
 }
 
 // ─── Confirm token store (Decision #6: opaque dual-secret) ───────────────────
@@ -1180,7 +1213,8 @@ export function createMcpToolsWithTokens(
         const lean = {
           turn_id: target.id,
           kind: turnKindFor(target.stop_reason),
-          preview,
+          user: preview.user,
+          prior_asst: preview.prior_asst,
           stop_reason: target.stop_reason,
           sealed_at: target.sealed_at,
         }
@@ -1340,19 +1374,119 @@ export function createMcpToolsWithTokens(
           `).get(sess.task_id, headId) as { n: number }).n
         : 0
 
-      const turnEntries = await Promise.all(rows.map(async (r, idx) => {
-        const preview = await turnPreview(deps, r.id)
-        const lean = {
-          turn_id: r.id,
-          kind: turnKindFor(r.stop_reason) as 'turn' | 'rewind_marker' | 'submit_marker' | 'release_marker',
-          n_back: (offset + idx + 1) as number | null, // matches rewind_to(turn_back_n=N)
-          preview,
-          stop_reason: r.stop_reason as string | null,
-          sealed_at: r.sealed_at,
-          release_reason: undefined as string | undefined,
+      // Pre-fetch landing-turn metadata and SR R3' content from fork.forked
+      // events. Done in one query each so we don't N+1 against events.
+      //
+      // landingKinds: revision_id (a "landing turn", i.e., id ∈ fork.forked.
+      //   to_revision_id set) → kind from fork.forked.payload.kind.
+      // srToR3: SR revision_id → synthetic_assistant_text (R3').
+      // landingToSR: landing turn id → its paired SR id (1:1 from fork.forked).
+      const forkForkedEvents = deps.db.prepare(`
+        SELECT payload FROM events WHERE topic='fork.forked' AND session_id=?
+      `).all(ctx.sessionId) as Array<{ payload: string }>
+      const landingKinds = new Map<string, 'rewind' | 'submit' | 'unknown'>()
+      const srToR3 = new Map<string, string>()
+      const landingToSR = new Map<string, string>()
+      const srToLanding = new Map<string, string>()
+      for (const ev of forkForkedEvents) {
+        try {
+          const p = JSON.parse(ev.payload) as {
+            kind?: 'rewind' | 'submit'
+            to_revision_id?: string
+            synthetic_revision_id?: string
+            synthetic_assistant_text?: string
+          }
+          const kind = p.kind ?? 'unknown'
+          if (p.to_revision_id) {
+            landingKinds.set(p.to_revision_id, kind)
+            if (p.synthetic_revision_id) {
+              landingToSR.set(p.to_revision_id, p.synthetic_revision_id)
+              srToLanding.set(p.synthetic_revision_id, p.to_revision_id)
+            }
+          }
+          if (p.synthetic_revision_id && p.synthetic_assistant_text) {
+            srToR3.set(p.synthetic_revision_id, p.synthetic_assistant_text)
+          }
         }
-        if (!verbose) return lean
-        return { ...lean, created_at: r.created_at as number | undefined }
+        catch { /* skip malformed */ }
+      }
+
+      // Orphan landings: turns with tobe_applied_from in their request_received
+      // event but no matching fork.forked (rewind succeeded mid-stream but the
+      // tool_use chain never closed with end_turn, or pending_synthetic_json
+      // never resolved). Mark as 'unknown' kind. Same query as fork.forked but
+      // for proxy.request_received with tobe_applied_from.
+      const orphanLandingRows = deps.db.prepare(`
+        SELECT event_id FROM events
+         WHERE session_id=? AND topic='proxy.request_received'
+           AND json_extract(payload, '$.tobe_applied_from') IS NOT NULL
+      `).all(ctx.sessionId) as Array<{ event_id: string }>
+      for (const r of orphanLandingRows) {
+        if (!landingKinds.has(r.event_id)) landingKinds.set(r.event_id, 'unknown')
+      }
+
+      type TurnEntry = {
+        turn_id: string
+        kind: 'turn' | 'rewind_marker' | 'submit_marker' | 'release_marker'
+        n_back: number | null
+        user: string | undefined
+        prior_asst: string | null | undefined
+        stop_reason: string | null
+        sealed_at: number | null
+        release_reason?: string
+        is_landing?: boolean
+        landing_kind?: 'rewind' | 'submit' | 'unknown'
+        paired_sr_id?: string
+        synthetic_assistant_text?: string
+        paired_landing_id?: string
+        created_at?: number
+      }
+
+      const turnEntries: TurnEntry[] = await Promise.all(rows.map(async (r, idx) => {
+        const kind = turnKindFor(r.stop_reason) as 'turn' | 'rewind_marker' | 'submit_marker'
+        const isSR = kind === 'rewind_marker' || kind === 'submit_marker'
+        const r3 = isSR ? srToR3.get(r.id) : undefined
+        const isLanding = landingKinds.has(r.id)
+        const landingKind = isLanding ? landingKinds.get(r.id)! : undefined
+        const pairedSrId = isLanding ? landingToSR.get(r.id) : undefined
+
+        // SR rows with R3' available: skip body extraction (R2' is mechanic-
+        // only; R3' is the navigation-friendly assist content). Display
+        // surfaces synthetic_assistant_text instead of user/prior_asst.
+        // Legacy orphan SRs (no R3') fall through to body extraction.
+        let user: string | undefined
+        let prior_asst: string | null | undefined
+        if (isSR && r3) {
+          user = undefined
+          prior_asst = undefined
+        }
+        else {
+          const preview = await turnPreview(deps, r.id)
+          user = preview.user
+          prior_asst = preview.prior_asst
+        }
+
+        const lean: TurnEntry = {
+          turn_id: r.id,
+          kind,
+          n_back: offset + idx + 1,
+          user,
+          prior_asst,
+          stop_reason: r.stop_reason,
+          sealed_at: r.sealed_at,
+        }
+        if (isLanding) {
+          lean.is_landing = true
+          lean.landing_kind = landingKind
+          if (pairedSrId) lean.paired_sr_id = pairedSrId
+        }
+        if (isSR && r3) {
+          lean.synthetic_assistant_text = r3
+          const landingId = srToLanding.get(r.id)
+          if (landingId) lean.paired_landing_id = landingId
+        }
+        if (verbose) lean.created_at = r.created_at
+        return lean
       }))
 
       // Pull branch_context release/clear events for this session and inject
@@ -1424,7 +1558,7 @@ export function createMcpToolsWithTokens(
 
       const nextSteps = turns.length === 0
         ? 'No rewindable turns yet. The current state is `current_head_turn_id`. After more turns close, call `recall` again.'
-        : 'To inspect a turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches the `n_back` of the target turn (or pass `turn_id` directly). Entries with `kind: "rewind_marker"` or `"submit_marker"` are synthetic departure points from earlier rewinds/submits — you can rewind back to them or dump them just like real turns. Entries with `kind: "release_marker"` mark moments when an active branch_context was released (state divergence, /compact, /clear, or 8 MiB overflow); they\'re not rewindable themselves, but they tell you when forks ended. To save the current spot, call `bookmark`. To list saved spots, call `list_branches`.'
+        : 'Each turn entry has a `user` field (the human prompt) and a `prior_asst` field (the assistant\'s preceding reply that this user prompt was responding to). Read them as a (assistant → user) pair to recover the conversational beat. Entries with `is_landing: true` are the first turn that landed inside a forked branch — they typically appear right above their paired SR (kind: "rewind_marker" or "submit_marker") which exposes `synthetic_assistant_text` (the assist text the rewinding AI was told it had said when the fork was created). Reading the SR\'s `synthetic_assistant_text` together with the landing turn\'s `user` shows the synthetic bridge. Orphan landings (no paired SR) carry `landing_kind: "unknown"`. Entries with `kind: "release_marker"` mark moments when an active branch_context was released (state divergence, /compact, /clear, or 8 MiB overflow); they\'re not rewindable themselves but tell you when forks ended. To inspect one turn, call `recall` with `turn_id` or `turn_back_n`. To rewind, call `rewind_to(turn_back_n=N, message="...")` where N matches `n_back` (or pass `turn_id` directly). To save the current spot, call `bookmark`; to list saved spots, call `list_branches`.'
 
       // rewind_events fields (rewind_events / rewind_events_total /
       // rewind_events_truncated) were dropped in v0.5.0. They've been replaced
