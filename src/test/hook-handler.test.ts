@@ -13,8 +13,8 @@ import http from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { BindingTable } from '../binding-table.js'
+import { type Channel, createChannel } from '../channel.js'
 import { type DB, migrate, openDb } from '../db.js'
-import { createEventProducer, type EventProducer } from '../events.js'
 import { handleSessionStartHook } from '../hook-handler.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
 
@@ -26,11 +26,11 @@ interface PostResponse {
 function startServer(
   db: DB,
   bindingTable: BindingTable,
-  producer: EventProducer,
+  channel: Channel,
 ): Promise<{ port: number, close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
-      void handleSessionStartHook(req, res, { db, bindingTable, producer })
+      void handleSessionStartHook(req, res, { db, bindingTable, channel })
     })
     server.on('error', reject)
     server.listen(0, '127.0.0.1', () => {
@@ -85,7 +85,7 @@ function eventsForTopic(db: DB, topic: string): unknown[] {
 describe('handleSessionStartHook', () => {
   let db: DB
   let bindingTable: BindingTable
-  let producer: EventProducer
+  let channel: Channel
   let port: number
   let close: () => Promise<void>
 
@@ -93,8 +93,8 @@ describe('handleSessionStartHook', () => {
     db = openDb({ path: ':memory:' })
     migrate(db)
     bindingTable = new BindingTable()
-    producer = createEventProducer(db, [])
-    const s = await startServer(db, bindingTable, producer)
+    channel = createChannel({ db })
+    const s = await startServer(db, bindingTable, channel)
     port = s.port
     close = s.close
   })

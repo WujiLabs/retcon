@@ -26,8 +26,8 @@ import http from 'node:http'
 
 import type { BindingTable } from './binding-table.js'
 import { ActorConflictError, rebindSession } from './binding-table.js'
+import type { Channel } from './channel.js'
 import type { DB } from './db.js'
-import type { EventProducer } from './events.js'
 import { SESSION_HEADER } from './proxy-handler.js'
 import { readBoundedBody } from './util/http-body.js'
 
@@ -36,7 +36,7 @@ const HOOK_MAX_BODY_BYTES = 64 * 1024
 export interface HookContext {
   readonly db: DB
   readonly bindingTable: BindingTable
-  readonly producer: EventProducer
+  readonly channel: Channel
 }
 
 export async function handleSessionStartHook(
@@ -111,7 +111,7 @@ export async function handleSessionStartHook(
         // return 409 to claude. The hook is advisory so claude continues;
         // new traffic stays attributed to transportId until reconciled.
         ctx.bindingTable.unset(transportId)
-        ctx.producer.emit(
+        await ctx.channel.submit(
           'session.actor_conflict',
           {
             binding_token: transportId,
@@ -128,7 +128,7 @@ export async function handleSessionStartHook(
       }
       throw err
     }
-    ctx.producer.emit(
+    await ctx.channel.submit(
       'session.rebound',
       { binding_token: transportId, session_id: sessionId, source },
       sessionId,
@@ -151,7 +151,7 @@ export async function handleSessionStartHook(
                  WHERE id = ? AND branch_context_json IS NOT NULL`)
       .run(sessionId)
     if (result.changes > 0) {
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'session.branch_context_cleared',
         { session_id: sessionId, source },
         sessionId,

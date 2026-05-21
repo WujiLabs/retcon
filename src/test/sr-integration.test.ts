@@ -20,10 +20,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { blobRefFromBytes, blobRefFromMessagesBody } from '../body-blob.js'
 import { type DB, migrate, openDb } from '../db.js'
+import { createChannel } from '../channel.js'
 import { createEventConsumer, createEventProducer } from '../events.js'
 import { ConfirmTokenStore, createMcpToolsWithTokens } from '../mcp-tools.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
-import { defaultProjectors, type ServerHandle, startServer } from '../server.js'
+import { defaultProjectors, defaultTasks, type ServerHandle, startServer } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 
@@ -57,13 +58,13 @@ async function setup(
 ): Promise<E2EFixture> {
   const db = openDb({ path: ':memory:' })
   migrate(db)
-  const producer = createEventProducer(db, defaultProjectors())
+  const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmpRoot = mkdtempSync(path.join(tmpdir(), 'sr-int-'))
   const tobeStore = createTobeStore(tmpRoot)
   const mock = await startMock(upstreamHandler)
   const proxy = await startServer({
     port: 0,
-    producer,
+    channel,
     tobeStore,
     upstream: `http://127.0.0.1:${mock.port}`,
     db,
@@ -206,7 +207,7 @@ describe('SR end-to-end (Phase 4)', () => {
     // Drive rewind_to via MCP — two-step token flow.
     const tobeStore = createTobeStore(fx.tmpRoot)
     const storage = new SqliteStorageProvider(fx.db)
-    const proxyProducer = createEventProducer(fx.db, defaultProjectors())
+    const proxyChannel = createChannel({ db: fx.db, tasks: await defaultTasks() })
     const tools = createMcpToolsWithTokens(
       { db: fx.db, tobeStore, storageProvider: storage, rewindEnabled: true },
       { rewind: new ConfirmTokenStore(), submit: new ConfirmTokenStore() },
@@ -214,11 +215,11 @@ describe('SR end-to-end (Phase 4)', () => {
     const rewindTool = tools.get('rewind_to')!
     const first = await rewindTool.handler(
       { turn_back_n: 1, message: 'switch to plan B' },
-      { sessionId, producer: proxyProducer },
+      { sessionId, channel: proxyChannel },
     ) as { confirm_clean: string }
     const second = await rewindTool.handler(
       { turn_back_n: 1, message: 'switch to plan B', confirm: first.confirm_clean },
-      { sessionId, producer: proxyProducer },
+      { sessionId, channel: proxyChannel },
     ) as { status: string }
     expect(second.status).toBe('scheduled')
 

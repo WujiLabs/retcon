@@ -21,6 +21,7 @@ import { handleActorRegister } from './actor-register.js'
 import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
 import { applyTask, type Task, taskRef } from './channel-types.js'
+import type { Channel } from './channel.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'
@@ -174,7 +175,7 @@ export interface ServerOptions {
   /** Full override of the upstream target. Defaults to the Anthropic API base. */
   upstream?: string
   /** Required: where events get emitted. */
-  producer: EventProducer
+  channel: Channel
   /** Required: file-based TOBE state (per-session). */
   tobeStore: TobeStore
   /** Optional: override the default header redaction list. */
@@ -219,7 +220,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const forkAwaiter = options.forkAwaiter ?? new ForkAwaiter()
   const bindingTable = new BindingTable()
   const proxyCtx: ProxyContext = {
-    producer: options.producer,
+    channel: options.channel,
     sessionQueue,
     tobeStore: options.tobeStore,
     redactSet: options.redactSet ?? DEFAULT_REDACTED_HEADERS,
@@ -229,7 +230,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
     db: options.db,
   }
   const mcpCtx: McpContext = {
-    producer: options.producer,
+    channel: options.channel,
     tools: options.mcpTools ?? new Map(),
     sessionQueue, // shared with the /v1/* proxy so tools/call serializes with /v1/messages
     bindingTable,
@@ -294,7 +295,7 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
       void handleSessionStartHook(req, res, {
         db: options.db,
         bindingTable,
-        producer: options.producer,
+        channel: options.channel,
       })
       return
     }

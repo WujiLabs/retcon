@@ -1,116 +1,137 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 //
-// In-tree Channel facade — Step 1 of the @playtiss/core/channel extraction.
+// In-tree Channel facade — Step 1 v3 of the @playtiss/core/channel extraction.
 //
-// Wraps retcon's existing event log with the Task-shaped API the channel
-// package will expose in Step 2. Tasks register with declarative TaskRef
-// dependencies; the runner topo-sorts and dispatches synchronously inside
-// emit's BEGIN IMMEDIATE.
+// PROTOCOL ALIGNMENT (the v2 → v3 fix):
 //
-// Channel API surface (final v0.3 shape):
-//   - emit(topic, payload, sessionId, blobs?)        — atomic write
-//   - storage: StorageProvider                        — re-exposed
-//   - registerTask(task)                              — record + topo-sort
-//   - taskMetadata(taskId): KV<string, string>        — per-Task K/V
-//   - db: DB                                          — direct SQL for Tasks
+// v2's `channel.emit()` delegated to createEventProducer, which ran event row
+// insertion + projector apply() in one outer BEGIN IMMEDIATE. If a projector
+// threw, the whole tx rolled back — including the event row. That violated
+// L1.2 (No Errors), L1.8 (Sovereign Ownership of Outcomes), L1.10 (Explicit
+// Discarding), and L2.4 (Resolution mediation): the event commit became
+// contingent on every downstream projector's resolver accepting, which is
+// backwards. The event append IS a Resolution outcome (the channel's
+// event-log Reference, trivially auto-accepted); each projector's apply()
+// is a SEPARATE Resolution outcome on a different Reference
+// (`revisions_of(projector_task)`).
 //
-// What Channel does NOT have (deferred to v0.4 when arianna lands):
-//   - subscribe(target, opts): AsyncIterable          — pull-based reads
-//   - propose / resolve / setResolver                 — non-trivial Resolution
-//   - ref(name): Reference                            — L2.3 binding history
+// v3 corrects this:
 //
-// Why Step 1 keeps the EventProducer shape internally: existing retcon code
-// (proxy-handler, mcp-tools, etc.) imports `producer.emit(...)`. The Channel
-// produces the same EventProducer surface so callers don't need rewrites.
-// Step 3 will swap them to import from `@playtiss/core/channel` directly.
+//   1. submit() is async (returns Promise<SubmitResult>) — the L4 verb
+//      shape. Local sqlite resolves on the same microtask (effectively
+//      sync) but the SHAPE is async so future cross-process channels swap
+//      in without breaking callers.
+//
+//   2. Per-projector SAVEPOINTs. The outer BEGIN IMMEDIATE stays as a
+//      retcon-local optimization (one fsync per submit), but each projector
+//      gets its own savepoint. Exceptions roll back the projector's partial
+//      writes without voiding the event row or earlier accepted projectors.
+//
+//   3. Outcomes are recorded. Each projector's accept/exception goes into
+//      SubmitResult.outcomes for callers that care. Exception outcomes are
+//      additionally recorded as substrate events (topic:
+//      'projection.exception') per L1.10 Explicit Discarding. Accept
+//      outcomes stay implicit in projection_offsets for v0.3 (Q1=c);
+//      v0.4 can add 'projection.accept' events additively.
+//
+//   4. submit() naming follows L4 verb vocabulary. Reference implementation
+//      naming matters; consumers reading retcon's source learn protocol
+//      verbs by exposure.
+//
+// What this file does NOT do (the substrate package owns these):
+//   - subscribe() AsyncIterable (deferred to v0.4 when arianna lands)
+//   - propose / resolve / setResolver beyond trivial auto-accept (v0.4)
+//   - ref(name) Reference primitive (v0.4)
+//   - save() as separate verb from submit() (v0.4 if needed)
+//
+// What retcon's caller code does NOT need to know:
+//   - The SAVEPOINT machinery — that's an impl detail of the local channel.
+//   - The 'projection.exception' topic — readers query the outcomes array
+//     via SubmitResult, not via substrate events directly.
 
-import type { StorageProvider } from '@playtiss/core'
+import {
+  generateOperationId,
+  type StorageProvider,
+  type TraceId,
+  TraceIdGenerator,
+} from '@playtiss/core'
 
 import {
   type KV,
+  type Outcome,
+  type SubmitResult,
   type Task,
   type TaskId,
 } from './channel-types.js'
 import type { DB } from './db.js'
 import {
   type BlobRef,
-  createEventProducer,
   type Event,
-  type EventProducer,
-  type Projection,
 } from './events.js'
-import { topoSort } from './projector-runner.js'
+import { buildTopicIndex, dispatchOrderForTopic, topoSort } from './projector-runner.js'
 import { SqliteStorageProvider } from './storage.js'
 
 /**
- * Adapt a {@link Task} as a legacy {@link Projection}. The producer's
- * array-order dispatch becomes our dep-order dispatch when the array is
- * topo-sorted. `subscribedTopics` mirrors `input.topics`; projection `id`
- * mirrors `task.id` (so `projection_offsets` indexes by TaskId — what
- * `taskMetadata.get('events_offset')` reads).
+ * The Channel interface — substrate primitives (L2) shaped as L4 verbs.
+ *
+ * v0.3 ships ONLY submit() (and the Task-registration / metadata helpers).
+ * Other L4 verbs (save / resolve / subscribe / mount / exit) deferred until
+ * a consumer needs them. Adding them later is purely additive.
  */
-function taskToProjection(task: Task): Projection {
-  const topics = (task.input.topics ?? []) as string[]
-  return {
-    id: task.id,
-    subscribedTopics: topics,
-    apply: (event, tx) => task.apply(event, tx),
-  }
-}
-
 export interface Channel {
   /**
-   * Append an event to the log (atomic + monotonic). Synchronously dispatches
-   * to every registered Task whose `input.topics` includes this topic, in
-   * dependency order, inside the same BEGIN IMMEDIATE transaction.
+   * L4 Submit — record an event in the substrate, dispatch to subscribed
+   * Tasks, return the per-Task outcomes.
    *
-   * Same shape as {@link EventProducer.emit} — preserved for back-compat.
+   * Async by shape — local sqlite resolves on the same microtask. The
+   * caller doesn't get a usable affordance for parallelism inside the
+   * submit (it's atomic per the outer BEGIN IMMEDIATE), but the SHAPE
+   * is async so future cross-process channels swap in without breaking
+   * callers.
+   *
+   * The event row lands UNCONDITIONALLY. Projector exceptions do not
+   * void the event. They're captured as Outcome.exception entries in
+   * SubmitResult.outcomes AND recorded as substrate events with
+   * topic 'projection.exception' (L1.10 Explicit Discarding).
+   *
+   * Channel-level failures (DB I/O, constraint violations on the event
+   * itself) propagate as Promise rejection — distinct from projector
+   * exceptions, which are part of the resolved outcome.
    */
-  emit<P>(
+  submit<P>(
     topic: string,
     payload: P,
     sessionId: string | null,
     referencedBlobs?: ReadonlyArray<BlobRef>,
-  ): Event<P>
+  ): Promise<SubmitResult<P>>
 
   /** Content-addressed blob storage. Re-exposed from the underlying DB. */
   readonly storage: StorageProvider
 
   /**
-   * Register a Task. Idempotent (same TaskId → no-op). Throws on cycles or
-   * unregistered TaskRef dependencies (see {@link topoSort}).
-   *
-   * Re-runs topo-sort on every registration. For v0.3 Tasks register at boot,
-   * so the cost is paid once. If future code adds per-request Task
-   * registration, batch registration via a separate API.
+   * Register a Task. Idempotent (same TaskId → no-op). Topo-sort is lazy
+   * — deferred until first submit() so out-of-order registration works
+   * (e.g. register B then A where B has TaskRef(A.id); both must be
+   * registered before submit() resolves them).
    */
   registerTask(task: Task): void
 
   /**
-   * Per-Task key/value metadata. Backed by retcon's `projection_offsets`
-   * table in Step 1: `taskMetadata(id).get('events_offset')` reads
+   * Per-Task K/V metadata. Backed by retcon's `projection_offsets` table
+   * in v0.3: `taskMetadata(id).get('events_offset')` reads
    * `projection_offsets.last_processed_event_id WHERE projection_id = id`.
-   * Step 2 introduces a dedicated `task_metadata` table.
-   *
-   * Operations are synchronous and respect the DB's transactional context
-   * — calls inside an emit's transaction see uncommitted writes from
-   * earlier dispatches.
+   * Step 2 introduces a dedicated `task_metadata` table for multi-key
+   * support.
    */
   taskMetadata(taskId: TaskId): KV<string, string>
 
   /**
    * Direct DB handle — Tasks query the events table via SQL for catch-up,
-   * filtered reads, etc. v0.4 may hide this when `subscribe()` ships with
+   * filtered reads, etc. v0.4 may hide this when subscribe() ships with
    * AsyncIterable cursor semantics.
    */
   readonly db: DB
-
-  /**
-   * Underlying EventProducer interface. Code that already imports
-   * `producer.emit(...)` continues to work without rewrites.
-   */
-  readonly producer: EventProducer
 }
 
 export interface ChannelOptions {
@@ -125,43 +146,25 @@ export interface ChannelOptions {
 }
 
 /**
- * Build a Channel. Tasks dispatched synchronously on emit, in dep order,
- * inside the producer's BEGIN IMMEDIATE — preserving event/projection
- * atomicity from the legacy code path.
- *
- * Internally adapts each Task to the existing {@link Projection} interface:
- * the producer's array-order dispatch, when fed topo-sorted Tasks, IS the
- * dep-order dispatch we want. The producer's projection_offsets bookkeeping
- * matches exactly what we want for taskMetadata's `events_offset` key. Zero
- * new transactional code; zero atomicity gap.
- *
- * Step 2 will move this into `@playtiss/core/channel` and the EventProducer
- * abstraction goes away.
+ * Build a Channel. Tasks dispatched on submit, in dep order, inside an
+ * outer BEGIN IMMEDIATE (retcon-local optimization). Per-projector
+ * SAVEPOINTs isolate exceptions.
  */
 export function createChannel(opts: ChannelOptions): Channel {
   const { db } = opts
 
-  // Mutable Task registry. Topo-sort is LAZY — deferred until first emit so
-  // out-of-order registerTask() calls work (e.g. register B then A where B
-  // has TaskRef(A.id), TaskRef resolution happens at emit time once both
-  // are registered).
+  // One TraceIdGenerator per channel ensures monotonic event_id within
+  // this process (matches the prior createEventProducer's contract).
+  const idGen = new TraceIdGenerator(generateOperationId())
+
+  // Mutable Task registry. Topo-sort is LAZY — deferred until first
+  // submit() so registerTask() can be called in any order.
   const registered: Task[] = []
-  let producer: EventProducer | null = null
+  let dispatchByTopic: ReadonlyMap<string, Task[]> | null = null
 
   function rebuildDispatch(): void {
-    // Topo-sort registered Tasks; adapt each as a Projection so the
-    // producer's array-order dispatch becomes our dep-order dispatch.
-    // projection_offsets row keyed by Task id == projection id; the
-    // producer's existing offset-bump is exactly what taskMetadata's
-    // 'events_offset' get/set semantics expect.
-    const sortedTasks = topoSort(registered)
-    const adaptedProjections: Projection[] = sortedTasks.map(taskToProjection)
-    producer = createEventProducer(db, adaptedProjections)
-  }
-
-  function ensureProducer(): EventProducer {
-    if (!producer) rebuildDispatch()
-    return producer!
+    const sorted = topoSort(registered)
+    dispatchByTopic = buildTopicIndex(sorted)
   }
 
   if (opts.tasks) {
@@ -174,38 +177,144 @@ export function createChannel(opts: ChannelOptions): Channel {
   function registerTask(task: Task): void {
     if (registered.find(r => r.id === task.id)) return
     registered.push(task)
-    // Invalidate cached producer; rebuild lazily on next emit.
-    producer = null
+    // Invalidate cached dispatch; rebuild lazily on next submit.
+    dispatchByTopic = null
   }
 
-  function emit<P>(
+  function ensureDispatch(): ReadonlyMap<string, Task[]> {
+    if (!dispatchByTopic) rebuildDispatch()
+    return dispatchByTopic!
+  }
+
+  // Prepared statements — eager at channel construction. Matches the
+  // pattern in events.ts; lets TS infer Statement.run's variadic signature.
+  const insertBlob = db.prepare(
+    'INSERT OR IGNORE INTO blobs (cid, bytes, size, created_at) VALUES (?, ?, ?, ?)',
+  )
+  const insertEvent = db.prepare(
+    'INSERT INTO events (event_id, topic, payload, session_id, created_at) VALUES (?, ?, ?, ?, ?)',
+  )
+  const upsertOffset = db.prepare(
+    'INSERT INTO projection_offsets (projection_id, last_processed_event_id) VALUES (?, ?)'
+    + ' ON CONFLICT(projection_id) DO UPDATE SET last_processed_event_id = excluded.last_processed_event_id',
+  )
+
+  function submit<P>(
     topic: string,
     payload: P,
     sessionId: string | null,
     referencedBlobs?: ReadonlyArray<BlobRef>,
-  ): Event<P> {
-    // Producer dispatch is atomic with event write — same BEGIN IMMEDIATE
-    // wraps blobs + event row + each adapted Projection's apply() + each
-    // projection_offsets bump. Tasks see uncommitted projection writes
-    // from upstream Tasks in the same emit (e.g. branch_views_v1 reads
-    // revisions_v1's parent_revision_id write), as today.
-    return ensureProducer().emit(topic, payload, sessionId, referencedBlobs)
+  ): Promise<SubmitResult<P>> {
+    const topicIndex = ensureDispatch()
+
+    const now = Date.now()
+    const event: Event<P> = {
+      id: idGen.generate(),
+      topic,
+      payload,
+      sessionId,
+      createdAt: now,
+    }
+    const payloadStr = JSON.stringify(payload)
+    const subscribers = dispatchOrderForTopic(topic, topicIndex)
+    const outcomes: Outcome[] = []
+    // Exception outcomes need to be inserted as substrate events. We collect
+    // their (event id, payload) tuples during dispatch and insert AFTER the
+    // for-loop completes — but still inside the outer BEGIN IMMEDIATE so
+    // they land atomically with the source event. Each exception event gets
+    // a fresh TraceId from the same generator.
+    const exceptionEvents: Array<{ id: TraceId, payload: string }> = []
+
+    const tx = db.transaction(() => {
+      // 1. Blobs first — they're referenced by the event payload's body_cid.
+      if (referencedBlobs) {
+        for (const blob of referencedBlobs) {
+          insertBlob.run(blob.cid, blob.bytes, blob.bytes.byteLength, now)
+        }
+      }
+
+      // 2. Event row — lands FIRST and UNCONDITIONALLY. Projector exceptions
+      // below do NOT void this. (L1.2 / L1.8 / L1.10 / L2.4.)
+      insertEvent.run(event.id, event.topic, payloadStr, event.sessionId, event.createdAt)
+
+      // 3. Dispatch to subscribed Tasks in dep order, each in its own
+      // SAVEPOINT. Exceptions roll back the projector's partial writes
+      // but leave the event row + earlier accepted projectors intact.
+      // Outcomes recorded into the SubmitResult AND (for exceptions) as
+      // substrate events.
+      for (let i = 0; i < subscribers.length; i++) {
+        const task = subscribers[i]!
+        // SAVEPOINT name must be a valid SQL identifier. Use a sequence-tagged
+        // prefix + a short slice of the TaskId hash to keep names unique-
+        // per-dispatch + readable in logs.
+        const spName = `sp_${i}_${task.id.slice(-8).replace(/[^a-zA-Z0-9]/g, '_')}`
+        db.exec(`SAVEPOINT ${spName}`)
+        try {
+          task.apply(event, db)
+          db.exec(`RELEASE ${spName}`)
+          outcomes.push({ kind: 'accept', taskId: task.id })
+          // Bump the projection_offsets row for this Task — the accept
+          // outcome is implicit in this offset advancement (Q1=c).
+          upsertOffset.run(task.id, event.id)
+        }
+        catch (err) {
+          // Roll back this projector's partial writes to the savepoint.
+          // The event row + previously accepted projectors stay.
+          db.exec(`ROLLBACK TO ${spName}`)
+          // RELEASE after ROLLBACK TO is required to consume the savepoint
+          // (otherwise the savepoint stays open and subsequent SAVEPOINTs
+          // accumulate). Per SQLite docs.
+          db.exec(`RELEASE ${spName}`)
+          const errStr = err instanceof Error ? err.message : String(err)
+          outcomes.push({ kind: 'exception', taskId: task.id, error: errStr })
+          // Defer the substrate-event INSERT until after the dispatch loop
+          // completes. Doing it inline here would interleave projection.exception
+          // event_ids with the dispatched Tasks' offset bumps, which is fine
+          // but harder to reason about for monotonicity. We collect now,
+          // insert after — still inside the outer tx so atomicity holds.
+          exceptionEvents.push({
+            id: idGen.generate(),
+            payload: JSON.stringify({
+              source_event_id: event.id,
+              task_id: task.id,
+              error: errStr,
+            }),
+          })
+        }
+      }
+
+      // 4. Insert the projection.exception events recorded above. Still
+      // inside the outer tx — they land atomically with the source event
+      // and the accepted projectors' writes.
+      for (const ee of exceptionEvents) {
+        insertEvent.run(ee.id, 'projection.exception', ee.payload, event.sessionId, now)
+      }
+    })
+
+    try {
+      tx.immediate()
+    }
+    catch (err) {
+      // Channel-level failure (DB I/O, primary-key violation on event row,
+      // etc.). Distinct from projector exceptions — these surface as
+      // Promise rejection because there's no Outcome shape for "the
+      // channel itself failed."
+      return Promise.reject(err)
+    }
+
+    return Promise.resolve({ event, outcomes })
   }
 
   function taskMetadata(taskId: TaskId): KV<string, string> {
-    // Step 1: back the K/V with retcon's existing projection_offsets table.
-    // Convention: only the 'events_offset' key is used today; other keys are
+    // v0.3: back the K/V with retcon's existing projection_offsets table.
+    // Convention: only the 'events_offset' key is used today (the per-Task
+    // event-log cursor that bumps on each accept outcome). Other keys are
     // valid but currently unused. Step 2 introduces a generic task_metadata
     // table with composite (task_id, key) PK so multiple keys per Task work
     // without stretching projection_offsets' single-column schema.
     return {
       get(key) {
-        if (key !== 'events_offset') {
-          // Other keys aren't representable in projection_offsets's single-
-          // column schema. Treat as absent for v0.3 — Step 2 fixes when
-          // task_metadata lands.
-          return null
-        }
+        if (key !== 'events_offset') return null
         const row = db
           .prepare('SELECT last_processed_event_id FROM projection_offsets WHERE projection_id = ?')
           .get(taskId) as { last_processed_event_id: string } | undefined
@@ -226,19 +335,12 @@ export function createChannel(opts: ChannelOptions): Channel {
   }
 
   return {
-    emit,
+    submit,
     get storage(): StorageProvider {
-      // Construct on access; cheap (just wraps the DB handle).
       return new SqliteStorageProvider(db)
     },
     registerTask,
     taskMetadata,
     db,
-    get producer(): EventProducer {
-      // Expose so existing code that imports `producer` keeps working.
-      // Routes through Channel's emit (which lazy-builds the topo-sorted
-      // dispatching producer on first call).
-      return { emit }
-    },
   }
 }

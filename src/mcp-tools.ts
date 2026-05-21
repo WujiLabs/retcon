@@ -1518,7 +1518,7 @@ export function createMcpToolsWithTokens(
       if (deps.rewindEnabled === false) {
         const bodyBytes = Buffer.from(JSON.stringify({ message, ...parsed }), 'utf8')
         const inputsBlob = await blobRefFromBytes(bodyBytes)
-        ctx.producer.emit(
+        await ctx.channel.submit(
           'fork.back_disabled_rejected',
           { inputs_cid: inputsBlob.cid },
           ctx.sessionId,
@@ -1643,7 +1643,7 @@ export function createMcpToolsWithTokens(
          WHERE id = ?
       `).run(JSON.stringify(baseMessages), forkId, ctx.sessionId)
 
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'fork.back_requested',
         {
           source_view_id: ctx.sessionId,
@@ -1714,7 +1714,7 @@ export function createMcpToolsWithTokens(
       }
 
       const viewId = generateTraceId()
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'fork.bookmark_created',
         {
           view_id: viewId,
@@ -1802,7 +1802,7 @@ export function createMcpToolsWithTokens(
       }
       const target = matches[0]!
 
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'fork.bookmark_deleted',
         { view_id: target.id, task_id: target.task_id },
         ctx.sessionId,
@@ -2374,7 +2374,7 @@ export function createMcpToolsWithTokens(
          WHERE id = ?
       `).run(JSON.stringify(finalMessages), forkId, ctx.sessionId)
 
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'fork.back_requested',
         {
           source_view_id: ctx.sessionId,

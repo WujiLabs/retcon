@@ -26,7 +26,8 @@ import zlib from 'node:zlib'
 import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes, blobRefFromMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
-import type { BlobRef, EventProducer } from './events.js'
+import type { Channel } from './channel.js'
+import type { BlobRef } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import {
   clearPendingSynthetic,
@@ -100,7 +101,7 @@ function filterResponseHeaders(
 }
 
 export interface ProxyContext {
-  readonly producer: EventProducer
+  readonly channel: Channel
   readonly sessionQueue: SessionQueue
   readonly tobeStore: TobeStore
   readonly redactSet: ReadonlySet<string>
@@ -872,7 +873,7 @@ async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Pr
  * everything downstream is the same.
  */
 async function tryEmitForkForked(opts: {
-  producer: EventProducer
+  channel: Channel
   sessionId: string
   synthetic: import('./tobe.js').SyntheticDepartureMeta
   parent_revision_id: string
@@ -880,7 +881,7 @@ async function tryEmitForkForked(opts: {
   to_revision_id: string
   originalBodyBytes: Uint8Array
 }): Promise<void> {
-  const { producer, sessionId, synthetic: s } = opts
+  const { channel, sessionId, synthetic: s } = opts
   try {
     const built = await buildSyntheticAsset({
       originalBody: opts.originalBodyBytes,
@@ -889,7 +890,7 @@ async function tryEmitForkForked(opts: {
       syntheticAssistantText: s.synthetic_assistant_text,
     })
     if (built) {
-      producer.emit(
+      await channel.submit(
         'fork.forked',
         {
           kind: s.kind,
@@ -909,7 +910,7 @@ async function tryEmitForkForked(opts: {
       )
     }
     else {
-      producer.emit(
+      await channel.submit(
         'fork.synthesis_failed',
         {
           parent_revision_id: opts.parent_revision_id,
@@ -922,7 +923,7 @@ async function tryEmitForkForked(opts: {
   }
   catch (synthErr) {
     const errMsg = (synthErr as Error).message ?? String(synthErr)
-    producer.emit(
+    await channel.submit(
       'fork.synthesis_failed',
       {
         parent_revision_id: opts.parent_revision_id,
@@ -1014,7 +1015,7 @@ async function dispatch(
     // unchanged). Commit (delete) the TOBE so retries don't keep tripping.
     // Emit fork.synthesis_failed for audit.
     ctx.tobeStore.commit(sessionId)
-    ctx.producer.emit(
+    await ctx.channel.submit(
       'fork.synthesis_failed',
       {
         target_revision_id: pending.fork_point_revision_id,
@@ -1040,7 +1041,7 @@ async function dispatch(
       // (8 MiB). The column has been NULL'd; pass claude's body through
       // unchanged. The fork is now broken — claude's local view drives
       // future turns. Emit an audit event so the operator sees it.
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'session.branch_context_overflow',
         { session_id: sessionId, max_bytes: BRANCH_CONTEXT_MAX_BYTES },
         sessionId,
@@ -1055,7 +1056,7 @@ async function dispatch(
       // reminder injected beside the user's message so the AI sees the
       // release on this same turn and can mention it to the user; emit the
       // audit row either way.
-      ctx.producer.emit(
+      await ctx.channel.submit(
         'session.branch_context_released',
         { session_id: sessionId, reason: rewritten.releasedReason },
         sessionId,
@@ -1088,14 +1089,14 @@ async function dispatch(
       const ttlFixed = stripTtlViolations(parsed)
       const stripped = capCacheControlBlocks(parsed, MAX_CACHE_CONTROL_BLOCKS)
       if (ttlFixed > 0) {
-        ctx.producer.emit(
+        await ctx.channel.submit(
           'proxy.cache_control_ttl_violation_fixed',
           { session_id: sessionId, removed: ttlFixed },
           sessionId,
         )
       }
       if (stripped > 0) {
-        ctx.producer.emit(
+        await ctx.channel.submit(
           'proxy.cache_control_capped',
           { session_id: sessionId, removed: stripped, max: MAX_CACHE_CONTROL_BLOCKS },
           sessionId,
@@ -1140,7 +1141,7 @@ async function dispatch(
   // originalBodyBlob was already set in the `pending` branch above.
 
   // Emit proxy.request_received (atomic with blobs, per G1).
-  const requestEvent = ctx.producer.emit(
+  const { event: requestEvent } = await ctx.channel.submit(
     'proxy.request_received',
     {
       method: req.method ?? 'GET',
@@ -1183,14 +1184,14 @@ async function dispatch(
   await new Promise<void>((resolve) => {
     let responseStarted = false
     let terminalEmitted = false
-    const emitTerminal = (
+    const emitTerminal = async (
       topic: 'proxy.response_completed' | 'proxy.response_aborted' | 'proxy.upstream_error',
       payload: Record<string, unknown>,
-      refs?: Parameters<typeof ctx.producer.emit>[3],
-    ): void => {
+      refs?: Parameters<Channel['submit']>[3],
+    ): Promise<void> => {
       if (terminalEmitted) return
       terminalEmitted = true
-      ctx.producer.emit(topic, payload, sessionId, refs)
+      await ctx.channel.submit(topic, payload, sessionId, refs)
       // TOBE lifecycle: only commit (delete the pending file) when the
       // upstream call actually returned a non-5xx response. Every other
       // outcome (5xx body, client abort, upstream_error) keeps the file
@@ -1263,15 +1264,17 @@ async function dispatch(
         res.writeHead(502, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: err.message }))
       }
-      emitTerminal(
+      // emitTerminal is async; await before resolve() so the SessionQueue
+      // sees the terminal event landed before the next session-scoped
+      // request begins (G2 sequencing invariant).
+      void emitTerminal(
         'proxy.upstream_error',
         {
           request_event_id: requestEvent.id,
           status: 502,
           error_message: err.message,
         },
-      )
-      resolve()
+      ).then(() => resolve())
     })
 
     upstreamReq.on('response', (upstreamRes) => {
@@ -1320,14 +1323,13 @@ async function dispatch(
             })
             upstreamRes.on('error', (err) => {
               if (!res.writableEnded) res.destroy(err)
-              emitTerminal(
+              void emitTerminal(
                 'proxy.response_aborted',
                 {
                   request_event_id: requestEvent.id,
                   reason: `upstream_stream_error: ${err.message}`,
                 },
-              )
-              done()
+              ).finally(() => done())
             })
           })
 
@@ -1360,7 +1362,7 @@ async function dispatch(
           // out of the response-format business.
 
           if (clientAborted) {
-            emitTerminal(
+            await emitTerminal(
               'proxy.response_aborted',
               { request_event_id: requestEvent.id, reason: 'client_disconnect' },
             )
@@ -1372,7 +1374,7 @@ async function dispatch(
             // all hashing to happen before we enter the transaction.
             const asset = await computeRevisionAsset(bodyCid, respBodyBlob.cid)
             const status = upstreamRes.statusCode ?? 0
-            emitTerminal(
+            await emitTerminal(
               'proxy.response_completed',
               {
                 request_event_id: requestEvent.id,
@@ -1419,7 +1421,7 @@ async function dispatch(
               if (ctx.db) {
                 const prior = getPendingSynthetic(ctx.db, sessionId)
                 if (prior) {
-                  ctx.producer.emit(
+                  await ctx.channel.submit(
                     'fork.synthesis_failed',
                     {
                       parent_revision_id: prior.synthetic.parent_revision_id,
@@ -1434,7 +1436,7 @@ async function dispatch(
 
               if (isClosedForkable) {
                 await tryEmitForkForked({
-                  producer: ctx.producer,
+                  channel: ctx.channel,
                   sessionId,
                   synthetic: s,
                   parent_revision_id: s.parent_revision_id,
@@ -1455,7 +1457,7 @@ async function dispatch(
               }
               else {
                 // Dangling stop_reason or no DB: audit-fail.
-                ctx.producer.emit(
+                await ctx.channel.submit(
                   'fork.synthesis_failed',
                   {
                     parent_revision_id: s.parent_revision_id,
@@ -1486,7 +1488,7 @@ async function dispatch(
                     .prepare('SELECT bytes FROM blobs WHERE cid=?')
                     .get(persisted.original_body_cid) as { bytes: Uint8Array } | undefined
                   if (!blobRow) {
-                    ctx.producer.emit(
+                    await ctx.channel.submit(
                       'fork.synthesis_failed',
                       {
                         parent_revision_id: persisted.synthetic.parent_revision_id,
@@ -1498,7 +1500,7 @@ async function dispatch(
                   }
                   else {
                     await tryEmitForkForked({
-                      producer: ctx.producer,
+                      channel: ctx.channel,
                       sessionId,
                       synthetic: persisted.synthetic,
                       parent_revision_id: persisted.synthetic.parent_revision_id,
@@ -1514,7 +1516,7 @@ async function dispatch(
                 }
                 else {
                   // Dangling stop_reason mid-chain.
-                  ctx.producer.emit(
+                  await ctx.channel.submit(
                     'fork.synthesis_failed',
                     {
                       parent_revision_id: persisted.synthetic.parent_revision_id,
@@ -1542,7 +1544,7 @@ async function dispatch(
           else if (!res.writableEnded) {
             res.destroy(err as Error)
           }
-          emitTerminal(
+          await emitTerminal(
             'proxy.upstream_error',
             {
               request_event_id: requestEvent.id,

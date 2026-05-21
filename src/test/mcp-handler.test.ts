@@ -6,8 +6,9 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { createChannel } from '../channel.js'
 import { migrate, openDb } from '../db.js'
-import { createEventConsumer, type EventProducer } from '../events.js'
+import { createEventConsumer } from '../events.js'
 import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'
 
 // Test helper: build a minimal McpTool from just a handler. Real tools have
@@ -15,22 +16,22 @@ import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'
 function tool(handler: McpTool['handler'], description = 'test tool'): McpTool {
   return { handler, description, inputSchema: { type: 'object' } }
 }
-import { createDefaultProducer, type ServerHandle, startServer } from '../server.js'
+import { defaultTasks, type ServerHandle, startServer } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
-function fixture() {
+async function fixture() {
   const db = openDb({ path: ':memory:' })
   migrate(db)
-  const producer: EventProducer = createDefaultProducer(db)
+  const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmp = mkdtempSync(path.join(tmpdir(), 'mcp-test-'))
   const tobeStore: TobeStore = createTobeStore(tmp)
-  return { db, producer, tobeStore, tmp, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
+  return { db, channel, tobeStore, tmp, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
 }
 
-async function startWithTools(fx: ReturnType<typeof fixture>, tools: Map<string, McpTool>) {
+async function startWithTools(fx: Awaited<ReturnType<typeof fixture>>, tools: Map<string, McpTool>) {
   return startServer({
     port: 0,
-    producer: fx.producer,
+    channel: fx.channel,
     tobeStore: fx.tobeStore,
     mcpTools: tools,
   })
@@ -52,11 +53,11 @@ async function postJsonRpc(port: number, body: unknown, extraHeaders: Record<str
 }
 
 describe('MCP /mcp route', () => {
-  let fx: ReturnType<typeof fixture>
+  let fx: Awaited<ReturnType<typeof fixture>>
   let handle: ServerHandle | undefined
 
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(async () => {
     if (handle) {

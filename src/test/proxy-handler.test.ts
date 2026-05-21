@@ -15,11 +15,11 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { type DB, migrate, openDb } from '../db.js'
-import { createEventConsumer, createEventProducer, type EventProducer } from '../events.js'
+import { createChannel } from '../channel.js'
+import { createEventConsumer } from '../events.js'
 import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER, stripTtlViolations } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
-import { defaultProjectors } from '../server.js'
-import { type ServerHandle, startServer } from '../server.js'
+import { defaultTasks, type ServerHandle, startServer } from '../server.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 type MockHandler = (
@@ -46,12 +46,12 @@ async function startMock(handler: MockHandler): Promise<{ port: number, close: (
 function fixture() {
   const db = openDb({ path: ':memory:' })
   migrate(db)
-  const producer: EventProducer = createEventProducer(db, [])
+  const channel = createChannel({ db })
   const tmpRoot = mkdtempSync(path.join(tmpdir(), 'proxy-ph-test-'))
   const tobeStore: TobeStore = createTobeStore(tmpRoot)
   return {
     db,
-    producer,
+    channel,
     tobeStore,
     tmpRoot,
     cleanup: () => rmSync(tmpRoot, { recursive: true, force: true }),
@@ -103,7 +103,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -161,7 +161,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -190,7 +190,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -235,7 +235,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
       db: fx.db,
@@ -316,7 +316,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
       db: fx.db,
@@ -384,7 +384,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -434,7 +434,7 @@ describe('proxy pass-through + event emission', () => {
     // sessions_v1 projector wired up so the row exists.
     const localDb = openDb({ path: ':memory:' })
     migrate(localDb)
-    const localProducer = createEventProducer(localDb, defaultProjectors())
+    const localChannel = createChannel({ db: localDb, tasks: await defaultTasks() })
 
     let callCount = 0
     mock = await startMock((_req, res) => {
@@ -445,7 +445,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: localProducer,
+      channel: localChannel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
       db: localDb,
@@ -545,7 +545,7 @@ describe('proxy pass-through + event emission', () => {
     // (dangling_unforkable; abandon).
     const localDb = openDb({ path: ':memory:' })
     migrate(localDb)
-    const localProducer = createEventProducer(localDb, defaultProjectors())
+    const localChannel = createChannel({ db: localDb, tasks: await defaultTasks() })
 
     let callCount = 0
     mock = await startMock((_req, res) => {
@@ -556,7 +556,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: localProducer,
+      channel: localChannel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
       db: localDb,
@@ -618,7 +618,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -658,7 +658,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -689,7 +689,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -709,7 +709,7 @@ describe('proxy pass-through + event emission', () => {
     // Use the standard projector chain (sessions_v1 + versions_v1).
     const db = openDb({ path: ':memory:' })
     migrate(db)
-    const producer = createEventProducer(db, defaultProjectors())
+    const channel = createChannel({ db, tasks: await defaultTasks() })
 
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -720,7 +720,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer,
+      channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -766,7 +766,7 @@ describe('proxy pass-through + event emission', () => {
   it('emits proxy.upstream_error when upstream is unreachable', async () => {
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: 'http://127.0.0.1:1', // port 1 is reserved / unreachable
     })
@@ -791,7 +791,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: 'http://127.0.0.1:1', // unreachable; any forwarded request fails
     })
@@ -840,7 +840,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -875,7 +875,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -905,7 +905,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -942,7 +942,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -971,7 +971,7 @@ describe('proxy pass-through + event emission', () => {
   it('notifies ForkAwaiter with aborted/http_error on upstream failure', async () => {
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: 'http://127.0.0.1:1', // unreachable
     })
@@ -1001,7 +1001,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       upstream: `http://127.0.0.1:${mock.port}`,
     })
@@ -1049,7 +1049,7 @@ describe('proxy pass-through + event emission', () => {
     })
     proxy = await startServer({
       port: 0,
-      producer: fx.producer,
+      channel: fx.channel,
       tobeStore: fx.tobeStore,
       db: fx.db,
       upstream: `http://127.0.0.1:${mock.port}`,

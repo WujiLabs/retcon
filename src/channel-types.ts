@@ -126,6 +126,51 @@ export interface KV<K extends string = string, V = string> {
 }
 
 /**
+ * The protocol L2.4 Resolution outcome produced by a Task's apply() when the
+ * Channel dispatches an event. v0.3 ships two baseline sub-states (Q4 per
+ * Cosimo); future channels extend `Outcome` additively with `reject`,
+ * `partial`, `merge`, `defer`, `custom`, etc. — existing consumers ignore
+ * unknown `kind` values.
+ *
+ * `accept` is the trivial-resolution case: apply() ran to completion. Accept
+ * outcomes are also implicit in {@link KV} offset advancement, so v0.3 does
+ * NOT emit a separate substrate event for them (Q1=c per Cosimo). v0.4 can
+ * add `topic: 'projection.accept'` events additively when subscribe()-side
+ * consumers need cursor-based read of all outcomes.
+ *
+ * `exception` is the protocol's "exception sub-state of a Revision" (L3.6.3)
+ * — apply() threw before completing. The throw is data, not an error: the
+ * Channel catches it, rolls back the projector's SAVEPOINT (its partial
+ * writes are discarded), records the exception as a substrate event
+ * (`topic: 'projection.exception'`, payload includes the source event id,
+ * the task id, and the error message), AND continues dispatching downstream
+ * Tasks. Downstream Tasks see whatever state upstream left and decide their
+ * own outcome — possibly also exception, recorded the same way (L1.10
+ * Explicit Discarding).
+ */
+export type Outcome =
+  | { kind: 'accept', taskId: TaskId }
+  | { kind: 'exception', taskId: TaskId, error: string }
+
+/**
+ * Returned from {@link Channel.submit}. Carries the recorded event row and
+ * the per-Task Resolution outcomes from the dispatch round.
+ *
+ * The event ALWAYS lands as long as the Channel itself didn't fail
+ * (DB I/O / constraint violation surfaces as Promise rejection). Projector
+ * exceptions in `outcomes` do NOT void `event` — they're recorded data per
+ * L1.2 (No Errors, only Exceptions).
+ *
+ * `outcomes` lists ONE entry per Task whose `input.topics` included this
+ * event's topic, in dependency-derived dispatch order. Tasks not subscribed
+ * to this topic do not appear here.
+ */
+export interface SubmitResult<P> {
+  event: Event<P>
+  outcomes: ReadonlyArray<Outcome>
+}
+
+/**
  * Compute the content-hashed {@link TaskId} for an (action, input) pair via
  * `@playtiss/core`'s `computeHash`. Same inputs → same TaskId across
  * processes / machines.

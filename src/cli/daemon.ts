@@ -117,7 +117,6 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   // declared deps, not implicit array order.
   const tasks = await defaultTasks()
   const channel = createChannel({ db, tasks })
-  const producer = channel.producer
   const tobeStore = createTobeStore(retconTobeDir())
   const storageProvider = new SqliteStorageProvider(db)
   const mcpTools = createMcpTools({ db, tobeStore, storageProvider, rewindEnabled: true })
@@ -125,7 +124,7 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   const handle = await startServer({
     port,
     upstream,
-    producer,
+    channel,
     tobeStore,
     mcpTools,
     db,

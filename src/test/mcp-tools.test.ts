@@ -13,10 +13,10 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { type Channel, createChannel } from '../channel.js'
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
-import { type Event, type EventProducer } from '../events.js'
-import { createEventProducer } from '../events.js'
+import { type Event } from '../events.js'
 import {
   CONFIRM_TOKEN_TTL_MS,
   ConfirmTokenStore,
@@ -25,13 +25,13 @@ import {
   detectMetaRef,
   META_REFS,
 } from '../mcp-tools.js'
-import { defaultProjectors } from '../server.js'
+import { defaultTasks } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 interface TestFixture {
   db: DB
-  producer: EventProducer
+  channel: Channel
   tobeStore: TobeStore
   storageProvider: SqliteStorageProvider
   tmp: string
@@ -40,28 +40,28 @@ interface TestFixture {
   cleanup: () => void
 }
 
-function fixture(opts: { orphan?: boolean } = {}): TestFixture {
+async function fixture(opts: { orphan?: boolean } = {}): Promise<TestFixture> {
   const db = openDb({ path: ':memory:' })
   migrate(db)
-  const producer = createEventProducer(db, defaultProjectors())
+  const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmp = mkdtempSync(path.join(tmpdir(), 'mcp-tools-test-'))
   const tobeStore = createTobeStore(tmp)
   const sessionId = 'sess-tools'
   if (opts.orphan) {
-    producer.emit(
+    await channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b' },
       sessionId,
     )
   }
   else {
-    producer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
+    await channel.submit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
   }
   const taskId = (db.prepare('SELECT task_id FROM sessions WHERE id = ?').get(sessionId) as { task_id: string }).task_id
   const storageProvider = new SqliteStorageProvider(db)
   return {
     db,
-    producer,
+    channel,
     tobeStore,
     storageProvider,
     tmp,
@@ -72,20 +72,20 @@ function fixture(opts: { orphan?: boolean } = {}): TestFixture {
 }
 
 /** Helper: emit request_received with an inline body blob so rewind_to can reconstruct messages. */
-function emitTurn(
+async function emitTurn(
   fx: TestFixture,
   stopReason: string,
   messagesArr: unknown[],
-): Event {
+): Promise<Event> {
   const bodyBytes = Buffer.from(JSON.stringify({ messages: messagesArr }), 'utf8')
   const bodyCid = `bafy-body-${Math.random().toString(36).slice(2)}`
-  const req = fx.producer.emit(
+  const { event: req } = await fx.channel.submit(
     'proxy.request_received',
     { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid },
     fx.sessionId,
     [{ cid: bodyCid, bytes: bodyBytes }],
   )
-  fx.producer.emit(
+  await fx.channel.submit(
     'proxy.response_completed',
     {
       request_event_id: req.id,
@@ -109,7 +109,7 @@ async function call(fx: TestFixture, name: string, args: unknown, rewindEnabled 
   })
   const tool = tools.get(name)
   if (!tool) throw new Error(`no such tool: ${name}`)
-  return tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer })
+  return tool.handler(args, { sessionId: fx.sessionId, channel: fx.channel })
 }
 
 /**
@@ -137,7 +137,7 @@ async function rewindTwoStep(
   )
   const tool = tools.get('rewind_to')!
   // First call — no confirm.
-  const first = await tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer }) as {
+  const first = await tool.handler(args, { sessionId: fx.sessionId, channel: fx.channel }) as {
     status: string
     rules?: string
     confirm_clean?: string
@@ -152,7 +152,7 @@ async function rewindTwoStep(
     ?? (choice === 'clean' ? first.confirm_clean! : first.confirm_meta!)
   return tool.handler(
     { ...args, confirm },
-    { sessionId: fx.sessionId, producer: fx.producer },
+    { sessionId: fx.sessionId, channel: fx.channel },
   )
 }
 
@@ -160,8 +160,8 @@ async function rewindTwoStep(
 
 describe('recall (list mode)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
@@ -170,10 +170,10 @@ describe('recall (list mode)', () => {
     // The head (most-recent closed_forkable, q4) is excluded from the list
     // because rewinding to the current state is a no-op. n_back numbering
     // matches what rewind_to(turn_back_n=N) would land on.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // open, should NOT appear
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head — excluded
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // open, should NOT appear
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head — excluded
     const res = await call(fx, 'recall', {}) as {
       total: number
       turns: Array<{ turn_id: string, n_back: number, preview: string, stop_reason: string | null }>
@@ -195,9 +195,9 @@ describe('recall (list mode)', () => {
     // Regression guard for the inconsistency between list mode and rewind_to:
     // calling rewind_to(turn_back_n=K) MUST land on the same revision that
     // recall list labels n_back=K (turn_id field).
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    const t2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }]) // head — excluded
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const t2 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }]) // head — excluded
     const list = await call(fx, 'recall', {}) as {
       turns: Array<{ turn_id: string, preview: string, n_back: number }>
     }
@@ -215,7 +215,7 @@ describe('recall (list mode)', () => {
   })
 
   it('returns empty list when only the head is closed_forkable (single-turn session)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }]) // head, only forkable
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }]) // head, only forkable
     const res = await call(fx, 'recall', {}) as {
       total: number
       turns: unknown[]
@@ -227,7 +227,7 @@ describe('recall (list mode)', () => {
   })
 
   it('returns empty list when no closed_forkable turns exist', async () => {
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
     const res = await call(fx, 'recall', {}) as {
       total: number
       turns: unknown[]
@@ -240,7 +240,7 @@ describe('recall (list mode)', () => {
 
   it('respects limit and offset (after head exclusion)', async () => {
     // 5 closed_forkable turns. Head excluded → 4 rewindable.
-    for (let i = 0; i < 5; i++) emitTurn(fx, 'end_turn', [{ role: 'user', content: `q${i}` }])
+    for (let i = 0; i < 5; i++) await emitTurn(fx, 'end_turn', [{ role: 'user', content: `q${i}` }])
     const r1 = await call(fx, 'recall', { limit: 2 }) as { turns: unknown[], total: number }
     expect(r1.turns.length).toBe(2)
     expect(r1.total).toBe(4) // 5 forkable - 1 head
@@ -251,8 +251,8 @@ describe('recall (list mode)', () => {
   })
 
   it('lean result hides revision_id / classification / asset_cid by default', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // need 2 so list isn't empty
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // need 2 so list isn't empty
     const r = await call(fx, 'recall', {}) as { turns: Array<Record<string, unknown>> }
     const t = r.turns[0]!
     expect('classification' in t).toBe(false)
@@ -267,16 +267,16 @@ describe('recall (list mode)', () => {
   // on the session, not revisions you can rewind to).
   it('list mode interleaves release_marker entries between turns', async () => {
     // q1, q2 [release happens here], q3, q4 — head q4 excluded.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
     // Emit a state-divergence release between q2 and q3.
-    fx.producer.emit(
+    await fx.channel.submit(
       'session.branch_context_released',
       { session_id: fx.sessionId, reason: 'rewind_or_state_divergence' },
       fx.sessionId,
     )
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head, excluded
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q4' }]) // head, excluded
 
     const res = await call(fx, 'recall', {}) as {
       total: number
@@ -303,13 +303,13 @@ describe('recall (list mode)', () => {
   })
 
   it('list mode surfaces compact / clear events as release_marker with reason from payload', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    fx.producer.emit(
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await fx.channel.submit(
       'session.branch_context_cleared',
       { session_id: fx.sessionId, source: 'compact' },
       fx.sessionId,
     )
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
     const res = await call(fx, 'recall', {}) as {
       turns: Array<{ kind: string, preview: string, release_reason?: string }>
     }
@@ -338,10 +338,10 @@ describe('recall (list mode)', () => {
   // landing on the prior real turn's *successor*). New: turn_back_n=1 from
   // head walks past rev_suggest → rev_aardvark, then back 1 → rev_zebra.
   it('rewind_to(turn_back_n=N) skips harness-injection revisions when counting', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nReminder body...\n</system-reminder>\n' }])
-    const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]' }])
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nReminder body...\n</system-reminder>\n' }])
+    const t3 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]' }])
     // From the new head (the SUGGESTION turn, which effectiveHead skips → AARDVARK):
     //   turn_back_n=1 → ZEBRA (skipping system-reminder injection between them)
     const recall1 = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { turn_id: string, preview: string } }
@@ -357,12 +357,12 @@ describe('recall (list mode)', () => {
   })
 
   it('current head skips harness-injection revisions', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real first turn' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real second turn' }])
-    const aardvarkTurn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real third turn' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: predict next input]' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'The user stepped away and is coming back. Recap in under 40 words.' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real first turn' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real second turn' }])
+    const aardvarkTurn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'real third turn' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: '[SUGGESTION MODE: predict next input]' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'The user stepped away and is coming back. Recap in under 40 words.' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
     // current_head_turn_id reflects the most-recent non-injection settled
     // turn (so bookmark / dump_to_file default to the right place). Three
     // injection-pattern turns at the tail (SUGGESTION + recap + bare system-
@@ -379,12 +379,12 @@ describe('recall (list mode)', () => {
   // turns whose ENTIRE content is the reminder block (msgs=1 probe-style)
   // are injection.
   it('system-reminder PREFIX + real user content is NOT treated as injection', async () => {
-    const realFirst = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first real prompt' }])
+    const realFirst = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first real prompt' }])
     // Mid: system-reminder PREFIX with real user content underneath. This is the
     // shape claude code uses for "user opened file X in IDE" reminders.
-    const reminderPlusReal = emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe user opened the file /tmp/foo.md in the IDE.\n</system-reminder>\nupdate the timeline section in foo.md' }])
+    const reminderPlusReal = await emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe user opened the file /tmp/foo.md in the IDE.\n</system-reminder>\nupdate the timeline section in foo.md' }])
     // Tail to anchor a head so the prior turn is rewindable.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'tail prompt' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'tail prompt' }])
     // turn_back_n=1 should land on `reminderPlusReal` (NOT walk past it to
     // realFirst, since reminderPlusReal contains real user content after the
     // reminder block).
@@ -409,10 +409,10 @@ describe('recall (list mode)', () => {
     // call emits proxy.request_received → proxy.response_completed and the
     // events_v1 projector wires up parent_revision_id from the previous turn.
     // ZEBRA → system-reminder probe → AARDVARK → AARDVARK's child (head).
-    const zebra = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
-    const sysRem = emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
-    const aardvark = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'next prompt' }]) // anchor head
+    const zebra = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word ZEBRA. Reply with just OK.' }])
+    const sysRem = await emitTurn(fx, 'end_turn', [{ role: 'user', content: '<system-reminder>\nThe task tools have not been used recently...\n</system-reminder>\n' }])
+    const aardvark = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'Remember the secret word AARDVARK. Reply with just OK.' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'next prompt' }]) // anchor head
     // Prove the DAG shape we set up actually has system-reminder between
     // ZEBRA and AARDVARK (parent chain).
     const aardRow = fx.db.prepare('SELECT parent_revision_id FROM revisions WHERE id = ?')
@@ -437,15 +437,15 @@ describe('recall (list mode)', () => {
 
 describe('recall (detail mode)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('returns turn details for a specific turn_id with preceding open chain', async () => {
-    const t1 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q1' }])
-    const t2 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
-    const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    const t1 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q1' }])
+    const t2 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
+    const t3 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
     const res = await call(fx, 'recall', { turn_id: t3.id, verbose: true }) as {
       turn: { turn_id: string, classification: string, preview: string }
       preceding_open_turns: string[]
@@ -457,9 +457,9 @@ describe('recall (detail mode)', () => {
   })
 
   it('returns turn details for turn_back_n', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'second' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'third' }])
     // Most recent settled is "third"; turn_back_n=1 means walk one closed_forkable
     // back from there → "second".
     const res = await call(fx, 'recall', { turn_back_n: 1 }) as { turn: { preview: string } }
@@ -474,25 +474,25 @@ describe('recall (detail mode)', () => {
   })
 
   it('errors when both turn_id and turn_back_n are passed', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_id: 'x', turn_back_n: 1 }) as { error: string }
     expect(res.error).toMatch(/exactly one/)
   })
 
   it('errors when turn_back_n exceeds available turns', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_back_n: 5 }) as { error: string }
     expect(res.error).toMatch(/fewer than/)
   })
 
   it('errors when turn_back_n is non-integer or < 1', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_back_n: 0 }) as { error: string }
     expect(res.error).toMatch(/integer/)
   })
 
   it('caps walk-back depth to prevent cyclic-chain runaway (A-WR13)', async () => {
-    const v = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const v = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     fx.db.prepare('UPDATE revisions SET parent_revision_id = id WHERE id = ?').run(v.id)
     const start = Date.now()
     const res = await call(fx, 'recall', { turn_id: v.id }) as {
@@ -504,7 +504,7 @@ describe('recall (detail mode)', () => {
   })
 
   it('verbose=true exposes internal fields (CEO Proposal B)', async () => {
-    const t = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const t = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_id: t.id, verbose: true }) as {
       turn: Record<string, unknown>
       preceding_open_turns: unknown
@@ -523,13 +523,13 @@ describe('recall (detail mode)', () => {
 
 describe('recall (Phase 3 extensions)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('1: view_id-happy — resolves to bookmark\'s head_turn_id', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const bm = await call(fx, 'bookmark', { label: 'v1' }) as {
       view_id: string
       head_revision_id: string
@@ -542,7 +542,7 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('2: view_id-not-found — clear error message', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { view_id: 'never-existed' }) as { error: string }
     expect(res.error).toMatch(/view not found/)
   })
@@ -557,7 +557,7 @@ describe('recall (Phase 3 extensions)', () => {
         messages.push({ role: 'assistant', content: `a${j}` })
       }
       messages.pop() // end on user
-      turns.push(emitTurn(fx, 'end_turn', messages))
+      turns.push(await emitTurn(fx, 'end_turn', messages))
     }
     const middle = turns[2]!
     const res = await call(fx, 'recall', { turn_id: middle.id, surrounding: 2 }) as {
@@ -586,7 +586,7 @@ describe('recall (Phase 3 extensions)', () => {
         messages.push({ role: 'assistant', content: `a${j}` })
       }
       messages.pop()
-      turns.push(emitTurn(fx, 'end_turn', messages))
+      turns.push(await emitTurn(fx, 'end_turn', messages))
     }
     const last = turns[2]!
     const res = await call(fx, 'recall', { turn_id: last.id, surrounding: 5 }) as {
@@ -600,8 +600,8 @@ describe('recall (Phase 3 extensions)', () => {
     // Regression guard: a future change re-introducing rewind_events would
     // duplicate what SR rows already surface and re-introduce the
     // fork.back_requested coupling we removed in v0.5.0.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
     const res = await call(fx, 'recall', {}) as Record<string, unknown>
     expect(res.rewind_events).toBeUndefined()
     expect(res.rewind_events_total).toBeUndefined()
@@ -613,8 +613,8 @@ describe('recall (Phase 3 extensions)', () => {
     // (mimicking what RewindMarkerV1Projector would do on fork.forked).
     // SR.sealed_at = 1 keeps it as the oldest entry so the second emitTurn
     // remains the head (which gets excluded from the list).
-    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head, excluded from list
+    const r1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head, excluded from list
     fx.db.prepare(`
       INSERT INTO revisions
         (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
@@ -633,8 +633,8 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('5c (v0.5): list mode discriminates submit_marker from rewind_marker', async () => {
-    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    const r1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
     fx.db.prepare(`
       INSERT INTO revisions
         (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
@@ -649,8 +649,8 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('5d (v0.5): detail mode on an SR turn includes kind=rewind_marker', async () => {
-    const r1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
+    const r1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }]) // head
     fx.db.prepare(`
       INSERT INTO revisions
         (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
@@ -665,9 +665,9 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('5e (v0.5): surrounding window entries carry kind discriminator', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    const t2 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
-    const t3 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    const t2 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
+    const t3 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q3' }])
     // Inject an SR sibling for t2.
     const t2Row = fx.db.prepare('SELECT sealed_at FROM revisions WHERE id = ?').get(t2.id) as { sealed_at: number }
     fx.db.prepare(`
@@ -686,7 +686,7 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('7: detail-mode-branch_views_at_turn — surfaces every view pointing at this turn', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const bm1 = await call(fx, 'bookmark', { label: 'a' }) as { view_id: string }
     const bm2 = await call(fx, 'bookmark', { label: 'b' }) as { view_id: string }
     const res = await call(fx, 'recall', { turn_id: turn.id }) as {
@@ -699,7 +699,7 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('8: view_id-pointing-at-deleted-view — clean "view not found" error', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const bm = await call(fx, 'bookmark', { label: 'v1' }) as { view_id: string }
     await call(fx, 'delete_bookmark', { label: 'v1' })
     const res = await call(fx, 'recall', { view_id: bm.view_id }) as { error: string }
@@ -707,7 +707,7 @@ describe('recall (Phase 3 extensions)', () => {
   })
 
   it('9: surrounding=0 — omits surrounding_turns field entirely from response', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'recall', { turn_id: turn.id, surrounding: 0 }) as Record<string, unknown>
     expect('surrounding_turns' in res).toBe(false)
     // Same when omitted.
@@ -719,7 +719,7 @@ describe('recall (Phase 3 extensions)', () => {
     // Adversarial-review finding: previously, target.sealed_at IS NULL silently
     // dropped surrounding_turns even when explicitly requested. Now it surfaces
     // an empty list AND a `surrounding_skipped` reason.
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     fx.db.prepare(`UPDATE revisions SET sealed_at = NULL, classification = 'open' WHERE id = ?`).run(turn.id)
     const res = await call(fx, 'recall', { turn_id: turn.id, surrounding: 3 }) as {
       surrounding_turns?: unknown[]
@@ -734,7 +734,7 @@ describe('recall (Phase 3 extensions)', () => {
     // head was reclassified would silently succeed and return next_steps text
     // saying "call rewind_to" — but rewind_to rejects non-forkable turns. Add
     // an explicit warning.
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const bm = await call(fx, 'bookmark', { label: 'orphan' }) as { view_id: string }
     fx.db.prepare(`UPDATE revisions SET classification = 'dangling_unforkable' WHERE id = ?`).run(turn.id)
     const res = await call(fx, 'recall', { view_id: bm.view_id }) as {
@@ -749,13 +749,13 @@ describe('recall (Phase 3 extensions)', () => {
 
 describe('bookmark', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('creates a branch_view pointing at the latest closed_forkable turn', async () => {
-    const req = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const req = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'bookmark', { label: 'my-spot' }) as {
       view_id: string
       head_revision_id: string
@@ -769,20 +769,20 @@ describe('bookmark', () => {
   })
 
   it('G10: rejects when no closed_forkable turn exists yet', async () => {
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'bookmark', { label: 'x' }) as { error: string }
     expect(res.error).toMatch(/no forkable turn yet/)
   })
 
   it('rejects label exceeding the byte cap (256)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const longLabel = 'x'.repeat(257)
     const res = await call(fx, 'bookmark', { label: longLabel }) as { error: string }
     expect(res.error).toMatch(/exceeds 256-byte cap/)
   })
 
   it('strips ASCII control chars from label, preserves printable text + emoji', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     // Label has newline, NUL, DEL, plus printable + emoji.
     const dirty = 'v1\nbase\x00line\x7f 🚀'
     const res = await call(fx, 'bookmark', { label: dirty }) as {
@@ -797,7 +797,7 @@ describe('bookmark', () => {
   })
 
   it('rejects label that is entirely control characters', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'bookmark', { label: '\n\t\x00' }) as { error: string }
     expect(res.error).toMatch(/control characters/)
   })
@@ -813,8 +813,8 @@ describe('bookmark', () => {
 
 describe('delete_bookmark', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
@@ -832,7 +832,7 @@ describe('delete_bookmark', () => {
    *  v0.5.0-alpha.4+: branch_views_v1 subscribes to fork.forked (success
    *  signal), not fork.back_requested. Tests need to seed R1 so the
    *  parent_revision_id lookup resolves. */
-  function seedForkPoint(forkPointRevId: string): string {
+  async function seedForkPoint(forkPointRevId: string): Promise<string> {
     const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
     const r1Id = `rev-r1-${Math.random().toString(36).slice(2, 10)}`
     // Seed R1 so branch-views-v1's parent_revision_id lookup succeeds.
@@ -840,7 +840,7 @@ describe('delete_bookmark', () => {
       INSERT INTO revisions (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
       VALUES (?, ?, NULL, NULL, 'open', 'tool_use', ?, ?)
     `).run(r1Id, fx.taskId, Date.now(), Date.now())
-    fx.producer.emit(
+    await fx.channel.submit(
       'fork.forked',
       {
         kind: 'rewind',
@@ -861,7 +861,7 @@ describe('delete_bookmark', () => {
   }
 
   it('1: deletes by unique label (happy path)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id, head_id } = await seedBookmark('v1')
     const res = await call(fx, 'delete_bookmark', { label: 'v1' }) as {
       deleted: { view_id: string, kind: string, label: string, head_turn_id_at_delete: string }
@@ -875,7 +875,7 @@ describe('delete_bookmark', () => {
   })
 
   it('2: rejects when label is missing or empty', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const r1 = await call(fx, 'delete_bookmark', {}) as { error: string }
     expect(r1.error).toMatch(/label is required/)
     const r2 = await call(fx, 'delete_bookmark', { label: '' }) as { error: string }
@@ -883,9 +883,9 @@ describe('delete_bookmark', () => {
   })
 
   it('3: rejects ambiguous label with ambiguous_views list', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id: a } = await seedBookmark('dup')
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'user', content: 'q2' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'user', content: 'q2' }])
     const { view_id: b } = await seedBookmark('dup')
     const res = await call(fx, 'delete_bookmark', { label: 'dup' }) as {
       error: string
@@ -904,19 +904,19 @@ describe('delete_bookmark', () => {
   })
 
   it('4: rejects when no bookmark has that label', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     await seedBookmark('v1')
     const res = await call(fx, 'delete_bookmark', { label: 'nonexistent' }) as { error: string }
     expect(res.error).toMatch(/no bookmark with label 'nonexistent'/)
   })
 
   it('5: rejects cross-session delete (label from another session\'s task does not match)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     await seedBookmark('cross-session-v1')
 
     // Spin up a second session with its own task.
     const otherSession = 'sess-other'
-    fx.producer.emit('mcp.session_initialized', { mcp_session_id: 'm2', harness: 'claude-code' }, otherSession)
+    await fx.channel.submit('mcp.session_initialized', { mcp_session_id: 'm2', harness: 'claude-code' }, otherSession)
 
     // Try to delete the FIRST session's bookmark from inside the SECOND session's context.
     const tools = createMcpTools({
@@ -927,7 +927,7 @@ describe('delete_bookmark', () => {
     })
     const res = await tools.get('delete_bookmark')!.handler(
       { label: 'cross-session-v1' },
-      { sessionId: otherSession, producer: fx.producer },
+      { sessionId: otherSession, channel: fx.channel },
     ) as { error: string }
     expect(res.error).toMatch(/no bookmark/)
     // First session's bookmark is still there.
@@ -936,8 +936,8 @@ describe('delete_bookmark', () => {
   })
 
   it('6: cannot delete fork_points (label=NULL never matches any string label)', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    seedForkPoint(turn.id)
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await seedForkPoint(turn.id)
     // Even if you guess the auto_label string, label-only resolver compares
     // against the `label` field which is NULL — the SQL `label = ?` excludes
     // NULL rows.
@@ -949,7 +949,7 @@ describe('delete_bookmark', () => {
   })
 
   it('7: cannot delete unlabeled bookmarks (bookmark() with no args)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     await seedBookmark(null) // label=NULL
     // No string label can resolve a NULL-label row.
     const res = await call(fx, 'delete_bookmark', { label: '' }) as { error: string }
@@ -959,7 +959,7 @@ describe('delete_bookmark', () => {
   })
 
   it('8: idempotent — second call against an already-deleted bookmark returns "not found"', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     await seedBookmark('v1')
     await call(fx, 'delete_bookmark', { label: 'v1' })
     const second = await call(fx, 'delete_bookmark', { label: 'v1' }) as { error: string }
@@ -967,21 +967,19 @@ describe('delete_bookmark', () => {
   })
 
   it('9: projector silently skips on task_id mismatch (no throw)', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id } = await seedBookmark('v1')
     // Emit a delete event with a wrong task_id directly to bypass the
     // resolver. The projector handler should run DELETE WHERE id=? AND
     // task_id=? — no match, no throw, row remains.
-    expect(() => {
-      fx.producer.emit(
-        'fork.bookmark_deleted',
-        { view_id, task_id: 'wrong-task' },
-        fx.sessionId,
-      )
-    }).not.toThrow()
+    await expect(fx.channel.submit(
+      'fork.bookmark_deleted',
+      { view_id, task_id: 'wrong-task' },
+      fx.sessionId,
+    )).resolves.toBeDefined()
     expect(fx.db.prepare('SELECT id FROM branch_views WHERE id = ?').get(view_id)).toBeTruthy()
     // Sanity: the right task_id deletes correctly.
-    fx.producer.emit(
+    await fx.channel.submit(
       'fork.bookmark_deleted',
       { view_id, task_id: turn ? fx.taskId : '' },
       fx.sessionId,
@@ -998,12 +996,12 @@ describe('delete_bookmark', () => {
 
 describe('list_branches', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
-  function seedForkPoint(forkPointRevId: string, label: string | null = null): string {
+  async function seedForkPoint(forkPointRevId: string, label: string | null = null): Promise<string> {
     const viewId = `vp_${Math.random().toString(36).slice(2, 10)}`
     const r1Id = `rev-r1-${Math.random().toString(36).slice(2, 10)}`
     // Seed R1 so branch-views-v1's parent_revision_id lookup succeeds
@@ -1012,7 +1010,7 @@ describe('list_branches', () => {
       INSERT INTO revisions (id, task_id, asset_cid, parent_revision_id, classification, stop_reason, sealed_at, created_at)
       VALUES (?, ?, NULL, NULL, 'open', 'tool_use', ?, ?)
     `).run(r1Id, fx.taskId, Date.now(), Date.now())
-    fx.producer.emit(
+    await fx.channel.submit(
       'fork.forked',
       {
         kind: 'rewind',
@@ -1030,7 +1028,7 @@ describe('list_branches', () => {
       fx.sessionId,
     )
     if (label !== null) {
-      fx.producer.emit('fork.label_updated', { view_id: viewId, label }, fx.sessionId)
+      await fx.channel.submit('fork.label_updated', { view_id: viewId, label }, fx.sessionId)
     }
     return viewId
   }
@@ -1042,11 +1040,11 @@ describe('list_branches', () => {
   })
 
   it('2: lists a mix of bookmark and fork_point with correct kind from auto_label', async () => {
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     // Explicit bookmark (no label).
     const bm = await call(fx, 'bookmark', {}) as { view_id: string }
     // Auto fork-point view (label=NULL).
-    const fp = seedForkPoint(turn.id)
+    const fp = await seedForkPoint(turn.id)
     const res = await call(fx, 'list_branches', {}) as {
       total: number
       branches: Array<{ view_id: string, kind: string, label: string | null }>
@@ -1060,7 +1058,7 @@ describe('list_branches', () => {
   })
 
   it('3: n_back_of_head=0 when bookmark is tracking the current head', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     await call(fx, 'bookmark', { label: 'tracking' })
     const res = await call(fx, 'list_branches', {}) as {
       branches: Array<{ label: string | null, n_back_of_head: number | null }>
@@ -1075,10 +1073,10 @@ describe('list_branches', () => {
     // independent turns landing without parent_revision_id chaining (no
     // fork yet), the first bookmark stays put. Verify it's reported as
     // n_back_of_head = position in DESC sequence.
-    const turn1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    const turn1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     await call(fx, 'bookmark', { label: 'frozen' })
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' }, { role: 'user', content: 'q3' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' }, { role: 'user', content: 'q2' }, { role: 'assistant', content: 'a2' }, { role: 'user', content: 'q3' }])
     const res = await call(fx, 'list_branches', {}) as {
       branches: Array<{ label: string | null, head_turn_id: string, n_back_of_head: number | null }>
     }
@@ -1104,7 +1102,7 @@ describe('list_branches', () => {
   it('5: n_back_of_head=null when head_revision_id is not in the closed_forkable sequence', async () => {
     // Bookmark a forkable turn, then surgically reclassify that revision
     // to dangling_unforkable. n_back_of_head should fall back to null.
-    const turn = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    const turn = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const { view_id } = await call(fx, 'bookmark', { label: 'orphan' }) as {
       view_id: string
     }
@@ -1125,7 +1123,7 @@ describe('list_branches', () => {
         messages.push({ role: 'user', content: `q${j}` }, { role: 'assistant', content: `a${j}` })
       }
       messages.pop() // end on user
-      emitTurn(fx, 'end_turn', messages)
+      await emitTurn(fx, 'end_turn', messages)
       await call(fx, 'bookmark', { label: `b${i}` })
     }
     const page1 = await call(fx, 'list_branches', { limit: 2, offset: 0 }) as {
@@ -1151,14 +1149,14 @@ describe('list_branches', () => {
 
 describe('rewind_to (dual-secret flow)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('first call (no confirm) returns rules + a fresh token pair', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1182,7 +1180,7 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('static-value rejection: confirm="acknowledged" routes back to fresh first call', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     const res = await call(fx, 'rewind_to', {
       turn_back_n: 1,
       message: 'X',
@@ -1201,9 +1199,9 @@ describe('rewind_to (dual-secret flow)', () => {
     // Shorter prefixes ("OK", "NO") would false-positive from randomness.
     const banned = ['PROCEED', 'REVISE', 'CONFIRM', 'ACCEPT', 'REJECT', 'APPROVE']
     for (let i = 0; i < 50; i++) {
-      const fxn = fixture()
+      const fxn = await fixture()
       try {
-        emitTurn(fxn, 'end_turn', [{ role: 'user', content: 'q' }])
+        await emitTurn(fxn, 'end_turn', [{ role: 'user', content: 'q' }])
         const res = await call(fxn, 'rewind_to', { turn_back_n: 1, message: 'X' }) as {
           confirm_clean: string
           confirm_meta: string
@@ -1224,8 +1222,8 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('clean_token + clean message → writes TOBE + scheduled response', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1272,8 +1270,8 @@ describe('rewind_to (dual-secret flow)', () => {
     //      noise on every fork.
     // Pin the content so a future re-wording change doesn't accidentally
     // drop a directive or merge them into one.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1305,8 +1303,8 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('synthetic-message verbatim test: message arg lands in TOBE byte-equal in its own block', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'orig' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'orig' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'orig' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
@@ -1332,7 +1330,7 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('meta_token → educational rejection + fresh token pair', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await rewindTwoStep(
       fx,
       { turn_back_n: 1, message: 'change my previous answer to B' },
@@ -1346,7 +1344,7 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('narrow regex catches "see above" on clean-token path', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await rewindTwoStep(fx, {
       turn_back_n: 1,
       message: 'see above for context',
@@ -1360,8 +1358,8 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('narrow regex no-false-positive: "the previous algorithm" succeeds (regression guard)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
@@ -1375,8 +1373,8 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('allow_meta_refs=true bypasses the regex backstop', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
@@ -1390,8 +1388,8 @@ describe('rewind_to (dual-secret flow)', () => {
   })
 
   it('token single-use: re-calling with same clean_token after consume returns fresh first-call', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
@@ -1405,25 +1403,25 @@ describe('rewind_to (dual-secret flow)', () => {
 
     const first = await tool.handler(
       { turn_back_n: 1, message: 'X' },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { confirm_clean: string }
     const stale = first.confirm_clean
 
     await tool.handler(
       { turn_back_n: 1, message: 'X', confirm: stale },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     )
 
     const replay = await tool.handler(
       { turn_back_n: 1, message: 'X', confirm: stale },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { status: string, confirm_clean?: string }
     expect(replay.status).toBe('rules_returned')
     expect(replay.confirm_clean).not.toBe(stale)
   })
 
   it('token single-use: re-calling with same meta_token after consume returns fresh first-call', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const tokenStore = new ConfirmTokenStore()
     const tools = createMcpToolsWithTokens(
       { db: fx.db, tobeStore: fx.tobeStore, storageProvider: fx.storageProvider, rewindEnabled: true },
@@ -1432,18 +1430,18 @@ describe('rewind_to (dual-secret flow)', () => {
     const tool = tools.get('rewind_to')!
     const first = await tool.handler(
       { turn_back_n: 1, message: 'X' },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { confirm_meta: string }
     const stale = first.confirm_meta
     // First send with meta → consumes pair.
     await tool.handler(
       { turn_back_n: 1, message: 'X', confirm: stale },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     )
     // Resend → no longer matches; routes to fresh rules.
     const replay = await tool.handler(
       { turn_back_n: 1, message: 'X', confirm: stale },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { status: string }
     expect(replay.status).toBe('rules_returned')
   })
@@ -1456,17 +1454,17 @@ describe('rewind_to (dual-secret flow)', () => {
       { db: fx.db, tobeStore: fx.tobeStore, storageProvider: fx.storageProvider, rewindEnabled: true },
       tokenStore,
     )
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const tool = tools.get('rewind_to')!
     const first = await tool.handler(
       { turn_back_n: 1, message: 'X' },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { confirm_clean: string }
     // Wait past TTL (1ms is enough; setTimeout 5ms covers timer slop).
     await new Promise(resolve => setTimeout(resolve, 5))
     const replay = await tool.handler(
       { turn_back_n: 1, message: 'X', confirm: first.confirm_clean },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { status: string }
     expect(replay.status).toBe('rules_returned')
   })
@@ -1487,20 +1485,20 @@ describe('rewind_to (dual-secret flow)', () => {
 
 describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('F4: walks past an open head to the nearest closed_forkable ancestor', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // head=open
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }]) // head=open
     const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'alt' }) as { error: string }
     expect(res.error).toMatch(/forkable turns available/)
   })
 
   it('F4: errors when no settled revision exists (everything in_flight)', async () => {
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'b' },
       fx.sessionId,
@@ -1510,7 +1508,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('rejects message > MAX_REWIND_MESSAGE_BYTES BEFORE consuming token', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const huge = 'x'.repeat(2 * 1024 * 1024)
     // Note: size check runs before the secret check, so we don't need two-step.
     const res = await call(fx, 'rewind_to', { turn_back_n: 1, message: huge }) as { error: string }
@@ -1518,9 +1516,9 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('rejects orphan sessions', async () => {
-    const orphan = fixture({ orphan: true })
+    const orphan = await fixture({ orphan: true })
     try {
-      emitTurn(orphan, 'end_turn', [{ role: 'user', content: 'q' }])
+      await emitTurn(orphan, 'end_turn', [{ role: 'user', content: 'q' }])
       const res = await rewindTwoStep(orphan, { turn_back_n: 1, message: 'alt' }) as { error: string }
       expect(res.error).toMatch(/orphan sessions cannot rewind/)
     }
@@ -1530,7 +1528,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('rejects whitespace-only message BEFORE consuming token', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     // Pre-token-check rejection — same as size-cap rejection.
     const r1 = await call(fx, 'rewind_to', { turn_back_n: 1, message: '   ' }) as { error: string }
     expect(r1.error).toMatch(/non-whitespace/)
@@ -1542,8 +1540,8 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
     // Seed two closed_forkable revisions, then create a self-loop on the head's
     // parent. effectiveHead and nthForkableBack used to spin forever on this;
     // they now bail via the visited-set + RECALL_MAX_DEPTH cap.
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1563,7 +1561,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('rewindEnabled=false emits fork.back_disabled_rejected and errors', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'alt' }, { rewindEnabled: false }) as {
       error: string
     }
@@ -1576,14 +1574,14 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('rejects turn_back_n < 1', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await rewindTwoStep(fx, { turn_back_n: 0, message: 'alt' }) as { error: string }
     expect(res.error).toMatch(/turn_back_n must be an integer/)
   })
 
   it('rejects when turn_back_n exceeds available forkable turns', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1593,7 +1591,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('falls back to target body when child body is malformed (A-WR9)', async () => {
-    const target = fx.producer.emit(
+    const { event: target } = await fx.channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-target-body' },
       fx.sessionId,
@@ -1601,18 +1599,18 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
         messages: [{ role: 'user', content: 'from-target' }],
       })) }],
     )
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.response_completed',
       { request_event_id: target.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
       fx.sessionId,
     )
-    const child = fx.producer.emit(
+    const { event: child } = await fx.channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-child-garbage' },
       fx.sessionId,
       [{ cid: 'bafy-child-garbage', bytes: Buffer.from('{not json') }],
     )
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.response_completed',
       { request_event_id: child.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
       fx.sessionId,
@@ -1634,22 +1632,22 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('errors when neither child nor target body resolves', async () => {
-    const target = fx.producer.emit(
+    const { event: target } = await fx.channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-target-ghost' },
       fx.sessionId,
     )
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.response_completed',
       { request_event_id: target.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
       fx.sessionId,
     )
-    const child = fx.producer.emit(
+    const { event: child } = await fx.channel.submit(
       'proxy.request_received',
       { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: 'bafy-child-ghost' },
       fx.sessionId,
     )
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.response_completed',
       { request_event_id: child.id, status: 200, headers_cid: 'h', body_cid: 'r', stop_reason: 'end_turn', asset_cid: 'a' },
       fx.sessionId,
@@ -1664,8 +1662,8 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('includes prior_outcome from the last TOBE-applied request', async () => {
-    const V1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    const V1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1674,7 +1672,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
     const bodyBytes = Buffer.from(JSON.stringify({
       messages: [{ role: 'user', content: 'q1' }],
     }), 'utf8')
-    const forked = fx.producer.emit(
+    const { event: forked } = await fx.channel.submit(
       'proxy.request_received',
       {
         method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid,
@@ -1687,7 +1685,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
       fx.sessionId,
       [{ cid: bodyCid, bytes: bodyBytes }],
     )
-    fx.producer.emit(
+    await fx.channel.submit(
       'proxy.upstream_error',
       { request_event_id: forked.id, status: 502, error_message: 'upstream down' },
       fx.sessionId,
@@ -1703,8 +1701,8 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('turn_id mode: rewinds to a specific forkable turn', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1718,7 +1716,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
   })
 
   it('turn_id mode rejects non-forkable turns', async () => {
-    const open = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
+    const open = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }])
     const res = await rewindTwoStep(fx, { turn_id: open.id, message: 'X' }) as { error: string }
     expect(res.error).toMatch(/not a forkable turn/)
   })
@@ -1779,8 +1777,8 @@ describe('detectMetaRef + META_REFS', () => {
 describe('dump_to_file', () => {
   let fx: TestFixture
   let retconHome: string
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
     // Each test gets its own RETCON_HOME so dumps from one test don't leak
     // into another. retconDumpsDir() reads process.env.RETCON_HOME at call
     // time, so we just need to set it before invoking the handler.
@@ -1797,8 +1795,8 @@ describe('dump_to_file', () => {
   })
 
   it('writes a JSONL dump of the current head and returns the path', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1831,8 +1829,8 @@ describe('dump_to_file', () => {
   })
 
   it('dumps a specific turn via turn_id', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1846,13 +1844,13 @@ describe('dump_to_file', () => {
   })
 
   it('dumps via turn_back_n (matches recall list numbering)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    const t2 = emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const t2 = await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'second' },
     ])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'second' },
@@ -1869,13 +1867,13 @@ describe('dump_to_file', () => {
   })
 
   it('errors with helpful message when no-args called on a fresh session (only 1 turn)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'dump_to_file', {}) as { error: string }
     expect(res.error).toMatch(/at least 2 forkable turns|active forked branch/)
   })
 
   it('rejects orphan sessions', async () => {
-    const orphan = fixture({ orphan: true })
+    const orphan = await fixture({ orphan: true })
     try {
       const res = await call(orphan, 'dump_to_file', {}) as { error: string }
       expect(res.error).toMatch(/orphan sessions cannot dump/)
@@ -1886,20 +1884,20 @@ describe('dump_to_file', () => {
   })
 
   it('errors when no forkable turn exists (open-only session)', async () => {
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q' }]) // open only
     const res = await call(fx, 'dump_to_file', {}) as { error: string }
     // effectiveHead returns undefined when only in_flight/open revs exist.
     expect(res.error).toMatch(/no settled turns yet|nothing to dump/)
   })
 
   it('errors on turn_id from a different session', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'dump_to_file', { turn_id: 'rev-unknown' }) as { error: string }
     expect(res.error).toMatch(/not found/)
   })
 
   it('rejects both turn_id and turn_back_n together', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'dump_to_file', { turn_id: 'x', turn_back_n: 1 }) as { error: string }
     expect(res.error).toMatch(/not both/)
   })
@@ -1910,7 +1908,7 @@ describe('dump_to_file', () => {
     // extends it ending in the user just typed by claude — Anthropic requires
     // request bodies end in user). dump_to_file must slice off the trailing
     // user line(s) so the file ends at the most recent assistant response.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const branchMessages = [
       { role: 'user', content: 'forked q' },
       { role: 'assistant', content: 'forked a' },
@@ -1938,7 +1936,7 @@ describe('dump_to_file', () => {
   it('handles deeply-nested trailing-user branch_context (multi-user-tail)', async () => {
     // Edge case: if for some reason branch_context has multiple consecutive
     // trailing users, slice them all so we land on the most recent assistant.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
       .run(JSON.stringify([
         { role: 'user', content: 'u1' },
@@ -1956,8 +1954,8 @@ describe('dump_to_file', () => {
     // empties it; we fall through to reconstructForkMessages. With turn_back_n=1
     // the target is one-before-head, which has a child (head) whose body
     // contains the assistant response — reconstruct succeeds.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
@@ -1985,20 +1983,20 @@ describe('dump_to_file', () => {
     // way to exercise it: emit an mcp.session_initialized for a malicious
     // session id and let the projector populate the session row normally,
     // then call dump_to_file with that session id in the ctx.
-    const evil = fixture()
+    const evil = await fixture()
     try {
       const evilId = '../../../tmp/evil'
-      evil.producer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, evilId)
+      await evil.channel.submit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, evilId)
       // Add a closed_forkable so the no-args default has a target.
       const bodyBytes = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'q' }] }), 'utf8')
       const bodyCid = `bafy-evil-${Math.random().toString(36).slice(2)}`
-      const req = evil.producer.emit(
+      const { event: req } = await evil.channel.submit(
         'proxy.request_received',
         { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid },
         evilId,
         [{ cid: bodyCid, bytes: bodyBytes }],
       )
-      evil.producer.emit('proxy.response_completed', {
+      await evil.channel.submit('proxy.response_completed', {
         request_event_id: req.id,
         status: 200,
         headers_cid: 'h',
@@ -2009,7 +2007,7 @@ describe('dump_to_file', () => {
       // Need a second turn so the no-args default (one-before-head) has data
       // to reconstruct from — that's the path that exercises filename safety.
       const bodyCid2 = `bafy-evil-${Math.random().toString(36).slice(2)}`
-      const req2 = evil.producer.emit(
+      const { event: req2 } = await evil.channel.submit(
         'proxy.request_received',
         { method: 'POST', path: '/v1/messages', headers_cid: 'h', body_cid: bodyCid2 },
         evilId,
@@ -2019,7 +2017,7 @@ describe('dump_to_file', () => {
           { role: 'user', content: 'q2' },
         ] }), 'utf8') }],
       )
-      evil.producer.emit('proxy.response_completed', {
+      await evil.channel.submit('proxy.response_completed', {
         request_event_id: req2.id,
         status: 200,
         headers_cid: 'h',
@@ -2051,8 +2049,8 @@ describe('dump_to_file', () => {
 describe('submit_file (dual-secret + path safety)', () => {
   let fx: TestFixture
   let dumpsRoot: string
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
     const tmpRoot = mkdtempSync(path.join(tmpdir(), 'retcon-submit-test-'))
     process.env.RETCON_HOME = tmpRoot
     dumpsRoot = path.join(tmpRoot, 'dumps')
@@ -2094,7 +2092,7 @@ describe('submit_file (dual-secret + path safety)', () => {
       { rewind: new ConfirmTokenStore(), submit: tokenStore },
     )
     const tool = tools.get('submit_file')!
-    const first = await tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer }) as {
+    const first = await tool.handler(args, { sessionId: fx.sessionId, channel: fx.channel }) as {
       status: string
       confirm_clean?: string
       confirm_meta?: string
@@ -2103,7 +2101,7 @@ describe('submit_file (dual-secret + path safety)', () => {
     const choice = opts.tokenChoice ?? 'clean'
     const confirm = opts.confirmOverride
       ?? (choice === 'clean' ? first.confirm_clean! : first.confirm_meta!)
-    return tool.handler({ ...args, confirm }, { sessionId: fx.sessionId, producer: fx.producer })
+    return tool.handler({ ...args, confirm }, { sessionId: fx.sessionId, channel: fx.channel })
   }
 
   it('first call returns rules + token pair (rules mention assistant-must-end)', async () => {
@@ -2125,7 +2123,7 @@ describe('submit_file (dual-secret + path safety)', () => {
   it('clean-token + valid dump → writes TOBE + scheduled response', async () => {
     // Need at least one forkable revision in the session — submit_file uses
     // it as the fork-point anchor for the emitted event.
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
     const dump = writeDump('valid.jsonl', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
@@ -2211,7 +2209,7 @@ describe('submit_file (dual-secret + path safety)', () => {
   })
 
   it('handles CRLF line endings (Windows-style dumps)', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session' }])
     const dump = path.join(dumpsRoot, 'crlf.jsonl')
     // Same content as a valid dump but with \r\n separators.
     fs.writeFileSync(dump,
@@ -2288,7 +2286,7 @@ describe('submit_file (dual-secret + path safety)', () => {
   })
 
   it('clean-token + allow_meta_refs=true bypasses regex', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
     const dump = writeDump('valid.jsonl', [
       { role: 'user', content: 'q' },
       { role: 'assistant', content: 'a' },
@@ -2306,7 +2304,7 @@ describe('submit_file (dual-secret + path safety)', () => {
       { role: 'user', content: 'q' },
       { role: 'assistant', content: 'a' },
     ])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
     await submitTwoStep({ path: dump, message: 'continue' })
     const ev = fx.db.prepare(
       `SELECT payload FROM events WHERE topic = 'fork.back_requested' AND session_id = ? ORDER BY event_id DESC LIMIT 1`,
@@ -2321,7 +2319,7 @@ describe('submit_file (dual-secret + path safety)', () => {
       { role: 'user', content: 'historical q' },
       { role: 'assistant', content: 'historical a' },
     ])
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
     await submitTwoStep({ path: dump, message: 'continue' })
     const row = fx.db.prepare('SELECT branch_context_json FROM sessions WHERE id = ?').get(fx.sessionId) as
       | { branch_context_json: string | null } | undefined
@@ -2335,8 +2333,8 @@ describe('submit_file (dual-secret + path safety)', () => {
 // ─── gcDumps (daemon GC sweep) ───────────────────────────────────────────────
 
 describe('createMcpToolsWithTokens (defensive construction)', () => {
-  function deps() {
-    const fx = fixture()
+  async function deps() {
+    const fx = await fixture()
     return {
       fx,
       asDeps: {
@@ -2348,8 +2346,8 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
     }
   }
 
-  it('throws if rewind store is missing in the object form', () => {
-    const { fx, asDeps } = deps()
+  it('throws if rewind store is missing in the object form', async () => {
+    const { fx, asDeps } = await deps()
     try {
       expect(() => createMcpToolsWithTokens(
         asDeps,
@@ -2360,8 +2358,8 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
     finally { fx.cleanup() }
   })
 
-  it('throws if submit store is missing in the object form', () => {
-    const { fx, asDeps } = deps()
+  it('throws if submit store is missing in the object form', async () => {
+    const { fx, asDeps } = await deps()
     try {
       expect(() => createMcpToolsWithTokens(
         asDeps,
@@ -2372,8 +2370,8 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
     finally { fx.cleanup() }
   })
 
-  it('accepts a single ConfirmTokenStore (back-compat with rewind-only tests)', () => {
-    const { fx, asDeps } = deps()
+  it('accepts a single ConfirmTokenStore (back-compat with rewind-only tests)', async () => {
+    const { fx, asDeps } = await deps()
     try {
       expect(() => createMcpToolsWithTokens(asDeps, new ConfirmTokenStore())).not.toThrow()
     }
@@ -2389,13 +2387,13 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
 
 describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () => {
   let fx: TestFixture
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
   })
   afterEach(() => fx.cleanup())
 
   it('first-call rules text contains the parallel-tool warning', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const res = await call(fx, 'rewind_to', { turn_back_n: 1, message: 'X' }) as {
       status: string
       rules: string
@@ -2406,15 +2404,15 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
   })
 
   it('writes synthetic SR-construction metadata to TOBE (no tool_use_id; derived later)', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    emitTurn(fx, 'end_turn', [
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
     ])
     // R1 — its response body shape is irrelevant since the parallel-tool guard
     // and tool_use_id derivation moved to proxy-handler at TOBE-consumption time.
-    const r1 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
+    const r1 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
     await rewindTwoStep(fx, { turn_back_n: 1, message: 'plan B' })
     const pending = fx.tobeStore.peek(fx.sessionId)
     expect(pending).toBeTruthy()
@@ -2438,13 +2436,13 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
   })
 
   it('TOBE roundtrip: write + peek preserves synthetic fields through fs', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
     ])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
     await rewindTwoStep(fx, { turn_back_n: 1, message: 'roundtrip me' })
     const pendingPath = fx.tobeStore.fileFor(fx.sessionId)
     const raw = JSON.parse(fs.readFileSync(pendingPath, 'utf8')) as { synthetic?: Record<string, unknown> }
@@ -2455,13 +2453,13 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
   })
 
   it('rewindScheduledResponse loud-failure text mentions parallel-tool cause', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    emitTurn(fx, 'end_turn', [
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
     ])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
     const res = await rewindTwoStep(fx, { turn_back_n: 1, message: 'plan B' }) as {
       status: string
       message: string
@@ -2476,8 +2474,8 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
   let fx: TestFixture
   let dumpsDir: string
 
-  beforeEach(() => {
-    fx = fixture()
+  beforeEach(async () => {
+    fx = await fixture()
     dumpsDir = mkdtempSync(path.join(tmpdir(), 'retcon-test-dumps-'))
     process.env.RETCON_HOME = path.dirname(dumpsDir)
     // Move dumps to <RETCON_HOME>/dumps to satisfy retconDumpsDir().
@@ -2512,19 +2510,19 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
       { rewind: tokenStore, submit: new ConfirmTokenStore() },
     )
     const tool = tools.get('submit_file')!
-    const first = await tool.handler(args, { sessionId: fx.sessionId, producer: fx.producer }) as {
+    const first = await tool.handler(args, { sessionId: fx.sessionId, channel: fx.channel }) as {
       status: string
       confirm_clean?: string
     }
     if (first.status !== 'rules_returned') return first
     return tool.handler(
       { ...args, confirm: first.confirm_clean! },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     )
   }
 
   it('first-call rules text contains the parallel-tool warning', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const dumpPath = writeDump('seed.jsonl', [
       { role: 'user', content: 'old' },
       { role: 'assistant', content: 'old reply' },
@@ -2536,7 +2534,7 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
     })
     const res = await tools.get('submit_file')!.handler(
       { path: dumpPath, message: 'X' },
-      { sessionId: fx.sessionId, producer: fx.producer },
+      { sessionId: fx.sessionId, channel: fx.channel },
     ) as { status: string, rules: string }
     expect(res.status).toBe('rules_returned')
     expect(res.rules).toMatch(/PARALLEL TOOLS/i)
@@ -2544,8 +2542,8 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
   })
 
   it('writes synthetic SR-construction metadata (no tool_use_id; derived later)', async () => {
-    const t1 = emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    const r1 = emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
+    const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    const r1 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
     const dumpPath = writeDump('happy.jsonl', [
       { role: 'user', content: 'edited 1' },
       { role: 'assistant', content: 'edited reply' },
@@ -2569,8 +2567,8 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
   })
 
   it('submitScheduledResponse loud-failure text mentions parallel-tool cause', async () => {
-    emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
-    emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
+    await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
+    await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
     const dumpPath = writeDump('loud.jsonl', [
       { role: 'user', content: 'a' },
       { role: 'assistant', content: 'b' },

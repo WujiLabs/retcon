@@ -23,7 +23,7 @@ import http from 'node:http'
 import { generateTraceId } from '@playtiss/core'
 
 import type { BindingTable } from './binding-table.js'
-import type { EventProducer } from './events.js'
+import type { Channel } from './channel.js'
 import type { SessionQueue } from './session-queue.js'
 import { VERSION } from './version.js'
 
@@ -39,7 +39,7 @@ export const PROTOCOL_VERSION = '2025-03-26'
 export const MCP_MAX_BODY_BYTES = 1024 * 1024
 
 export interface McpContext {
-  readonly producer: EventProducer
+  readonly channel: Channel
   /** Tool handlers keyed by name (with MCP-spec metadata). Wired in C8. */
   readonly tools: Map<string, McpTool>
   /**
@@ -60,7 +60,7 @@ export interface McpContext {
 
 export type McpToolHandler = (
   args: unknown,
-  ctx: { sessionId: string, producer: EventProducer },
+  ctx: { sessionId: string, channel: Channel },
 ) => Promise<unknown>
 
 /**
@@ -222,7 +222,7 @@ async function handleInitialize(
   }
   const harness = params.clientInfo?.name ?? 'unknown'
 
-  ctx.producer.emit(
+  await ctx.channel.submit(
     'mcp.session_initialized',
     {
       mcp_session_id: sessionId,
@@ -271,7 +271,7 @@ async function handleToolsCall(
   // /v1/messages the proxy is processing for the same session.
   const invoke = (): Promise<unknown> => tool.handler(params?.arguments ?? {}, {
     sessionId,
-    producer: ctx.producer,
+    channel: ctx.channel,
   })
   const result = ctx.sessionQueue
     ? await ctx.sessionQueue.run(sessionId, invoke)
@@ -288,7 +288,7 @@ async function handleMcpDelete(
 ): Promise<void> {
   const sessionId = extractSessionId(req, ctx.bindingTable)
   if (sessionId) {
-    ctx.producer.emit('mcp.session_closed', {}, sessionId)
+    await ctx.channel.submit('mcp.session_closed', {}, sessionId)
   }
   res.writeHead(204)
   res.end()
