@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { applyTask, type Task, taskRef, type TaskId } from '../channel-types.js'
+import { applyTask, type Task, type TaskId, taskRef } from '../channel-types.js'
 import { buildTopicIndex, depsOf, dispatchOrderForTopic, topoSort } from '../projector-runner.js'
 
 function noopApply(): void { /* test stub */ }

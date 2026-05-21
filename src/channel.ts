@@ -249,15 +249,27 @@ export function createChannel(opts: ChannelOptions): Channel {
         // per-dispatch + readable in logs.
         const spName = `sp_${i}_${task.id.slice(-8).replace(/[^a-zA-Z0-9]/g, '_')}`
         db.exec(`SAVEPOINT ${spName}`)
+        let applyThrew: unknown
         try {
           task.apply(event, db)
+        }
+        catch (err) {
+          applyThrew = err
+        }
+        // Branch on apply()'s outcome, NOT inside the try/catch. This keeps
+        // the offset-bump and substrate-event insert OUTSIDE the apply()
+        // exception trap — those are channel-bookkeeping writes; if they
+        // throw, that's a channel-level failure (DB I/O) that propagates
+        // as Promise rejection, not a re-classification of the projector
+        // as exception-after-it-already-accepted.
+        if (applyThrew === undefined) {
           db.exec(`RELEASE ${spName}`)
           outcomes.push({ kind: 'accept', taskId: task.id })
           // Bump the projection_offsets row for this Task — the accept
           // outcome is implicit in this offset advancement (Q1=c).
           upsertOffset.run(task.id, event.id)
         }
-        catch (err) {
+        else {
           // Roll back this projector's partial writes to the savepoint.
           // The event row + previously accepted projectors stay.
           db.exec(`ROLLBACK TO ${spName}`)
@@ -265,7 +277,7 @@ export function createChannel(opts: ChannelOptions): Channel {
           // (otherwise the savepoint stays open and subsequent SAVEPOINTs
           // accumulate). Per SQLite docs.
           db.exec(`RELEASE ${spName}`)
-          const errStr = err instanceof Error ? err.message : String(err)
+          const errStr = applyThrew instanceof Error ? applyThrew.message : String(applyThrew)
           outcomes.push({ kind: 'exception', taskId: task.id, error: errStr })
           // Defer the substrate-event INSERT until after the dispatch loop
           // completes. Doing it inline here would interleave projection.exception

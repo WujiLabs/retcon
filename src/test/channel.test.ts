@@ -17,8 +17,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { applyTask, type Task, taskRef, type TaskId } from '../channel-types.js'
 import { createChannel } from '../channel.js'
+import { applyTask, type Task, taskRef } from '../channel-types.js'
 import { type DB, migrate, openDb } from '../db.js'
 import { defaultTasks } from '../server.js'
 

@@ -34,11 +34,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { createChannel } from '../channel.js'
 import { closeDb, migrate, openDb } from '../db.js'
 import { createMcpTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
-import { createChannel } from '../channel.js'
-import { defaultTasks, DEFAULT_PORT, type ServerHandle, startServer } from '../server.js'
+import { DEFAULT_PORT, defaultTasks, type ServerHandle, startServer } from '../server.js'
 import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile, retconTobeDir } from './paths.js'

@@ -25,8 +25,8 @@ import zlib from 'node:zlib'
 
 import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes, blobRefFromMessagesBody } from './body-blob.js'
-import type { DB } from './db.js'
 import type { Channel } from './channel.js'
+import type { DB } from './db.js'
 import type { BlobRef } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import {
@@ -1266,15 +1266,20 @@ async function dispatch(
       }
       // emitTerminal is async; await before resolve() so the SessionQueue
       // sees the terminal event landed before the next session-scoped
-      // request begins (G2 sequencing invariant).
-      void emitTerminal(
+      // request begins (G2 sequencing invariant). Surface channel-level
+      // failures via process.stderr rather than swallowing them — a void
+      // Promise rejection from inside an event handler would otherwise
+      // crash with UnhandledPromiseRejection on some Node configs.
+      emitTerminal(
         'proxy.upstream_error',
         {
           request_event_id: requestEvent.id,
           status: 502,
           error_message: err.message,
         },
-      ).then(() => resolve())
+      ).catch((emitErr: unknown) => {
+        process.stderr.write(`[retcon] emitTerminal failed: ${String(emitErr)}\n`)
+      }).finally(() => resolve())
     })
 
     upstreamReq.on('response', (upstreamRes) => {
@@ -1323,13 +1328,17 @@ async function dispatch(
             })
             upstreamRes.on('error', (err) => {
               if (!res.writableEnded) res.destroy(err)
-              void emitTerminal(
+              // Same Promise-rejection-surfacing pattern as the
+              // upstreamReq.on('error') handler above.
+              emitTerminal(
                 'proxy.response_aborted',
                 {
                   request_event_id: requestEvent.id,
                   reason: `upstream_stream_error: ${err.message}`,
                 },
-              ).finally(() => done())
+              ).catch((emitErr: unknown) => {
+                process.stderr.write(`[retcon] emitTerminal failed: ${String(emitErr)}\n`)
+              }).finally(() => done())
             })
           })
 

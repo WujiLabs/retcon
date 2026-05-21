@@ -23,11 +23,11 @@
 // pattern that hooks emit() to call each Task's apply() inside the same
 // transaction. arianna or other consumers would write their own runner.
 
-import { computeHash } from '@playtiss/core'
 import type { AssetId } from '@playtiss/core'
+import { computeHash } from '@playtiss/core'
 
 import type { DB } from './db.js'
-import type { BlobRef, Event } from './events.js'
+import type { Event } from './events.js'
 
 /**
  * Opaque action identifier for v0.3. Full L3.4 form (Action-as-Task) deferred.
@@ -148,9 +148,9 @@ export interface KV<K extends string = string, V = string> {
  * own outcome — possibly also exception, recorded the same way (L1.10
  * Explicit Discarding).
  */
-export type Outcome =
-  | { kind: 'accept', taskId: TaskId }
-  | { kind: 'exception', taskId: TaskId, error: string }
+export type Outcome
+  = | { kind: 'accept', taskId: TaskId }
+    | { kind: 'exception', taskId: TaskId, error: string }
 
 /**
  * Returned from {@link Channel.submit}. Carries the recorded event row and

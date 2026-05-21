@@ -16,10 +16,10 @@
 // async pull from `subscribe()` once that ships in v0.4.
 
 import {
+  isTaskRef,
   type Task,
   type TaskId,
   type TaskInput,
-  isTaskRef,
 } from './channel-types.js'
 
 /**
