@@ -17,11 +17,12 @@
 import fs from 'node:fs'
 import http from 'node:http'
 
+import type { Channel } from '@playtiss/core/channel'
+import { applyTask, type Task, taskRef } from '@playtiss/core/channel'
+
 import { handleActorRegister } from './actor-register.js'
 import { BindingTable } from './binding-table.js'
 import { BranchViewsV1Projector } from './branch-views-v1.js'
-import type { Channel } from './channel.js'
-import { applyTask, type Task, taskRef } from './channel-types.js'
 import type { DB } from './db.js'
 import { createEventProducer, type EventProducer, type Projection } from './events.js'
 import { ForkAwaiter } from './fork-awaiter.js'

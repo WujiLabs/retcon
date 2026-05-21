@@ -11,9 +11,10 @@ import fs, { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { type Channel, createChannel } from '@playtiss/core/channel'
+import { SqliteStorageProvider } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { type Channel, createChannel } from '../channel.js'
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
 import { type Event } from '../events.js'
@@ -26,7 +27,6 @@ import {
   META_REFS,
 } from '../mcp-tools.js'
 import { defaultTasks } from '../server.js'
-import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore, type TobeStore } from '../tobe.js'
 
 interface TestFixture {

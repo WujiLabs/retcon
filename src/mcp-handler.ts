@@ -21,9 +21,9 @@
 import http from 'node:http'
 
 import { generateTraceId } from '@playtiss/core'
+import type { Channel } from '@playtiss/core/channel'
 
 import type { BindingTable } from './binding-table.js'
-import type { Channel } from './channel.js'
 import type { SessionQueue } from './session-queue.js'
 import { VERSION } from './version.js'
 

@@ -24,9 +24,10 @@
 
 import http from 'node:http'
 
+import type { Channel } from '@playtiss/core/channel'
+
 import type { BindingTable } from './binding-table.js'
 import { ActorConflictError, rebindSession } from './binding-table.js'
-import type { Channel } from './channel.js'
 import type { DB } from './db.js'
 import { SESSION_HEADER } from './proxy-handler.js'
 import { readBoundedBody } from './util/http-body.js'

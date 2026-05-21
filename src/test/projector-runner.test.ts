@@ -5,10 +5,9 @@
 // algorithm + TaskRef extraction so a future contributor can't silently
 // reintroduce the array-positional dispatch order risk.
 
+import { applyTask, type Task, type TaskId, taskRef } from '@playtiss/core/channel'
+import { buildTopicIndex, depsOf, dispatchOrderForTopic, topoSort } from '@playtiss/core/channel'
 import { describe, expect, it } from 'vitest'
-
-import { applyTask, type Task, type TaskId, taskRef } from '../channel-types.js'
-import { buildTopicIndex, depsOf, dispatchOrderForTopic, topoSort } from '../projector-runner.js'
 
 function noopApply(): void { /* test stub */ }
 

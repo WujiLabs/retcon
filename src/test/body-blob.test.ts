@@ -5,6 +5,7 @@
 // The bytes-blob path is exercised indirectly by every other test that
 // emits a request_received event, so we don't repeat that here.
 
+import { SqliteStorageProvider } from '@playtiss/core/channel'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -13,7 +14,6 @@ import {
   loadHydratedMessagesBody,
 } from '../body-blob.js'
 import { type DB, migrate, openDb } from '../db.js'
-import { SqliteStorageProvider } from '../storage.js'
 
 function buildBody(messages: unknown[], tools?: unknown[]): Uint8Array {
   const body: Record<string, unknown> = { model: 'claude-test', messages }

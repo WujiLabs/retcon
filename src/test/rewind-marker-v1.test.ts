@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { SqliteStorageProvider } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { blobRefFromBytes, blobRefFromMessagesBody, loadHydratedMessagesBody } from '../body-blob.js'
@@ -26,7 +27,6 @@ import { createEventConsumer, createEventProducer, type EventProducer } from '..
 import { RevisionsV1Projector } from '../revisions-v1.js'
 import { buildSyntheticAsset, type ForkForkedPayload, RewindMarkerV1Projector } from '../rewind-marker-v1.js'
 import { SessionsV1Projector } from '../sessions-v1.js'
-import { SqliteStorageProvider } from '../storage.js'
 
 interface TestFixture {
   db: DB

@@ -3,25 +3,29 @@
 //
 // Schema + migrations for the proxy's SQLite database.
 //
-// Two layers:
-//   1. Source of truth (append-only, immutable):  blobs, events, projection_offsets
-//   2. Projected views (rebuildable from events): sessions, tasks, revisions, branch_views
+// Two ownership layers (Step 2+ of the channel refactor):
+//   1. Channel-owned (via @playtiss/core/channel): blobs, events,
+//      task_metadata, channel_schema_version. Created by channel.migrate(db).
+//   2. Retcon-owned (here): schema_version, sessions, tasks, revisions,
+//      branch_views, pending_actors, projection_offsets (legacy — copied
+//      to channel's task_metadata in the v7→v8 migration; kept for
+//      forensic value).
+//
+// retcon's migrate() calls channel.migrate FIRST (channel's tables must
+// exist before retcon's v7→v8 step references task_metadata), then runs
+// retcon's own per-version migration registry.
 //
 // Migration policy: NEVER wipe an on-disk DB silently. If we find an older
 // schema version, we (1) make a `VACUUM INTO` snapshot of the file at
 // `<dbPath>.bak.v<old>.<ts>` so the user can fall back, then (2) iterate
 // the MIGRATIONS registry from <old> → CURRENT_SCHEMA_VERSION applying
 // each step's SQL. Missing migration step ⇒ throw with the backup path
-// in the message, leaving the original DB untouched. The user decides
-// whether to downgrade retcon, restore the backup, or wipe manually.
-//
-// Empty MIGRATIONS for now: v5 is the only release in the wild and the
-// only entry path is fresh-install. Future schema bumps register a
-// function under from-version → from-version+1.
+// in the message, leaving the original DB untouched.
 
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
+import { migrate as channelMigrate } from '@playtiss/core/channel'
 import Database from 'better-sqlite3'
 
 export type DB = Database.Database
@@ -38,7 +42,7 @@ export type DB = Database.Database
 // metadata that survives a tool_use-chained post-rewind turn, so fork.forked
 // can fire when an end_turn eventually arrives instead of dropping silently.
 // Backfill is just a NULL column add — additive, no data rewrite.
-export const CURRENT_SCHEMA_VERSION = 7
+export const CURRENT_SCHEMA_VERSION = 8
 
 // Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N
 // and brings it to N+1. Add an entry whenever you bump
@@ -59,6 +63,26 @@ const MIGRATIONS: Record<number, (db: DB) => void> = {
   6: (db) => {
     db.exec('ALTER TABLE sessions ADD COLUMN branch_context_fork_id TEXT')
   },
+  // v8 (Step 2 of channel refactor): the channel package now owns blobs,
+  // events, and task_metadata. projection_offsets stays in retcon's
+  // schema as legacy (forensic value) but the channel reads/writes
+  // task_metadata for per-Task offsets. Migrate existing data so the
+  // channel sees what retcon's pre-Step-2 projectors had committed.
+  //
+  // task_metadata is created by channel.migrate(db) which runs BEFORE
+  // this step (see migrate() below).
+  7: (db) => {
+    db.exec(`
+      INSERT INTO task_metadata (task_id, key, value)
+        SELECT projection_id, 'events_offset', last_processed_event_id
+          FROM projection_offsets
+       WHERE last_processed_event_id IS NOT NULL
+         AND last_processed_event_id != ''
+      ON CONFLICT (task_id, key) DO NOTHING
+    `)
+    // projection_offsets table left in place for forensic value; v0.4
+    // can drop it after a release cycle confirms nothing reads it.
+  },
 }
 
 // Single source of truth for the schema_version table DDL. Used in two
@@ -71,31 +95,13 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 `
 
+// Step 2+: blobs / events / event indexes / task_metadata are channel-owned
+// (created by channel.migrate). projection_offsets stays in retcon's schema
+// as a legacy table — pre-Step-2 DBs have data here that the v7→v8 migration
+// copies into channel's task_metadata. Kept for forensic value; v0.4 can
+// drop after a release cycle.
 const SOURCE_OF_TRUTH_SCHEMA = `
 ${SCHEMA_VERSION_DDL}
-
-CREATE TABLE IF NOT EXISTS blobs (
-  cid TEXT PRIMARY KEY,
-  bytes BLOB NOT NULL,
-  size INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS events (
-  event_id TEXT PRIMARY KEY,
-  topic TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  session_id TEXT,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic, event_id);
-CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, event_id);
--- Composite index for "all events of topic X in session Y, in event_id order".
--- Used by recall's rewind_events query (filter to fork.back_requested in this
--- session). Without this, idx_events_session covers session_id but post-filters
--- topic — on long sessions with thousands of non-rewind events, that scan is
--- expensive. CREATE IF NOT EXISTS is additive on upgrade; no migration needed.
-CREATE INDEX IF NOT EXISTS idx_events_session_topic ON events(session_id, topic, event_id);
 
 CREATE TABLE IF NOT EXISTS projection_offsets (
   projection_id TEXT PRIMARY KEY,
@@ -252,6 +258,14 @@ export function closeDb(db: DB): void {
  * skip the backup since there's no file to copy.
  */
 export function migrate(db: DB, dbPath?: string): void {
+  // Step 2+: the channel package owns blobs/events/task_metadata/
+  // channel_schema_version. Run channel.migrate FIRST so those tables
+  // exist before retcon's own migrations reference them — in particular,
+  // the v7→v8 step writes to task_metadata. channel.migrate is idempotent;
+  // safe to call on every openDb. The channel tracks its version
+  // separately in `channel_schema_version`.
+  channelMigrate(db)
+
   // schema_version belongs to source-of-truth, but we read from it before
   // the rest of the schema exists. Create just that table first, idempotently.
   db.exec(SCHEMA_VERSION_DDL)

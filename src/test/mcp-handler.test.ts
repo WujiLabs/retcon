@@ -4,9 +4,9 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { createChannel } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createChannel } from '../channel.js'
 import { migrate, openDb } from '../db.js'
 import { createEventConsumer } from '../events.js'
 import { MCP_SESSION_HEADER, type McpTool } from '../mcp-handler.js'

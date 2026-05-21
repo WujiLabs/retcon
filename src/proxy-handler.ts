@@ -23,9 +23,10 @@ import https from 'node:https'
 import { URL } from 'node:url'
 import zlib from 'node:zlib'
 
+import type { Channel } from '@playtiss/core/channel'
+
 import type { BindingTable } from './binding-table.js'
 import { blobRefFromBytes, blobRefFromMessagesBody } from './body-blob.js'
-import type { Channel } from './channel.js'
 import type { DB } from './db.js'
 import type { BlobRef } from './events.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'

@@ -12,9 +12,9 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { createChannel } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createChannel } from '../channel.js'
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer } from '../events.js'
 import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER, stripTtlViolations } from '../proxy-handler.js'

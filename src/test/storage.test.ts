@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Wuji Labs Inc
 // SPDX-License-Identifier: MIT
 import type { AssetId } from '@playtiss/core'
+import { SqliteStorageProvider } from '@playtiss/core/channel'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import type { DB } from '../db.js'
 import { migrate, openDb } from '../db.js'
-import { SqliteStorageProvider } from '../storage.js'
 
 describe('SqliteStorageProvider', () => {
   let db: DB

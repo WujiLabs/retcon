@@ -16,16 +16,16 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { createChannel } from '@playtiss/core/channel'
+import { SqliteStorageProvider } from '@playtiss/core/channel'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { blobRefFromBytes, blobRefFromMessagesBody } from '../body-blob.js'
-import { createChannel } from '../channel.js'
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer, createEventProducer } from '../events.js'
 import { ConfirmTokenStore, createMcpToolsWithTokens } from '../mcp-tools.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
 import { defaultProjectors, defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 
 interface E2EFixture {

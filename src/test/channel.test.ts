@@ -15,10 +15,10 @@
 //   - Per-projector SAVEPOINT isolation (one throw doesn't roll back accepted
 //     siblings' writes).
 
+import { createChannel } from '@playtiss/core/channel'
+import { applyTask, type Task, taskRef } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createChannel } from '../channel.js'
-import { applyTask, type Task, taskRef } from '../channel-types.js'
 import { type DB, migrate, openDb } from '../db.js'
 import { defaultTasks } from '../server.js'
 
@@ -141,11 +141,13 @@ describe('createChannel + defaultTasks (happy path)', () => {
     expect(callOrder).toEqual(['a', 'b'])
   })
 
-  it('taskMetadata.set on unknown key is a silent no-op (v0.3 single-key limit)', async () => {
+  it('taskMetadata accepts free-form keys (Step 2+ generic task_metadata table)', async () => {
     const channel = createChannel({ db })
     const id = await applyTask('test.action', {})
     const md = channel.taskMetadata(id)
     md.set('arbitrary_key', 'value')
+    expect(md.get('arbitrary_key')).toBe('value')
+    md.delete('arbitrary_key')
     expect(md.get('arbitrary_key')).toBeNull()
     md.set('events_offset', 'evt-123')
     expect(md.get('events_offset')).toBe('evt-123')

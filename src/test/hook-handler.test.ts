@@ -10,10 +10,10 @@
 
 import http from 'node:http'
 
+import { type Channel, createChannel } from '@playtiss/core/channel'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { BindingTable } from '../binding-table.js'
-import { type Channel, createChannel } from '../channel.js'
 import { type DB, migrate, openDb } from '../db.js'
 import { handleSessionStartHook } from '../hook-handler.js'
 import { SESSION_HEADER } from '../proxy-handler.js'

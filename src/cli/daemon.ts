@@ -34,12 +34,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { createChannel } from '../channel.js'
+import { createChannel } from '@playtiss/core/channel'
+import { SqliteStorageProvider } from '@playtiss/core/channel'
+
 import { closeDb, migrate, openDb } from '../db.js'
 import { createMcpTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { DEFAULT_PORT, defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { SqliteStorageProvider } from '../storage.js'
 import { createTobeStore } from '../tobe.js'
 import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile, retconTobeDir } from './paths.js'
 
