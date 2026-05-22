@@ -2,6 +2,34 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [Unreleased] — channel substrate refactor
+
+Internal substrate refactor. retcon's event log, content-addressed blob storage, and projector dispatch now ride on `@playtiss/core/channel` instead of proxy-local code. No user-visible behavior change; the v7→v8 migration was verified byte-for-byte against a 1.77 GB production DB.
+
+The point of this work is to make the substrate reusable. arianna (the AI-collaborator sibling project) needs the same event-log + Task-dispatch primitives; rather than copy retcon's code, those primitives move into `@playtiss/core/channel` where any consumer can import them. retcon becomes the reference implementation of an Observer Actor over the Channel substrate.
+
+### Changed
+
+- **Event log, blob storage, and projector dispatch moved to `@playtiss/core/channel`.** The proxy-local `channel.ts`, `channel-types.ts`, `projector-runner.ts`, and `storage.ts` files are gone. retcon imports `createChannel`, `migrate`, `applyTask`, `taskRef`, and `SqliteStorageProvider` from the new subpath. The channel's interface follows the Collaboration Protocol's L4 verb naming: `submit()` (was `emit()`), with async return shape so future cross-process channels swap in without breaking callers.
+- **Projectors register as `Task`s with content-hashed identity.** Each projector becomes a `Task` whose `id` is `applyTask(action, input)` — a CID derived from `(action, input)` via dag-json + SHA-256. Same logical Task → same TaskId across processes. Dispatch order is derived from declarative `TaskRef` dependencies inside each Task's input dict, not from array position. Topo-sort is lazy (deferred until first `submit()`) so registration order doesn't matter.
+- **Per-projector SAVEPOINT exception isolation.** Each Task's `apply()` runs inside its own SAVEPOINT inside the outer `BEGIN IMMEDIATE`. If one projector throws, its partial writes roll back; the event row, earlier accepted projectors, and downstream projectors all stay landed. The exception is recorded as a `projection.exception` substrate event so L1.10 Explicit Discarding holds.
+- **Outcomes are first-class.** `submit()` returns `{ event, outcomes }` where `outcomes` lists one `accept` or `exception` per Task subscribed to the topic, in dispatch order. Channel-level failures (DB I/O, primary-key collision on the event row itself) propagate as Promise rejection — distinct from projector exceptions, which are part of the resolved outcome.
+
+### Schema
+
+- v7 → v8: introduces `task_metadata (task_id, key, value)` (owned by `@playtiss/core/channel`). The v7→v8 step copies `projection_offsets.last_processed_event_id` rows into `task_metadata.events_offset` so the channel sees what retcon's pre-Step-2 projectors had committed. `projection_offsets` stays in the schema as legacy/forensic; nothing reads it post-v8. Verified non-destructive on a 1.77 GB DB (64 076 events, 232 659 blobs, 165 sessions, 28 950 revisions) in ~7.3 s.
+- The channel package now tracks its own version in a separate `channel_schema_version` table (initial v1). `channel.migrate(db)` runs FIRST inside retcon's `migrate()`; retcon's own v7→v8 step references `task_metadata` and depends on the channel's tables existing.
+
+### Tests
+
+- `playtiss-core` ships a 128-test suite covering channel migration idempotency, SAVEPOINT-isolated exception cascades, lazy topo-sort, TaskRef dependency walking, content-hashed Task identity, and `applyTask` determinism.
+- `playtiss-proxy` retains all existing tests (509 unit + 16 integration); none required logic changes for the switchover. Test wiring imports `Channel` from `@playtiss/core/channel` instead of the deleted local modules.
+
+### For contributors
+
+- New `playtiss-proxy/scripts/step4-byte-equality.mjs` — verifies on the most-recent on-disk backup that the v7→v8 migration produces byte-identical retcon-owned tables (sessions, tasks, revisions, branch_views, projection_offsets, pending_actors, schema_version) and that `task_metadata` matches `projection_offsets` row-for-row. Use it before shipping any future channel-version bump that touches retcon-owned tables.
+- `EventProducer` / `defaultProjectors` / `Projection` interface are retained in `src/events.ts` and `src/server.ts` for test-time seeding but are no longer wired into production. Production goes through `Channel.submit()`. Migrating tests off these (and then deleting the legacy code) is a follow-up.
+
 ## [0.5.5] - 2026-05-08
 
 Fork lifecycle: closes a class of false-positive divergence releases, makes the released-state visible to the AI, and ships the multi-block-aware injection detection that the cli-tmux integration test had been quietly failing for. Same-day forensic on session b17275fb (3 healthy rewinds released within 4 minutes each on 2026-05-06) — three bugs found, one user-feature added on top.

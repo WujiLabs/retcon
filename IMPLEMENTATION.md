@@ -277,6 +277,8 @@ Format detection is sniff-based: any top blob whose decoded value is an object w
 
 retcon is event-sourced. The `events` table is append-only and authoritative; the `sessions`, `tasks`, `revisions`, `branch_views` tables are projected views derived from events. Projectors are pure state machines keyed on event topics; they run synchronously inside the same transaction as the event insert (the "event-emit invariant").
 
+The event log, content-addressed blob storage, and projector dispatch live in `@playtiss/core/channel` since v0.5.6. retcon constructs a `Channel` over its SQLite handle and registers each projector as a `Task` — the Channel runs the actual dispatch. Same in-process synchronous-dispatch behavior as before; same `events` and `blobs` tables. The split moves the substrate primitives out so any consumer (today retcon; soon arianna) can ride the same protocol-conformant Channel without copy-pasting code.
+
 Projectors that ship by default:
 
 - `sessions_v1` — creates session rows from `mcp.session_initialized` and `proxy.request_received`; merges binding-token rows on `session.rebound`.
@@ -284,7 +286,24 @@ Projectors that ship by default:
 - `branch_views_v1` — manages branch_views from `fork.bookmark_created`, `fork.forked`, `fork.label_updated`, `fork.bookmark_deleted`, and auto-advance from `proxy.response_completed`. Auto fork-point views materialize from `fork.forked` (success-only); `fork.back_requested` is audit-only and no projector consumes it.
 - `rewind_marker_v1` — INSERTs SR rows from `fork.forked`. Topic-disjoint from the others.
 
-The dispatch order matters. `sessions_v1` runs first so the session/task rows exist before `revisions_v1` tries to FK against them. `revisions_v1` runs before `branch_views_v1` so that `revisions.parent_revision_id` is set when branch_views_v1 reads it for auto-advance.
+Dispatch order is now declared via `TaskRef` dependencies in each projector's Task input dict, not by array position. `revisions_v1` declares `{ sessions: taskRef(sessionsId) }`; `branch_views_v1` and `rewind_marker_v1` both declare `{ revisions: taskRef(revisionsId) }`. The Channel's runner walks each Task's input recursively, harvests every `{ kind: 'task_ref', id }` value, and topologically sorts. Same effective ordering as the pre-Step-2 hardcoded array (sessions → revisions → branch_views, with rewind_marker after revisions), but reordering registration calls can no longer silently break dispatch.
+
+### Per-projector SAVEPOINT isolation
+
+Each projector's `apply()` runs inside its own SQLite SAVEPOINT inside the outer `BEGIN IMMEDIATE`. When a projector throws:
+
+- Its partial writes roll back (`ROLLBACK TO sp_<i>_<...>` + `RELEASE`).
+- The event row, earlier accepted projectors' writes, and downstream projectors all stay landed.
+- The Channel records the exception as a `projection.exception` substrate event (payload: source event id, task id, error message) so the L1.10 Explicit Discarding invariant holds — the throw becomes data, not a swallow.
+- `submit()` returns the per-Task `Outcome` (`accept` or `exception`) in dispatch order; the caller decides whether to surface the exception.
+
+`submit()` itself rejects only on channel-level failures (DB I/O, primary-key collision on the event row). Projector exceptions never void the event.
+
+### Two schema_version tables
+
+`@playtiss/core/channel` owns `blobs`, `events`, `task_metadata`, and `channel_schema_version`. retcon owns `schema_version`, `sessions`, `tasks`, `revisions`, `branch_views`, `pending_actors`, and the legacy `projection_offsets`. `migrate()` calls `channelMigrate(db)` FIRST (the channel's tables must exist before retcon's v7→v8 step references `task_metadata`), then runs retcon's own migration registry. Each tracks its own version independently — channel-version bumps don't force retcon code changes.
+
+The v7→v8 step copies `projection_offsets.last_processed_event_id` rows into `task_metadata` as `(task_id, 'events_offset', value)`. `projection_offsets` is left in place as legacy/forensic; nothing post-v8 reads from it. Verified non-destructive on a 1.77 GB production DB via `scripts/step4-byte-equality.mjs`.
 
 ## Stop-reason classifier
 
