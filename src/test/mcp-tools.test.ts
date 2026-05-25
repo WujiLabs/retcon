@@ -1468,7 +1468,7 @@ describe('rewind_to (dual-secret flow)', () => {
     }
     expect(res.status).toBe('scheduled')
     // Loud-failure response text — Decision #7.
-    expect(res.message).toMatch(/RETCON ERROR/)
+    expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
     expect(res.fork_point).toBe(t1.id)
     const pending = fx.tobeStore.peek(fx.sessionId)
     expect(pending).toBeTruthy()
@@ -2133,20 +2133,30 @@ describe('dump_to_file', () => {
     expect(res.error).toMatch(/not both/)
   })
 
-  it('uses branch_context_json when on a forked branch — slices trailing user (post-rewind reality)', async () => {
-    // Branch_context_json's tail is ALWAYS user-role in production (rewind_to
-    // sets it ending in the new user message; subsequent applyBranchContextRewrite
-    // extends it ending in the user just typed by claude — Anthropic requires
-    // request bodies end in user). dump_to_file must slice off the trailing
-    // user line(s) so the file ends at the most recent assistant response.
+  // v0.6: dump_to_file reads from the active fork_anchors row (was
+  // sessions.branch_context_json in v0.5.5). target_messages_json carries the
+  // splice prefix; its tail is ALWAYS user-role (synthetic_user_message).
+  // dump_to_file slices trailing user lines so the file ends at the most
+  // recent assistant response.
+  function seedActiveForkAnchor(db: DB, sessionId: string, targetMessages: unknown[]): string {
+    const token = `tok_${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`
+    db.prepare(`
+      INSERT INTO fork_anchors (
+        anchor_token, session_id, target_messages_json, target_messages_top_cid,
+        fork_point_revision_id, source_view_id, synthetic_metadata_json,
+        state, state_reason, acknowledged_at, created_at, released_at
+      ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'active', NULL, NULL, ?, NULL)
+    `).run(token, sessionId, JSON.stringify(targetMessages), Date.now())
+    return token
+  }
+
+  it('uses fork_anchors target_messages when on a forked branch — slices trailing user (post-rewind reality)', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    const branchMessages = [
+    seedActiveForkAnchor(fx.db, fx.sessionId, [
       { role: 'user', content: 'forked q' },
       { role: 'assistant', content: 'forked a' },
       { role: 'user', content: 'pending user (would-be next prompt)' },
-    ]
-    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
-      .run(JSON.stringify(branchMessages), fx.sessionId)
+    ])
     const res = await call(fx, 'dump_to_file', {}) as {
       path?: string
       message_count?: number
@@ -2164,40 +2174,32 @@ describe('dump_to_file', () => {
     expect(JSON.parse(lines[1]!).content).toBe('forked a')
   })
 
-  it('handles deeply-nested trailing-user branch_context (multi-user-tail)', async () => {
-    // Edge case: if for some reason branch_context has multiple consecutive
-    // trailing users, slice them all so we land on the most recent assistant.
+  it('handles deeply-nested trailing-user target_messages (multi-user-tail)', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
-    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
-      .run(JSON.stringify([
-        { role: 'user', content: 'u1' },
-        { role: 'assistant', content: 'a1' },
-        { role: 'user', content: 'u2' },
-        { role: 'user', content: 'u3' },
-      ]), fx.sessionId)
+    seedActiveForkAnchor(fx.db, fx.sessionId, [
+      { role: 'user', content: 'u1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'u2' },
+      { role: 'user', content: 'u3' },
+    ])
     const res = await call(fx, 'dump_to_file', {}) as { message_count: number, error?: string }
     if (res.error) throw new Error(res.error)
     expect(res.message_count).toBe(2) // [u1, a1]
   })
 
-  it('falls through to reconstructForkMessages if branch_context is all-user (corrupt state)', async () => {
-    // Pathological: branch_context is just users with no assistant. Slicing
-    // empties it; we fall through to reconstructForkMessages. With turn_back_n=1
-    // the target is one-before-head, which has a child (head) whose body
-    // contains the assistant response — reconstruct succeeds.
+  it('falls through to reconstructForkMessages if target_messages is all-user (corrupt state)', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'q1' },
       { role: 'assistant', content: 'a1' },
       { role: 'user', content: 'q2' },
     ])
-    fx.db.prepare('UPDATE sessions SET branch_context_json = ? WHERE id = ?')
-      .run(JSON.stringify([
-        { role: 'user', content: 'all-user-1' },
-        { role: 'user', content: 'all-user-2' },
-      ]), fx.sessionId)
-    // turn_back_n=1 targets the FIRST turn (q1's revision); branch_context
-    // is only consulted on the head case, so this dump uses reconstruct
+    seedActiveForkAnchor(fx.db, fx.sessionId, [
+      { role: 'user', content: 'all-user-1' },
+      { role: 'user', content: 'all-user-2' },
+    ])
+    // turn_back_n=1 targets the FIRST turn (q1's revision); fork_anchors is
+    // only consulted on the head case, so this dump uses reconstruct
     // directly without touching the corrupt state.
     const res = await call(fx, 'dump_to_file', { turn_back_n: 1 }) as {
       is_branch_view?: boolean
@@ -2205,7 +2207,7 @@ describe('dump_to_file', () => {
       error?: string
     }
     if (res.error) throw new Error(res.error)
-    expect(res.is_branch_view).toBe(false) // not the head, so branch_context not used
+    expect(res.is_branch_view).toBe(false) // not the head, so fork_anchors not used
     expect(res.message_count).toBeGreaterThanOrEqual(1)
   })
 
@@ -2365,7 +2367,7 @@ describe('submit_file (dual-secret + path safety)', () => {
       message_count: number
     }
     expect(res.status).toBe('scheduled')
-    expect(res.message).toMatch(/RETCON ERROR/)
+    expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
     expect(res.message_count).toBe(3) // 2 dump + 1 appended user
     const pending = fx.tobeStore.peek(fx.sessionId)!
     expect(pending.messages.length).toBe(3)
@@ -2545,17 +2547,19 @@ describe('submit_file (dual-secret + path safety)', () => {
     expect(parsed.dump_path).toContain('dumps')
   })
 
-  it('writes branch_context_json so submit persists across turns', async () => {
+  it('writes fork_anchors target_messages so submit persists across turns', async () => {
     const dump = writeDump('valid.jsonl', [
       { role: 'user', content: 'historical q' },
       { role: 'assistant', content: 'historical a' },
     ])
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'session-q' }])
     await submitTwoStep({ path: dump, message: 'continue' })
-    const row = fx.db.prepare('SELECT branch_context_json FROM sessions WHERE id = ?').get(fx.sessionId) as
-      | { branch_context_json: string | null } | undefined
-    expect(row?.branch_context_json).not.toBeNull()
-    const msgs = JSON.parse(row!.branch_context_json!) as Array<{ role: string }>
+    const row = fx.db.prepare(`
+      SELECT target_messages_json FROM fork_anchors
+       WHERE session_id = ? AND state = 'active' LIMIT 1
+    `).get(fx.sessionId) as { target_messages_json: string | null } | undefined
+    expect(row?.target_messages_json).not.toBeNull()
+    const msgs = JSON.parse(row!.target_messages_json!) as Array<{ role: string }>
     expect(msgs.length).toBe(3) // 2 dump + 1 appended user
     expect(msgs[2]!.role).toBe('user')
   })
@@ -2634,31 +2638,37 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
     expect(res.rules).toMatch(/lose their results/i)
   })
 
-  it('writes synthetic SR-construction metadata to TOBE (no tool_use_id; derived later)', async () => {
+  it('writes synthetic SR-construction metadata to fork_anchors (no tool_use_id; derived later)', async () => {
     const t1 = await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
     await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
       { role: 'assistant', content: 'a' },
       { role: 'user', content: 'q2' },
     ])
-    // R1 — its response body shape is irrelevant since the parallel-tool guard
-    // and tool_use_id derivation moved to proxy-handler at TOBE-consumption time.
     const r1 = await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
     await rewindTwoStep(fx, { turn_back_n: 1, message: 'plan B' })
-    const pending = fx.tobeStore.peek(fx.sessionId)
-    expect(pending).toBeTruthy()
-    expect(pending!.synthetic).toBeTruthy()
-    const s = pending!.synthetic!
+    const row = fx.db.prepare(`
+      SELECT synthetic_metadata_json FROM fork_anchors
+       WHERE session_id = ? AND state = 'active' LIMIT 1
+    `).get(fx.sessionId) as { synthetic_metadata_json: string | null }
+    expect(row.synthetic_metadata_json).toBeTruthy()
+    const s = JSON.parse(row.synthetic_metadata_json!) as Record<string, unknown> & {
+      kind: string
+      parent_revision_id: string
+      synthetic_user_message: string
+      synthetic_revision_id: string
+      synthetic_tool_result_text: string
+      synthetic_assistant_text: string
+      target_view_id: string
+      back_requested_at: number
+    }
     expect(s.kind).toBe('rewind')
     expect(s.parent_revision_id).toBe(r1.id)
     expect(s.synthetic_user_message).toBe('plan B')
     expect(s.synthetic_revision_id).toMatch(/^[a-z0-9]/i)
     expect(s.synthetic_revision_id).not.toBe(r1.id)
     expect(s.synthetic_revision_id).not.toBe(t1.id)
-    // tool_use_id intentionally absent — proxy-handler derives it from
-    // claude's pre-splice JSON body at TOBE consumption.
-    expect((s as Record<string, unknown>).tool_use_id).toBeUndefined()
-    // R2'/R3' content includes the fork target in shorthand form.
+    expect(s.tool_use_id).toBeUndefined()
     expect(s.synthetic_tool_result_text).toContain(t1.id.slice(0, 8))
     expect(s.synthetic_tool_result_text).toContain('plan B')
     expect(s.synthetic_assistant_text).toContain(t1.id.slice(0, 8))
@@ -2666,7 +2676,7 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
     expect(s.back_requested_at).toBeGreaterThan(0)
   })
 
-  it('TOBE roundtrip: write + peek preserves synthetic fields through fs', async () => {
+  it('fork_anchors row persists synthetic fields through SQL roundtrip', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
     await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
@@ -2675,15 +2685,19 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
     ])
     await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q3' }])
     await rewindTwoStep(fx, { turn_back_n: 1, message: 'roundtrip me' })
-    const pendingPath = fx.tobeStore.fileFor(fx.sessionId)
-    const raw = JSON.parse(fs.readFileSync(pendingPath, 'utf8')) as { synthetic?: Record<string, unknown> }
+    const row = fx.db.prepare(`
+      SELECT synthetic_metadata_json FROM fork_anchors
+       WHERE session_id = ? AND state = 'active' LIMIT 1
+    `).get(fx.sessionId) as { synthetic_metadata_json: string | null }
+    expect(row.synthetic_metadata_json).toBeTruthy()
+    const raw = { synthetic: JSON.parse(row.synthetic_metadata_json!) } as { synthetic?: Record<string, unknown> }
     expect(raw.synthetic).toBeTruthy()
     expect(raw.synthetic!.kind).toBe('rewind')
     expect(raw.synthetic!.synthetic_user_message).toBe('roundtrip me')
     expect(typeof raw.synthetic!.back_requested_at).toBe('number')
   })
 
-  it('rewindScheduledResponse loud-failure text mentions parallel-tool cause', async () => {
+  it('rewindScheduledResponse embeds anchor token (v0.6)', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
     await emitTurn(fx, 'end_turn', [
       { role: 'user', content: 'first' },
@@ -2696,8 +2710,7 @@ describe('rewind_to: rules + extended TOBE shape (Phase 1, v0.5.0-alpha.1)', () 
       message: string
     }
     expect(res.status).toBe('scheduled')
-    expect(res.message).toMatch(/RETCON ERROR/)
-    expect(res.message).toMatch(/parallel tool_uses/i)
+    expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
   })
 })
 
@@ -2797,7 +2810,7 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
     expect(s.synthetic_assistant_text).toMatch(/Submission applied/)
   })
 
-  it('submitScheduledResponse loud-failure text mentions parallel-tool cause', async () => {
+  it('submitScheduledResponse embeds anchor token (v0.6)', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'first' }])
     await emitTurn(fx, 'tool_use', [{ role: 'user', content: 'q2' }])
     const dumpPath = writeDump('loud.jsonl', [
@@ -2809,8 +2822,7 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
       message: string
     }
     expect(res.status).toBe('scheduled')
-    expect(res.message).toMatch(/RETCON ERROR/)
-    expect(res.message).toMatch(/parallel tool_uses/i)
+    expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
   })
 })
 
