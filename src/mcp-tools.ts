@@ -35,6 +35,13 @@ import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import { retconDumpsDir } from './cli/paths.js'
 import type { DB } from './db.js'
 import { lastForkOutcome } from './fork-awaiter.js'
+import {
+  buildAnchorToolResultText,
+  generateAnchorToken,
+  getActiveAnchor,
+  insertActiveAnchor,
+  TARGET_MESSAGES_MAX_BYTES,
+} from './fork-anchors.js'
 import type { McpTool } from './mcp-handler.js'
 import type { TobeStore } from './tobe.js'
 
@@ -890,40 +897,39 @@ function rewindRegexRejectedResponse(
 }
 
 /**
- * The "scheduled" response. Decision #7: invisible-success, loud-failure.
- * If the AI sees this text, the splice didn't run and the user needs to
- * hear about it. On the success path, the proxy's body-splice replaces the
- * entire turn carrying this response, so the AI never reads it.
+ * The "scheduled" response — carries the v0.6 anchor token.
+ *
+ * The `message` text embeds `<retcon-anchor token="tok_..." />` which the
+ * proxy's applyAnchorSplice scans for in claude's next /v1/messages body
+ * (specifically in tool_result content). When found, the splice replaces
+ * the body with [target_messages, ...messages_after_anchor_turn].
+ *
+ * Unlike the v0.5.x "RETCON ERROR" loud-failure scaffold, this response
+ * is friendly and informational — claude stores it in local jsonl unchanged.
+ * The failure signal moves to a `<retcon-released>` reminder injected by
+ * the proxy on subsequent /v1/messages whenever the fork's state is
+ * `released` and `acknowledged_at` is still NULL.
  */
 function rewindScheduledResponse(extra: {
   fork_point: string
   target_view_id: string
-  pending_path: string
+  anchor_token: string
   prior_outcome: unknown
 }): {
   status: string
   message: string
   fork_point: string
   target_view_id: string
-  pending_path: string
+  anchor_token: string
   prior_outcome: unknown
   next_steps: string
 } {
   return {
     status: 'scheduled',
-    message: [
-      'RETCON ERROR: If you are reading this, the rewind did NOT take effect.',
-      'Tell the user: "retcon failed to apply the rewind. The next message will not be in the rewound state."',
-      'They may need to retry, or run `retcon stop && retcon` to restart the daemon.',
-      '',
-      'POSSIBLE CAUSE — did you call rewind_to alongside other tools in the same assistant turn?',
-      'Parallel tool_uses with rewind_to abort the splice (their results would be discarded by the rewound context). If that\'s what happened, retry rewind_to alone — no parallel tools — on a later turn.',
-      '',
-      '(On the success path, the proxy splices the rewound history into the next /v1/messages and this entire turn is discarded — meaning you never see this text. Reading it means the splice failed.)',
-    ].join('\n'),
+    message: buildAnchorToolResultText('rewind', extra.anchor_token),
     fork_point: extra.fork_point,
     target_view_id: extra.target_view_id,
-    pending_path: extra.pending_path,
+    anchor_token: extra.anchor_token,
     prior_outcome: extra.prior_outcome,
     next_steps: 'WAIT for the next message from the user — that\'s where the rewind lands. Do not call further tools, do not generate any other output for this turn. The proxy will splice the rewound history into your next /v1/messages call automatically.',
   }
@@ -1028,7 +1034,7 @@ function submitScheduledResponse(extra: {
   path: string
   fork_point: string | null
   target_view_id: string
-  pending_path: string
+  anchor_token: string
   message_count: number
 }): {
   status: string
@@ -1036,26 +1042,17 @@ function submitScheduledResponse(extra: {
   path: string
   fork_point: string | null
   target_view_id: string
-  pending_path: string
+  anchor_token: string
   message_count: number
   next_steps: string
 } {
   return {
     status: 'scheduled',
-    message: [
-      'RETCON ERROR: If you are reading this, the submit did NOT take effect.',
-      'Tell the user: "retcon failed to apply the submitted dump. The next message will not include the edits."',
-      'They may need to retry, or run `retcon stop && retcon` to restart the daemon.',
-      '',
-      'POSSIBLE CAUSE — did you call submit_file alongside other tools in the same assistant turn?',
-      'Parallel tool_uses with submit_file abort the splice (their results would be discarded by the submitted context). If that\'s what happened, retry submit_file alone — no parallel tools — on a later turn.',
-      '',
-      '(On the success path, the proxy splices the submitted history into the next /v1/messages and this entire turn is discarded — meaning you never see this text. Reading it means the splice failed.)',
-    ].join('\n'),
+    message: buildAnchorToolResultText('submit', extra.anchor_token),
     path: extra.path,
     fork_point: extra.fork_point,
     target_view_id: extra.target_view_id,
-    pending_path: extra.pending_path,
+    anchor_token: extra.anchor_token,
     message_count: extra.message_count,
     next_steps: 'WAIT for the next message from the user — that\'s where the submitted dump lands. Do not call further tools, do not generate any other output for this turn.',
   }
@@ -1748,11 +1745,29 @@ export function createMcpToolsWithTokens(
         = `Rewind initiated. Jumping to rev_${forkShort}.`
       const backRequestedAt = Date.now()
 
-      deps.tobeStore.write(ctx.sessionId, {
-        messages: baseMessages,
+      // v0.6 anchor mechanism: write the active fork_anchors row. The proxy's
+      // applyAnchorSplice scans claude's next /v1/messages body for the
+      // anchor_token embedded in our tool_result reply (see
+      // rewindScheduledResponse below) and splices target_messages_json
+      // in place of everything before-and-including that tool_result turn.
+      // Replaces the v0.5.5 branch_context_json + branch_context_fork_id
+      // mechanism (asst-text continuity check, fresh-fork token skip) with
+      // one cleanly-anchored handle.
+      const anchorToken = generateAnchorToken()
+      const targetMessagesJson = JSON.stringify(baseMessages)
+      if (targetMessagesJson.length > TARGET_MESSAGES_MAX_BYTES) {
+        return {
+          status: 'error',
+          message: `rewind_to: target_messages would exceed the ${TARGET_MESSAGES_MAX_BYTES} byte cap. Rewind to a more recent turn (less history to splice) and try again.`,
+        }
+      }
+      insertActiveAnchor(deps.db, {
+        anchor_token: anchorToken,
+        session_id: ctx.sessionId,
+        target_messages_json: targetMessagesJson,
         fork_point_revision_id: target.id,
         source_view_id: ctx.sessionId,
-        synthetic: r1
+        synthetic_metadata: r1
           ? {
               kind: 'rewind',
               target_view_id: targetViewId,
@@ -1765,17 +1780,6 @@ export function createMcpToolsWithTokens(
             }
           : undefined,
       })
-
-      // Persistent fork branch context — see daemon for downstream consumers.
-      // forkId is persisted alongside so the divergence guard can detect
-      // "fresh fork" (synthetic_user_message at branch_context's tail) by
-      // exact-equality match against the column.
-      deps.db.prepare(`
-        UPDATE sessions
-           SET branch_context_json = ?,
-               branch_context_fork_id = ?
-         WHERE id = ?
-      `).run(JSON.stringify(baseMessages), forkId, ctx.sessionId)
 
       await ctx.channel.submit(
         'fork.back_requested',
@@ -1797,7 +1801,7 @@ export function createMcpToolsWithTokens(
       return rewindScheduledResponse({
         fork_point: target.id,
         target_view_id: targetViewId,
-        pending_path: deps.tobeStore.fileFor(ctx.sessionId),
+        anchor_token: anchorToken,
         prior_outcome: prior,
       })
     },
@@ -2103,17 +2107,15 @@ export function createMcpToolsWithTokens(
       }
       else {
         // No args: default to "current dumpable state". If a forked branch
-        // is active (branch_context_json set), that's the source — and the
-        // target is the current branch head. Otherwise the head's response
-        // body isn't reliably available from the request-body chain (the
-        // head's child doesn't exist yet), so we step back one forkable
+        // is active (fork_anchors row with state='active'), that's the source
+        // — and the target is the current branch head. Otherwise the head's
+        // response body isn't reliably available from the request-body chain
+        // (the head's child doesn't exist yet), so we step back one forkable
         // turn — `reconstructForkMessages(target=N-1)` uses head as the
         // child and slices off head's user input, ending the dump at the
         // one-before-head's assistant response.
-        const branchRowEarly = deps.db.prepare(
-          'SELECT branch_context_json FROM sessions WHERE id = ?',
-        ).get(ctx.sessionId) as { branch_context_json: string | null } | undefined
-        if (branchRowEarly?.branch_context_json) {
+        const activeAnchorEarly = getActiveAnchor(deps.db, ctx.sessionId)
+        if (activeAnchorEarly) {
           target = mostRecentForkableRevision(deps.db, sess.task_id)
           if (!target) return { error: 'forked branch active but no forkable turn anchors it' }
         }
@@ -2129,33 +2131,26 @@ export function createMcpToolsWithTokens(
         }
       }
 
-      // Resolve messages. If we're on a forked branch (branch_context_json
-      // populated) AND the target IS the current branch head, dump the
-      // branch's view directly — that's the truth of what Anthropic has been
-      // seeing across this branch's lifetime. Otherwise reconstruct from the
-      // request body via reconstructForkMessages (same path rewind_to uses).
+      // Resolve messages. If we're on a forked branch (active fork_anchors
+      // row present) AND the target IS the current branch head, dump the
+      // anchor's target_messages_json directly — that's the splice prefix
+      // we use on every /v1/messages; the most-recent assistant + new user
+      // input arrive on claude's side post-splice and aren't in our store.
+      // Otherwise reconstruct from the request body via reconstructForkMessages.
       //
-      // CRITICAL: branch_context_json's tail is ALWAYS user-role in production.
-      // rewind_to writes it as [history..., new_user_message]; subsequent
-      // applyBranchContextRewrite extends it to [..., asst, final_user]
-      // because Anthropic requires request bodies end in user. So when we
-      // adopt branch_context as the dump source, we MUST slice off the
-      // trailing user line(s) to satisfy the load-bearing assistant-tail
-      // rule. See proxy-handler.ts:240-274 for the upstream invariant.
+      // CRITICAL: target_messages_json's tail is ALWAYS user-role
+      // (synthetic_user_message). Slice off trailing user line(s) so the dump
+      // ends at the most recent assistant response. The post-splice tail
+      // (asst + new_user) lives in claude's local jsonl, not in our DB.
       let messages: unknown[] | null = null
-      const branchRow = deps.db.prepare(
-        'SELECT branch_context_json FROM sessions WHERE id = ?',
-      ).get(ctx.sessionId) as { branch_context_json: string | null } | undefined
+      const activeAnchor = getActiveAnchor(deps.db, ctx.sessionId)
       const headRev = mostRecentForkableRevision(deps.db, sess.task_id)
       const isHead = headRev?.id === target.id
-      const usedBranchView = isHead && !!branchRow?.branch_context_json
+      const usedBranchView = isHead && !!activeAnchor?.target_messages_json
       if (usedBranchView) {
         try {
-          const parsedJson = JSON.parse(branchRow!.branch_context_json!) as unknown
+          const parsedJson = JSON.parse(activeAnchor!.target_messages_json!) as unknown
           if (Array.isArray(parsedJson)) {
-            // Slice off any trailing user line(s) so the dump ends at the
-            // most recent assistant response. Empty result falls through to
-            // reconstructForkMessages.
             const trimmed = [...parsedJson]
             while (
               trimmed.length > 0
@@ -2480,11 +2475,24 @@ export function createMcpToolsWithTokens(
         = `Submission applied. Continuing from edited conversation.`
       const backRequestedAt = Date.now()
 
-      deps.tobeStore.write(ctx.sessionId, {
-        messages: finalMessages,
+      // v0.6 anchor mechanism: write the active fork_anchors row. Symmetric
+      // with rewind_to — the anchor token in the returned tool_result drives
+      // applyAnchorSplice on the next /v1/messages.
+      const anchorToken = generateAnchorToken()
+      const finalMessagesJson = JSON.stringify(finalMessages)
+      if (finalMessagesJson.length > TARGET_MESSAGES_MAX_BYTES) {
+        return {
+          status: 'error',
+          message: `submit_file: target messages would exceed the ${TARGET_MESSAGES_MAX_BYTES} byte cap. Trim the dump and try again.`,
+        }
+      }
+      insertActiveAnchor(deps.db, {
+        anchor_token: anchorToken,
+        session_id: ctx.sessionId,
+        target_messages_json: finalMessagesJson,
         fork_point_revision_id: headForkable.id,
         source_view_id: ctx.sessionId,
-        synthetic: r1
+        synthetic_metadata: r1
           ? {
               kind: 'submit',
               target_view_id: targetViewId,
@@ -2497,16 +2505,6 @@ export function createMcpToolsWithTokens(
             }
           : undefined,
       })
-
-      // Persist as branch context (same as rewind_to) so subsequent turns
-      // continue on the submitted branch. forkId persisted alongside so the
-      // divergence guard can detect "fresh fork" via exact-equality match.
-      deps.db.prepare(`
-        UPDATE sessions
-           SET branch_context_json = ?,
-               branch_context_fork_id = ?
-         WHERE id = ?
-      `).run(JSON.stringify(finalMessages), forkId, ctx.sessionId)
 
       await ctx.channel.submit(
         'fork.back_requested',
@@ -2531,7 +2529,7 @@ export function createMcpToolsWithTokens(
         path: resolvedPath,
         fork_point: headForkable.id,
         target_view_id: targetViewId,
-        pending_path: deps.tobeStore.fileFor(ctx.sessionId),
+        anchor_token: anchorToken,
         message_count: finalMessages.length,
       })
     },

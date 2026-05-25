@@ -29,6 +29,7 @@ import type { Channel } from '@playtiss/core/channel'
 import type { BindingTable } from './binding-table.js'
 import { ActorConflictError, rebindSession } from './binding-table.js'
 import type { DB } from './db.js'
+import { markSessionActiveAnchorsReleased } from './fork-anchors.js'
 import { SESSION_HEADER } from './proxy-handler.js'
 import { readBoundedBody } from './util/http-body.js'
 
@@ -139,22 +140,17 @@ export async function handleSessionStartHook(
     ctx.bindingTable.set(transportId, sessionId)
   }
 
-  // Clear any active fork override on /clear or /compact. claude has just
-  // dropped or rewritten its local conversation history; persisting our
-  // own override past that point would either re-inflate the bytes claude
-  // just compressed (compact) or revive a conversation the user explicitly
-  // wiped (clear). Either way, hand the wheel back to claude.
+  // Release any active fork on /clear or /compact. claude has just dropped
+  // or rewritten its local conversation history; persisting our own override
+  // past that point would either re-inflate the bytes claude just compressed
+  // (compact) or revive a conversation the user explicitly wiped (clear).
+  // Either way, hand the wheel back to claude.
   if (source === 'clear' || source === 'compact') {
-    const result = ctx.db
-      .prepare(`UPDATE sessions
-                   SET branch_context_json = NULL,
-                       branch_context_fork_id = NULL
-                 WHERE id = ? AND branch_context_json IS NOT NULL`)
-      .run(sessionId)
-    if (result.changes > 0) {
+    const releasedTokens = markSessionActiveAnchorsReleased(ctx.db, sessionId, source)
+    if (releasedTokens.length > 0) {
       await ctx.channel.submit(
         'session.branch_context_cleared',
-        { session_id: sessionId, source },
+        { session_id: sessionId, source, anchor_tokens: releasedTokens },
         sessionId,
       )
     }
