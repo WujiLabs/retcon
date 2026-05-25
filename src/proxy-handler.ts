@@ -31,9 +31,7 @@ import type { DB } from './db.js'
 import type { BlobRef } from './events.js'
 import {
   applyAnchorSplice,
-  getActiveAnchorSyntheticMetadata,
   getMostRecentUnacknowledgedRelease,
-  setActiveAnchorSyntheticMetadata,
 } from './fork-anchors.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import {
@@ -283,85 +281,11 @@ function findLastForkAppliedTurn(db: DB, sessionId: string): string | null {
  * into the reply however it judges best — same calling-AI-decides
  * pattern as the v0.5.4 `<retcon-active>` reminder.
  */
-/**
- * Build the `<retcon-released>` reminder as separate text blocks — one per
- * logical section, matching claude code's `<system-reminder>`-per-block
- * pattern. Mirrors mcp-tools.ts:buildActiveReminderBlocks. The user's
- * actual message is appended as a separate UNWRAPPED block by the caller.
- */
-function buildReleaseReminderBlocks(lastForkAppliedTurn: string | null): Array<{ type: 'text', text: string }> {
-  const blocks: Array<{ type: 'text', text: string }> = []
-  blocks.push({
-    type: 'text',
-    text: [
-      '<retcon-released>',
-      '[system note from retcon proxy — NOT from the user]',
-      'A retcon fork that was active has just been released. retcon detected your local conversation view diverged from the fork\'s history — most commonly because the user typed claude code\'s `/rewind`, OR a Task subagent fired /v1/messages with a body that doesn\'t carry the fork\'s tail.',
-      'What this means: the conversation you are now seeing is your local view, NOT the fork\'s history. Earlier turns from inside the fork are no longer in scope for retcon\'s splice.',
-      '</retcon-released>',
-    ].join('\n'),
-  })
-  if (lastForkAppliedTurn) {
-    blocks.push({
-      type: 'text',
-      text: [
-        '<retcon-released>',
-        'LAST FORK-APPLIED TURN:',
-        `  turn_id: ${lastForkAppliedTurn}`,
-        '  This was the most recent turn where the fork was successfully spliced and advanced the conversation. To dive back into that context (or as close as possible):',
-        `    - inspect what was there: recall(turn_id="${lastForkAppliedTurn}")`,
-        `    - resume the fork branch with a fresh user message: rewind_to(turn_id="${lastForkAppliedTurn}", message="...")`,
-        `    - inspect-and-edit before resuming: dump_to_file(turn_id="${lastForkAppliedTurn}") then edit + submit_file`,
-        '</retcon-released>',
-      ].join('\n'),
-    })
-  }
-  blocks.push({
-    type: 'text',
-    text: [
-      '<retcon-released>',
-      'PROPAGATION — important:',
-      'No matter how you handle the user\'s request (answer fully, decline, partial answer, anything), ALWAYS include a brief mention of this release in your response output. The recipient of your response may be the user directly, OR — if you are a Task subagent — a parent agent who reads your response as a tool result. Either way, the release notice has to propagate through the chain so the user eventually sees it. Best-effort relay: each link passes it along.',
-      'Recommended one-liner you can drop into your response (exact wording up to you, just say enough that a parent agent reading this can pass it on):',
-      lastForkAppliedTurn
-        ? `  "(retcon: prior fork released — last fork-applied turn was \`${lastForkAppliedTurn}\`; \`recall\`/\`rewind_to\` it to resume that context)"`
-        : '  "(retcon: a prior fork was just released — earlier fork history is no longer in scope; use `recall` + `rewind_to` to refork if needed)"',
-      '</retcon-released>',
-    ].join('\n'),
-  })
-  return blocks
-}
-
-/**
- * Inject the release reminder blocks at the front of the last user message's
- * content array. Returns true on success; false if the body shape is
- * unexpected (last message not user-role, or content shape unrecognized).
- * Mutates `parsedBody.messages[last]` in place.
- *
- * `lastForkAppliedTurn` (when non-null) gets included in the reminder as
- * the suggested rewind target, so the AI can guide the user back into
- * the (now-released) fork's content.
- */
-function injectReleaseReminderInPlace(
-  parsedBody: { messages?: unknown[] },
-  lastForkAppliedTurn: string | null,
-): boolean {
-  if (!Array.isArray(parsedBody.messages) || parsedBody.messages.length === 0) return false
-  const last = parsedBody.messages[parsedBody.messages.length - 1] as
-    | { role?: string, content?: unknown }
-    | undefined
-  if (!last || last.role !== 'user') return false
-  const reminderBlocks = buildReleaseReminderBlocks(lastForkAppliedTurn)
-  if (typeof last.content === 'string') {
-    last.content = [...reminderBlocks, { type: 'text', text: last.content }]
-    return true
-  }
-  if (Array.isArray(last.content)) {
-    last.content.unshift(...reminderBlocks)
-    return true
-  }
-  return false
-}
+// v0.5.x one-shot release reminder helpers (buildReleaseReminderBlocks /
+// injectReleaseReminderInPlace) deleted in the v0.6 cutover. The persistent
+// reminder (buildPersistentReleaseReminderBlocks / injectPersistentReleaseReminder
+// below) replaces both, firing on every /v1/messages while a released
+// fork_anchors row has acknowledged_at IS NULL.
 
 /**
  * Build the persistent `<retcon-released>` reminder text. Used by the v0.6

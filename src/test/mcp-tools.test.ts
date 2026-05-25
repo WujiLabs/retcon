@@ -113,6 +113,42 @@ async function call(fx: TestFixture, name: string, args: unknown, rewindEnabled 
 }
 
 /**
+ * v0.6 test shim: read the active fork_anchors row for this session and
+ * return it in the TOBE-shape that pre-v0.6 tests expect (so the assertions
+ * about messages, fork_point_revision_id, synthetic don't need rewriting
+ * one-by-one). Returns null when no active anchor exists (mirroring
+ * tobeStore.peek's null-on-no-pending contract).
+ */
+function peekAnchorAsTobe(db: DB, sessionId: string): {
+  messages: unknown[]
+  fork_point_revision_id: string
+  source_view_id: string
+  synthetic?: Record<string, unknown>
+} | null {
+  const row = db.prepare(`
+    SELECT target_messages_json, fork_point_revision_id, source_view_id,
+           synthetic_metadata_json
+      FROM fork_anchors
+     WHERE session_id = ? AND state = 'active'
+     LIMIT 1
+  `).get(sessionId) as {
+    target_messages_json: string | null
+    fork_point_revision_id: string | null
+    source_view_id: string | null
+    synthetic_metadata_json: string | null
+  } | undefined
+  if (!row?.target_messages_json) return null
+  return {
+    messages: JSON.parse(row.target_messages_json) as unknown[],
+    fork_point_revision_id: row.fork_point_revision_id ?? '',
+    source_view_id: row.source_view_id ?? '',
+    synthetic: row.synthetic_metadata_json
+      ? (JSON.parse(row.synthetic_metadata_json) as Record<string, unknown>)
+      : undefined,
+  }
+}
+
+/**
  * Two-step rewind_to helper: first call returns rules + tokens; second call
  * (with `confirm` set to the clean token by default) does the actual work.
  * Most tests want the second-call result; this hides the dance.
@@ -1407,7 +1443,7 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(res.confirm_clean).toMatch(/^[A-Za-z0-9]{8}$/)
     expect(res.confirm_meta).toMatch(/^[A-Za-z0-9]{8}$/)
     // No TOBE side effects.
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('static-value rejection: confirm="acknowledged" routes back to fresh first call', async () => {
@@ -1470,7 +1506,7 @@ describe('rewind_to (dual-secret flow)', () => {
     // Loud-failure response text — Decision #7.
     expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
     expect(res.fork_point).toBe(t1.id)
-    const pending = fx.tobeStore.peek(fx.sessionId)
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)
     expect(pending).toBeTruthy()
     // The last message is now a user-role turn whose content array contains
     // a `<retcon-active>` reminder block + the AI's `message` arg verbatim
@@ -1508,7 +1544,7 @@ describe('rewind_to (dual-secret flow)', () => {
       { role: 'user', content: 'q2' },
     ])
     await rewindTwoStep(fx, { turn_back_n: 1, message: 'change A to B' })
-    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)!
     const last = pending.messages[pending.messages.length - 1] as {
       content: Array<{ type: string, text: string }>
     }
@@ -1542,7 +1578,7 @@ describe('rewind_to (dual-secret flow)', () => {
     ])
     const verbatim = 'EXACT VERBATIM 12345 (changing my earlier answer of A)'
     await rewindTwoStep(fx, { turn_back_n: 1, message: verbatim })
-    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)!
     const last = pending.messages[pending.messages.length - 1] as {
       role: string
       content: Array<{ type: string, text: string }>
@@ -1571,7 +1607,7 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(res.message).toMatch(/Good catch/)
     expect(res.message).toMatch(/clean=/)
     expect(res.message).toMatch(/meta=/)
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('narrow regex catches "see above" on clean-token path', async () => {
@@ -1585,7 +1621,7 @@ describe('rewind_to (dual-secret flow)', () => {
     // "see/saw/read above" branch of META_REFS without over-escaping.
     expect(res.matched_pattern).toContain('see|saw|read')
     expect(res.matched_pattern).toContain('above')
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('narrow regex no-false-positive: "the previous algorithm" succeeds (regression guard)', async () => {
@@ -1600,7 +1636,7 @@ describe('rewind_to (dual-secret flow)', () => {
       message: 'the previous algorithm was O(n²)',
     }) as { status: string }
     expect(res.status).toBe('scheduled')
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeTruthy()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeTruthy()
   })
 
   it('allow_meta_refs=true bypasses the regex backstop', async () => {
@@ -1801,7 +1837,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
       `SELECT COUNT(*) AS n FROM events WHERE topic = 'fork.back_disabled_rejected' AND session_id = ?`,
     ).get(fx.sessionId) as { n: number }
     expect(row.n).toBe(1)
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('rejects turn_back_n < 1', async () => {
@@ -1851,7 +1887,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
       error?: string
     }
     expect(res.status).toBe('scheduled')
-    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)!
     const msgs = pending.messages as Array<{ content: string | Array<{ type: string, text: string }> }>
     expect(msgs[0]!.content).toBe('from-target')
     // The last message is the synthetic user turn — content is now an array
@@ -1889,7 +1925,7 @@ describe('rewind_to (existing F4 / orphan / size-cap / feature-gate behavior)', 
     }
     expect(res.status).toBeUndefined()
     expect(res.error).toMatch(/no usable source blob/)
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('includes prior_outcome from the last TOBE-applied request', async () => {
@@ -2369,7 +2405,7 @@ describe('submit_file (dual-secret + path safety)', () => {
     expect(res.status).toBe('scheduled')
     expect(res.message).toMatch(/<retcon-anchor token="tok_[0-9a-f]{12}" \/>/)
     expect(res.message_count).toBe(3) // 2 dump + 1 appended user
-    const pending = fx.tobeStore.peek(fx.sessionId)!
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)!
     expect(pending.messages.length).toBe(3)
     const last = pending.messages[2] as {
       role: string
@@ -2502,7 +2538,7 @@ describe('submit_file (dual-secret + path safety)', () => {
     ) as { status: string, message: string }
     expect(res.status).toBe('rejected')
     expect(res.message).toMatch(/Good catch/)
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('clean-token + regex-flagged message → rejection (no TOBE)', async () => {
@@ -2515,7 +2551,7 @@ describe('submit_file (dual-secret + path safety)', () => {
       message: 'see above for context',
     }) as { status: string }
     expect(res.status).toBe('rejected')
-    expect(fx.tobeStore.peek(fx.sessionId)).toBeNull()
+    expect(peekAnchorAsTobe(fx.db, fx.sessionId)).toBeNull()
   })
 
   it('clean-token + allow_meta_refs=true bypasses regex', async () => {
@@ -2796,7 +2832,7 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
       status: string
     }
     expect(res.status).toBe('scheduled')
-    const pending = fx.tobeStore.peek(fx.sessionId)
+    const pending = peekAnchorAsTobe(fx.db, fx.sessionId)
     expect(pending).toBeTruthy()
     expect(pending!.synthetic).toBeTruthy()
     const s = pending!.synthetic!

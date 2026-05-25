@@ -34,7 +34,6 @@ import { generateTraceId } from '@playtiss/core'
 import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import { retconDumpsDir } from './cli/paths.js'
 import type { DB } from './db.js'
-import { lastForkOutcome } from './fork-awaiter.js'
 import {
   buildAnchorToolResultText,
   generateAnchorToken,
@@ -42,6 +41,7 @@ import {
   insertActiveAnchor,
   TARGET_MESSAGES_MAX_BYTES,
 } from './fork-anchors.js'
+import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
 import type { TobeStore } from './tobe.js'
 
