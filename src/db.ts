@@ -47,7 +47,14 @@ export type DB = Database.Database
 // task_metadata. The v7→v8 step copies projection_offsets rows into
 // task_metadata. projection_offsets stays for forensic value; nothing post-v8
 // reads it.
-export const CURRENT_SCHEMA_VERSION = 8
+//
+// v9 = anchor-based context replacement (v0.6). Adds fork_anchors table;
+// synthesizes ghost-released rows for any pre-existing branch_context_json
+// fork in v0.5.5 deployed DBs so the AI gets a one-shot release reminder
+// on the next /v1/messages; folds pending_synthetic_json into
+// fork_anchors.synthetic_metadata_json; drops branch_context_json,
+// branch_context_fork_id, pending_synthetic_json columns from sessions.
+export const CURRENT_SCHEMA_VERSION = 9
 
 // Per-version migrations. MIGRATIONS[N] takes a DB at schema_version=N
 // and brings it to N+1. Add an entry whenever you bump
@@ -88,6 +95,97 @@ const MIGRATIONS: Record<number, (db: DB) => void> = {
     // projection_offsets table left in place for forensic value; v0.4
     // can drop it after a release cycle confirms nothing reads it.
   },
+  // v9: anchor-based context-replacement cutover.
+  //
+  //   1. Create fork_anchors table.
+  //   2. For each session with non-NULL branch_context_json (v0.5.5 deployed
+  //      shape): synthesize a released ghost row in fork_anchors so the AI
+  //      gets a `<retcon-released>` reminder on the next /v1/messages and
+  //      knows to re-rewind. Anchor_token is a fresh synthetic value (won't
+  //      match any body content, so no false-splice). State_reason marks
+  //      the migration origin.
+  //   3. Fold sessions.pending_synthetic_json into the synthesized ghost
+  //      row's synthetic_metadata_json so an in-flight tool_use-chain
+  //      rewind can still materialize an SR row if the AI finishes the
+  //      chain post-upgrade.
+  //   4. Drop the three v0.5.x columns: branch_context_json,
+  //      branch_context_fork_id, pending_synthetic_json. SQLite 3.35+
+  //      supports ALTER TABLE DROP COLUMN; better-sqlite3 ships with a
+  //      newer SQLite than that.
+  8: (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS fork_anchors (
+        anchor_token TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        target_messages_json TEXT,
+        target_messages_top_cid TEXT,
+        fork_point_revision_id TEXT,
+        source_view_id TEXT,
+        synthetic_metadata_json TEXT,
+        state TEXT NOT NULL,
+        state_reason TEXT,
+        acknowledged_at INTEGER,
+        created_at INTEGER NOT NULL,
+        released_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_fork_anchors_session_state
+        ON fork_anchors(session_id, state);
+      CREATE INDEX IF NOT EXISTS idx_fork_anchors_session_unacked
+        ON fork_anchors(session_id, state, acknowledged_at);
+    `)
+    // Synthesize ghost-released rows for v0.5.5 active forks. crypto isn't
+    // available in this sync migration context; use a deterministic-ish
+    // suffix (session_id-derived) for the token. The token will NEVER appear
+    // in any body, so uniqueness only needs to hold among migrated rows.
+    const activeForks = db.prepare(`
+      SELECT s.id AS session_id,
+             s.branch_context_json,
+             s.pending_synthetic_json,
+             (SELECT r.id
+                FROM revisions r
+                JOIN sessions s2 ON s2.task_id = r.task_id
+               WHERE s2.id = s.id
+                 AND r.classification = 'closed_forkable'
+                 AND r.sealed_at IS NOT NULL
+               ORDER BY r.sealed_at DESC, r.id DESC
+               LIMIT 1) AS last_fork_applied
+        FROM sessions s
+       WHERE s.branch_context_json IS NOT NULL
+    `).all() as Array<{
+      session_id: string
+      branch_context_json: string
+      pending_synthetic_json: string | null
+      last_fork_applied: string | null
+    }>
+    const now = Date.now()
+    const insertGhost = db.prepare(`
+      INSERT INTO fork_anchors (
+        anchor_token, session_id, target_messages_json, target_messages_top_cid,
+        fork_point_revision_id, source_view_id, synthetic_metadata_json,
+        state, state_reason, acknowledged_at, created_at, released_at
+      ) VALUES (?, ?, NULL, NULL, ?, NULL, ?, 'released', 'migrated_from_v0_5_5', NULL, ?, ?)
+    `)
+    for (const f of activeForks) {
+      // Migration-only synthetic token: prefixed with `mig_` so it never
+      // matches the production regex `tok_<12hex>`. Uniqueness via the PK
+      // would catch a collision; using session_id makes the conflict
+      // effectively impossible.
+      const ghostToken = `mig_${f.session_id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24)}`
+      insertGhost.run(
+        ghostToken,
+        f.session_id,
+        f.last_fork_applied,
+        f.pending_synthetic_json,
+        now,
+        now,
+      )
+    }
+    // Drop the v0.5.x columns. They're forensic at this point and the new
+    // code doesn't reference them.
+    db.exec('ALTER TABLE sessions DROP COLUMN branch_context_json')
+    db.exec('ALTER TABLE sessions DROP COLUMN branch_context_fork_id')
+    db.exec('ALTER TABLE sessions DROP COLUMN pending_synthetic_json')
+  },
 }
 
 // Single source of truth for the schema_version table DDL. Used in two
@@ -122,41 +220,36 @@ CREATE TABLE IF NOT EXISTS sessions (
   ended_at INTEGER,
   pid INTEGER,
   harness TEXT,
-  actor TEXT NOT NULL DEFAULT 'default',
-  -- Persistent fork branch context. NULL when the session is on its
-  -- main branch; otherwise a JSON array of messages representing the
-  -- full conversation in the active forked branch (history up to the
-  -- fork point + every user/assistant pair since). proxy-handler reads
-  -- this on every /v1/messages and rewrites the upstream body to use
-  -- it as the messages array (plus claude's new user input when the
-  -- branch's tail is an assistant turn). Updated after every 2xx
-  -- response. Survives daemon restarts and --resume so cross-resume
-  -- forks stay coherent.
-  branch_context_json TEXT,
-  -- Deferred SR-construction metadata. NULL when no rewind/submit is
-  -- waiting for an end_turn. Set when a TOBE-consuming /v1/messages
-  -- closes with stop_reason=tool_use (the splice landed but the post-
-  -- rewind first turn chained more tool calls instead of finishing).
-  -- Cleared on the next end_turn (fork.forked fires then) or on a
-  -- dangling stop_reason (max_tokens/refusal — fork.synthesis_failed
-  -- fires) or when overwritten by a new rewind/submit. Carries the
-  -- synthetic metadata, the post-rewind first turn's revision id (=
-  -- to_revision_id in fork.forked), the fork-point revision id, and
-  -- the original (pre-splice) request body's CID so buildSyntheticAsset
-  -- can reconstruct the SR's content from blobs at fire-time.
-  pending_synthetic_json TEXT,
-  -- Per-fork random token (tok_ + 12 hex chars) retcon issues at
-  -- rewind_to/submit_file time and embeds in the synthetic_user_message
-  -- as a fork-id attribute on the retcon-active tag. proxy-handler.ts
-  -- uses exact-equality against this column to detect "branch_context
-  -- tail is still the synthetic" (fresh fork, no extension yet) and
-  -- skip the asst-text continuity check on the first post-rewind turn
-  -- (otherwise the rewound target's response, which may be compacted
-  -- out of claude local view, anchors the check and false-positive-
-  -- releases healthy forks). NULL when no fork active.
-  branch_context_fork_id TEXT
+  actor TEXT NOT NULL DEFAULT 'default'
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_actor ON sessions(actor);
+
+-- v0.6 anchor-based context replacement. rewind_to / submit_file insert an
+-- active row carrying target_messages_json (the splice prefix). The proxy's
+-- splice path scans claude's outgoing body for the anchor_token embedded in
+-- a tool_result block; on match the body is rewritten to
+-- [target_messages, ...messages_after_anchor]. Released rows fold
+-- target_messages into content-addressed blobs (target_messages_top_cid)
+-- to deduplicate storage across forks. See fork-anchors.ts for the full
+-- state machine + splice algorithm.
+CREATE TABLE IF NOT EXISTS fork_anchors (
+  anchor_token TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  target_messages_json TEXT,
+  target_messages_top_cid TEXT,
+  fork_point_revision_id TEXT,
+  source_view_id TEXT,
+  synthetic_metadata_json TEXT,
+  state TEXT NOT NULL,
+  state_reason TEXT,
+  acknowledged_at INTEGER,
+  created_at INTEGER NOT NULL,
+  released_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_fork_anchors_session_state
+  ON fork_anchors(session_id, state);
+CREATE INDEX IF NOT EXISTS idx_fork_anchors_session_unacked
+  ON fork_anchors(session_id, state, acknowledged_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
