@@ -2,33 +2,59 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
-## [Unreleased] — channel substrate refactor
+## [0.6.0] - 2026-05-26
 
-Internal substrate refactor. retcon's event log, content-addressed blob storage, and projector dispatch now ride on `@playtiss/core/channel` instead of proxy-local code. No user-visible behavior change; the v7→v8 migration was verified byte-for-byte against a 1.77 GB production DB.
+Two intertwined cutovers ship together. The substrate moves to `@playtiss/core/channel` (event log, blob storage, projector dispatch) — that part is invisible to users but unlocks shared infrastructure for `arianna`. On top of it, the fork mechanism gets replaced: a per-rewind anchor token embedded in the `rewind_to` / `submit_file` tool_result drives a one-mechanism splice, displacing three fragile machineries from v0.5.x (`branch_context_json` column, asst-text continuity check, fresh-fork token skip).
 
-The point of this work is to make the substrate reusable. arianna (the AI-collaborator sibling project) needs the same event-log + Task-dispatch primitives; rather than copy retcon's code, those primitives move into `@playtiss/core/channel` where any consumer can import them. retcon becomes the reference implementation of an Observer Actor over the Channel substrate.
+What changes for you, the user: nothing visible if your forks were healthy on v0.5.5. Two failure modes that used to release perfectly good forks (asst-text false matches on ambiguous short replies, branch_context tails past `/compact`) stop happening. The `<retcon-released>` reminder you'd see on a divergence release is now smarter — it knows which turn to point you at, and it stops repeating once you `recall(turn_id=...)` to ack it. Re-running `rewind_to` after a release is the only way to resume; there's no auto-recovery, by design.
 
-### Changed
+What changes for an in-flight v0.5.5 fork: it gets released once at upgrade time with a friendly reminder. Re-run `rewind_to` to continue from the same point.
+
+### Anchor-based fork mechanism (v0.6 cutover)
+
+- **`fork_anchors` table replaces `sessions.branch_context_json`.** Every `rewind_to` / `submit_file` writes a row keyed by a 48-bit random `anchor_token` (12 hex chars, prefixed `tok_`). The tool_result the AI receives contains `<retcon-anchor token="..." />`. On the next `/v1/messages`, the proxy scans the outgoing body backward through user-role `tool_result` blocks, finds the most-recent anchor token, looks up the row, and splices `target_messages_json` in place of everything before-and-including that tool_result turn. Everything after stays as-is, so claude's local jsonl is the source of truth for post-fork content.
+- **State machine: active → released (terminal).** Reasons: `clear`, `compact`, `divergence` (anchor missing from body — user `/rewind`'d past it), `superseded` (new `rewind_to` on same session), `parallel_tools` (splice guard fired — R1 carried sibling tool_uses), `upstream_4xx` (Anthropic rejected the spliced body). One active anchor per session; supersession is enforced in a `BEGIN IMMEDIATE` transaction at `rewind_to` time. Released rows stay in the DB so `dump_to_file` / `recall` / navigation tools can still read them; the splice just stops applying.
+- **`<retcon-released>` persistent reminder fires until the AI acks.** On every `/v1/messages` where a released row has `acknowledged_at IS NULL`, the proxy prepends a `<retcon-released>` text block to the last user message naming the `turn_id` of the last successfully fork-applied revision. The AI mutes it by calling `recall(turn_id=<that-turn>)`. No auto-mute, no silent reset — explicit AI action is the only path back to a clean state.
+- **Three legacy mechanisms deleted:** asst-text continuity check (false-positive prone on ambiguous short replies), fresh-fork token skip (with its own per-fork random ID column), and the "RETCON ERROR" loud-failure tool_result text. The anchor token *is* the fork-correlation signal; the splice never needs to compare assistant text strings.
+- **Released anchors fold target_messages into content-addressed CIDs.** Active rows hold `target_messages_json` inline for splice-time performance. On transition to `released`, `markReleased({foldToCids: true})` walks the messages, stores each as a `@playtiss/core` blob, and replaces the column with a top-level CID. Storage growth stays bounded by blob dedup.
+
+### Channel substrate refactor (Steps 1–4)
 
 - **Event log, blob storage, and projector dispatch moved to `@playtiss/core/channel`.** The proxy-local `channel.ts`, `channel-types.ts`, `projector-runner.ts`, and `storage.ts` files are gone. retcon imports `createChannel`, `migrate`, `applyTask`, `taskRef`, and `SqliteStorageProvider` from the new subpath. The channel's interface follows the Collaboration Protocol's L4 verb naming: `submit()` (was `emit()`), with async return shape so future cross-process channels swap in without breaking callers.
 - **Projectors register as `Task`s with content-hashed identity.** Each projector becomes a `Task` whose `id` is `applyTask(action, input)` — a CID derived from `(action, input)` via dag-json + SHA-256. Same logical Task → same TaskId across processes. Dispatch order is derived from declarative `TaskRef` dependencies inside each Task's input dict, not from array position. Topo-sort is lazy (deferred until first `submit()`) so registration order doesn't matter.
 - **Per-projector SAVEPOINT exception isolation.** Each Task's `apply()` runs inside its own SAVEPOINT inside the outer `BEGIN IMMEDIATE`. If one projector throws, its partial writes roll back; the event row, earlier accepted projectors, and downstream projectors all stay landed. The exception is recorded as a `projection.exception` substrate event so L1.10 Explicit Discarding holds.
 - **Outcomes are first-class.** `submit()` returns `{ event, outcomes }` where `outcomes` lists one `accept` or `exception` per Task subscribed to the topic, in dispatch order. Channel-level failures (DB I/O, primary-key collision on the event row itself) propagate as Promise rejection — distinct from projector exceptions, which are part of the resolved outcome.
 
+### Other behavior changes (v0.5.6 work folded in)
+
+- **`count_tokens` no longer triggers fork release.** Pre-fix, `isMessagesPath = url.includes('/messages')` matched both `/v1/messages` and `/v1/messages/count_tokens`. claude code's count_tokens probe (121-byte body, no anchor) was hitting the divergence guard and false-releasing healthy forks. Split into `isMessagesEndpoint` (real conversations) and `isMessagesPath` (any /messages shape); count_tokens skips the entire splice + divergence path.
+- **`recall` renders the user prompt + prior assistant text together.** Each turn entry surfaces the assistant's *preceding* reply alongside the user's prompt that responded to it, so the AI reading recall output recovers the conversational beat (assistant → user pair) instead of an isolated user message. Reduces "what was I responding to?" round-trips when the AI uses recall to navigate.
+- **Event topic rename: `session.branch_context_{released,cleared}` → `session.fork_anchor_{released,cleared}`.** Audit log naming follows the substrate name. The `recall` walk-back query reads both old and new topic names, so historical event logs still surface release markers without a data migration.
+
+### Fixed
+
+- **`acknowledgeRelease` is actually wired into the recall handler.** The persistent `<retcon-released>` reminder text promises that `recall(turn_id="...")` will silence it. Before this fix, the function was exported but unused — the reminder would have fired on every `/v1/messages` forever. The recall handler now flips `acknowledged_at` to a timestamp when the AI inspects the turn the reminder names.
+- **Migration steps run inside a `BEGIN ... COMMIT` transaction.** Previously, a partial crash during the v8→v9 ghost-row insert loop could leave fork_anchors with N rows and schema_version still at 8, blocking re-migration with a PK collision on the deterministic `mig_<session_id>` ghost token. Now the step + schema_version stamp are atomic; any throw rolls back cleanly.
+- **`/clear` and `/compact` correctly mark fork_anchors as released across the session rebind boundary.** When claude code mints a new session_id after `/clear`, `rebindSession` migrates `sessions`, `tasks`, and `events` from the old id to the new one. v0.6 adds `fork_anchors` to the same transaction; without it, the row stayed orphaned at the old id, the cleared-event never fired, and the AI never learned the fork was released.
+- **Anchor regex matches the JSON-escaped quote form claude code emits.** Claude code JSON-stringifies MCP tool_result content, escaping inner quotes as `\"`. The regex now matches both raw (`<retcon-anchor token="...">`) and escaped (`<retcon-anchor token=\"...\">`) forms.
+
 ### Schema
 
 - v7 → v8: introduces `task_metadata (task_id, key, value)` (owned by `@playtiss/core/channel`). The v7→v8 step copies `projection_offsets.last_processed_event_id` rows into `task_metadata.events_offset` so the channel sees what retcon's pre-Step-2 projectors had committed. `projection_offsets` stays in the schema as legacy/forensic; nothing reads it post-v8. Verified non-destructive on a 1.77 GB DB (64 076 events, 232 659 blobs, 165 sessions, 28 950 revisions) in ~7.3 s.
+- v8 → v9: creates `fork_anchors` table with indexes on `(session_id, state)` and `(session_id, state, acknowledged_at)`. For each session with non-NULL `branch_context_json`, synthesizes a `released` ghost row (token `mig_<sid>`, reason `migrated_from_v0_5_5`, fork_point_revision_id resolved from the task's most-recent closed_forkable revision, pending_synthetic_json folded into synthetic_metadata_json). Drops the three v0.5.x columns: `branch_context_json`, `branch_context_fork_id`, `pending_synthetic_json`. Idempotent on transitional v0.6 DBs that already lack the legacy columns (PRAGMA table_info guards on each DROP).
 - The channel package now tracks its own version in a separate `channel_schema_version` table (initial v1). `channel.migrate(db)` runs FIRST inside retcon's `migrate()`; retcon's own v7→v8 step references `task_metadata` and depends on the channel's tables existing.
 
 ### Tests
 
 - `playtiss-core` ships a 128-test suite covering channel migration idempotency, SAVEPOINT-isolated exception cascades, lazy topo-sort, TaskRef dependency walking, content-hashed Task identity, and `applyTask` determinism.
-- `playtiss-proxy` retains all existing tests (509 unit + 16 integration); none required logic changes for the switchover. Test wiring imports `Channel` from `@playtiss/core/channel` instead of the deleted local modules.
+- `playtiss-proxy`: 498 unit tests pass, 26 skipped. New tests cover the v8→v9 ghost-row synthesis, the rebindSession fork_anchors migration, the escaped-quote anchor regex (commit 15b722e), and acknowledgeRelease idempotence. 10 v0.5.x tests are `it.skip('[v0.6 rewrite pending] …')` — tracked in TODOS.md "P2 — v0.6 test debt".
+- Integration tests (`RETCON_TEST_INTEGRATION=1`): 3 tmux-driven end-to-end flows pass 2-3 times out of 3. The residual flake is the documented "AI didn't invoke the tool" failure mode — not retcon-side.
 
 ### For contributors
 
-- New `playtiss-proxy/scripts/step4-byte-equality.mjs` — verifies on the most-recent on-disk backup that the v7→v8 migration produces byte-identical retcon-owned tables (sessions, tasks, revisions, branch_views, projection_offsets, pending_actors, schema_version) and that `task_metadata` matches `projection_offsets` row-for-row. Use it before shipping any future channel-version bump that touches retcon-owned tables.
+- New `playtiss-proxy/scripts/step4-byte-equality.mjs` — verifies on the most-recent on-disk backup that the v7→v8 migration produces byte-identical retcon-owned tables and that `task_metadata` matches `projection_offsets` row-for-row. Use it before shipping any future channel-version bump that touches retcon-owned tables.
 - `EventProducer` / `defaultProjectors` / `Projection` interface are retained in `src/events.ts` and `src/server.ts` for test-time seeding but are no longer wired into production. Production goes through `Channel.submit()`. Migrating tests off these (and then deleting the legacy code) is a follow-up.
+- `src/test/_legacy-tobe-stub.ts` is a placeholder TobeStore type that lets the 10 skipped v0.5.x tests compile. Delete it once those tests are rewritten against `fork_anchors`.
 
 ## [0.5.5] - 2026-05-08
 

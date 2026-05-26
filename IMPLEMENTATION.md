@@ -4,30 +4,33 @@ The "how" of retcon's non-trivial mechanisms. [INSIGHTS.md](./INSIGHTS.md) cover
 
 What this doc deliberately doesn't cover: file layout, type definitions, function signatures. Those are derivable by reading the code.
 
-## TOBE pending file: the one-shot baton
+## Anchor splice: how rewinds carry across turns
 
-`rewind_to` and `submit_file` schedule effects that land on the *next* `/v1/messages`. The hand-off mechanism is a per-session pending file at `~/.retcon/tobe/tobe_pending-<session-id>.json`. The MCP handler writes it; the proxy-handler peeks-then-commits it on the next outbound request.
+`rewind_to` and `submit_file` create a row in the `fork_anchors` table and return a tool_result containing `<retcon-anchor token="tok_<12hex>" />`. The 48-bit token is the per-fork handle. On every subsequent `/v1/messages`, the proxy scans claude's outgoing body backward through user-role `tool_result` blocks, finds the most-recent token, looks up the row, and splices `target_messages_json` into the body — replacing everything before and including that tool_result turn. Whatever claude wrote after the anchor passes through unchanged.
 
 ```
-  MCP rewind_to call           proxy.request_received          proxy.response_completed
-       │                              │                                   │
-       ├─ write TOBE                  ├─ peek TOBE                        ├─ commit TOBE (delete)
-       │  (atomic: tmpfile+rename)    │  (read; don't delete yet)          │  iff status<500
-       │                              ├─ apply splice                     ├─ emit fork.forked
-       └─ return                      └─ forward to upstream               │  iff 2xx + end_turn
-                                                                          │  + synthetic present
-                                                                          └─ otherwise emit
-                                                                            fork.synthesis_failed
+  MCP rewind_to call             proxy.request_received                next turn's request
+       │                                │                                       │
+       ├─ INSERT fork_anchors           ├─ findLatestAnchorTokenInToolResults    ├─ same scan;
+       │  (state=active, token=tok_X,   │                                       │  finds tok_X again
+       │   target_messages_json=[...])  ├─ row.state=active → splice            │
+       │                                │  body = [target_messages, …postAnchor]├─ postAnchor now
+       └─ return tool_result with       │                                       │  includes earlier
+          <retcon-anchor token="tok_X"  └─ forward to upstream                  │  assistant + user
+          /> embedded in the text                                                │  turns claude added
 ```
 
-Atomic write is mandatory. A concurrent peek of a partially-flushed file parses as malformed and the fork intent is silently lost. Implementation: write to `<target>.<pid>.tmp`, then `rename()` over the target. Peek reads the file but doesn't delete; commit (delete) happens only after the upstream call returns a 2xx response. On 5xx / abort / upstream_error the file stays so claude's retry loop re-applies it.
+Why this beats the v0.5.x design: the splice never has to guess where the fork started. The anchor token IS the boundary marker. The body scan never compares assistant text strings (so ambiguous short replies like "OK" no longer false-release). The fresh-fork special case is gone (no need to detect "the tail is still the synthetic landing turn"). And the tool_result text the AI sees on a successful rewind is friendly natural language — the v0.5.x "RETCON ERROR" tool_result scaffolding (which polluted claude's local jsonl on the success path) is deleted.
 
-The TOBE shape carries:
+The row carries:
 
-- `messages[]` — the new conversation history to splice in.
+- `anchor_token` — primary key. 12 hex chars (`tok_` prefix), 48 bits entropy. Generated per rewind via `crypto.randomBytes(6)`.
+- `target_messages_json` — the new conversation history to splice in. Active rows hold raw JSON; released rows fold to a content-addressed `target_messages_top_cid` (one blob per message, deduped via `@playtiss/core` storage) so storage stays bounded over the lifetime of a session.
 - `fork_point_revision_id` — the rewind target's revision id.
 - `source_view_id` — the calling session id.
-- `synthetic` (optional) — SR-construction metadata. See "Synthetic departure Revision pipeline" below.
+- `synthetic_metadata_json` — SR-construction metadata. See "Synthetic departure Revision pipeline" below.
+- `state` — `active` or `released`. `state_reason` describes the cause (clear / compact / divergence / superseded / parallel_tools / upstream_4xx).
+- `acknowledged_at` — null while the persistent reminder is firing; set to a timestamp when the AI calls `recall(turn_id=…)` against the released fork's last-fork-applied turn.
 
 ## Synthetic departure Revision (SR) pipeline
 
@@ -37,20 +40,21 @@ Every successful rewind/submit produces an SR row in the revisions table. The pi
   T0: MCP-call time (rewind_to / submit_file handler)
       ├── compute synthetic_revision_id (generateTraceId)
       ├── compute R2'/R3' display text
-      ├── stash in TOBE.synthetic alongside messages[]
+      ├── stash in fork_anchors.synthetic_metadata_json alongside target_messages_json
       └── (do NOT touch claude's response body — it's gzip'd SSE)
 
-  T1: TOBE-consumed time (proxy-handler, on next /v1/messages)
+  T1: splice time (proxy-handler, on next /v1/messages)
+      ├── findLatestAnchorTokenInToolResults locates the anchor in body
       ├── parse claude's pre-splice body as JSON (NOT the response — the request)
       ├── find last assistant message → that's R1's parsed content
       ├── parallel-tool guard:
       │     if R1's content has tool_use blocks beyond the operation tool,
-      │     abort splice + emit fork.synthesis_failed
-      ├── apply splice (replace messages[] with TOBE.messages)
+      │     markReleased(state_reason='parallel_tools') + emit fork.synthesis_failed
+      ├── apply splice (body = [target_messages, ...messages_after_anchor])
       └── forward to upstream
 
   T2: response-completed time (proxy-handler, after upstream replies)
-      ├── if status==2xx + stop_reason==end_turn + TOBE.synthetic present:
+      ├── if status==2xx + stop_reason==end_turn + synthetic_metadata_json present:
       │     ├── extract operation tool's tool_use_id from R1's content
       │     ├── compose synthetic body (history + R2'/R3')
       │     ├── content-address each message via blobRefFromMessagesBody
@@ -99,26 +103,21 @@ Earlier drafts ran the guard at MCP-call time (T0). Same SSE+gzip problem — at
 
 The trade-off: at T0 we could have returned a friendly inline error to the calling AI. At T1 the abort happens silently from the AI's perspective; the loud-failure response in `rewind_scheduled_response`/`submit_scheduled_response` surfaces it on the next turn. The loud-failure response includes a "did you call rewind_to alongside other tools?" hint so the AI can self-diagnose.
 
-### Pre-v0.5 TOBE backward-compat
-
-A daemon upgrade mid-session can leave a v0.4-shaped TOBE pending file (no `synthetic` field) for the v0.5+ daemon to consume. proxy-handler logs a warning and skips fork.forked emission. The rewind/submit still applies; only the SR row doesn't materialize for that one operation. Documented gap, acceptable per pre-1.0 alpha policy.
 
 ### Deferred fork.forked across tool_use chains
 
-The original SR pipeline gates `fork.forked` on `stop_reason='end_turn'` at T2. That works when the post-rewind AI types one final answer immediately, but breaks when the AI chains tool calls (Read, Bash, recall) before answering — `stop_reason='tool_use'` doesn't pass the gate, the TOBE was already consumed at T1, the rewind applied but no SR row materializes. Empirically (3-day dogfood signal): 7 of 9 fork.back_requested events produced no fork.forked, all 7 had tool_use as the post-rewind first stop_reason.
+The original SR pipeline gates `fork.forked` on `stop_reason='end_turn'` at T2. That works when the post-rewind AI types one final answer immediately, but breaks when the AI chains tool calls (Read, Bash, recall) before answering — `stop_reason='tool_use'` doesn't pass the gate, the splice already ran at T1, the rewind applied but no SR row materializes. Empirically (3-day dogfood signal): 7 of 9 fork.back_requested events produced no fork.forked, all 7 had tool_use as the post-rewind first stop_reason.
 
-v0.5.1 fixed this with deferred emission. When T2 sees `tobe_consumed && synthetic && status==2xx && stop_reason ∈ {tool_use, pause_turn}`, it persists the synthetic metadata to a new `sessions.pending_synthetic_json` column instead of emitting fork.forked. Subsequent `proxy.response_completed` events for the same session check the column; on the first `closed_forkable` stop_reason that arrives, retcon re-fetches the original (pre-splice) request body's bytes from `blobs` by CID, calls `buildSyntheticAsset`, and emits fork.forked with `to_revision_id` pointing at the FIRST post-rewind turn (the TOBE-consumer — that's the navigation handle the user thinks of as "where the fork landed").
+v0.5.1 fixed this with deferred emission. When T2 sees `splice_applied && synthetic && status==2xx && stop_reason ∈ {tool_use, pause_turn}`, the synthetic metadata persists on the active fork_anchors row (`synthetic_metadata_json` column) instead of emitting fork.forked immediately. Subsequent `proxy.response_completed` events for the same session check the row; on the first `closed_forkable` stop_reason that arrives, retcon re-fetches the original (pre-splice) request body's bytes from `blobs` by CID, calls `buildSyntheticAsset`, emits fork.forked with `to_revision_id` pointing at the FIRST post-rewind turn (the splice-consumer — that's the navigation handle the user thinks of as "where the fork landed"), and clears `synthetic_metadata_json`.
 
-State transitions for `pending_synthetic_json`:
+State transitions for `synthetic_metadata_json` on the active fork_anchors row:
 
-- Set: T2 with `tobe_consumed && stop_reason ∈ {tool_use, pause_turn}` — defer.
+- Set: T2 with `splice_applied && stop_reason ∈ {tool_use, pause_turn}` — defer.
 - Cleared on closed_forkable: emit fork.forked first.
 - Cleared on dangling (max_tokens, refusal, null): emit fork.synthesis_failed (the chain ended on a non-resumable stop_reason).
-- Cleared on supersede: a new rewind/submit that consumes a fresh TOBE clobbers the prior pending_synthetic, with a fork.synthesis_failed audit (`error_message: "superseded by a new rewind/submit before reaching end_turn"`).
+- Cleared on supersede: a new rewind/submit that inserts a fresh anchor releases the prior active row (state_reason=`superseded`), with a fork.synthesis_failed audit (`error_message: "superseded by a new rewind/submit before reaching end_turn"`).
 
-The schema migration is additive (`ALTER TABLE sessions ADD COLUMN pending_synthetic_json TEXT` in v5→v6). Existing rows get NULL. Backward-compat: a v0.5.0 daemon won't recognize the column but additive ALTER doesn't break basic queries; the deferred path is unavailable to that daemon (degrades to the original gate, same behavior as 0.5.0).
-
-The mechanism details (column shape, helper module `pending-synthetic.ts`, where the read/write happens in proxy-handler.ts T2) are derivable from the code.
+Pre-v0.6, the same metadata lived in `sessions.pending_synthetic_json` — the v8→v9 migration folds those values into the synthesized ghost fork_anchors rows so an in-flight v0.5.x deferred SR still materializes after upgrade. The mechanism details (column shape, helper module `pending-synthetic.ts` as a facade over fork-anchors helpers, where the read/write happens in proxy-handler.ts T2) are derivable from the code.
 
 ### Harness-injection skip in turn_back_n
 
@@ -134,47 +133,25 @@ The pattern set is anchored-at-start with near-zero false-positive risk on real 
 
 Navigation helpers `effectiveHead`, `nthForkableBack`, `countForkableBack`, and `mostRecentForkableRevision` all consult `isHarnessInjectionRevision` and skip matching revisions when counting. `firstChild` (used by reconstructForkMessages for fork-point base derivation) does a bounded DFS through injection grandchildren — needed because injection probes sometimes ship with `msgs=1` (no conversation history), and the real continuation might be the grandchild via the probe.
 
-### State-divergence guard via asst-text continuity
+### State-divergence detection via anchor scan
 
-Persistent-fork's penultimate-user pivot assumes claude's body always contains the conversation we sent last turn. Claude code's `/rewind` slash command breaks that assumption — it truncates claude's local jsonl client-side, fires no hook, sends no separate /v1/messages. retcon has no direct signal.
+The anchor splice doesn't need a continuity check. Claude code's `/rewind` truncates claude's local jsonl past some point — but `<retcon-anchor token="..." />` lives inside the rewind_to tool_result, so if `/rewind` truncated past the fork, the token is gone from claude's outgoing body. `findLatestAnchorTokenInToolResults` returns null. The proxy looks up the session's active fork_anchors row, sees the divergence, marks the row `state='released', state_reason='divergence'`, emits `session.fork_anchor_released{reason: 'rewind_or_state_divergence'}`, and the persistent `<retcon-released>` reminder fires on subsequent turns until the AI acks via `recall`.
 
-`applyBranchContextRewrite` runs an asst-text continuity check before splicing: walk `branch_context` backward for the most-recent assistant message, extract its text (stripping cache_control flags), and walk claude's body for any assistant with the same text. In normal operation that text is always present (claude assembles every upstream response into its local jsonl as an assistant turn). When `/rewind` truncates past it, the text is gone, retcon NULLs `branch_context_json` AND `branch_context_fork_id`, emits `session.branch_context_released{reason: 'rewind_or_state_divergence'}`, injects a `<retcon-released>` reminder block into the request body (see below), and returns the modified body. The user's next prompt reaches the AI cleanly with the release notice prepended.
+This replaces three pieces of v0.5.x machinery: the asst-text continuity check (false-positive prone on ambiguous short replies like "OK" matching the wrong earlier occurrence), the fresh-fork token skip (which existed only to mask the continuity check's structural blind spot on the first post-rewind turn), and the "RETCON ERROR" loud-failure tool_result text (which left a confusing artifact in claude's local jsonl on the success path). The anchor token IS the per-fork signal; the splice never compares assistant text.
 
-The check skips when `branch_context` has no assistant at all (rare — happens only when reconstructForkMessages fell back to the target's own body) AND when the fresh-fork skip applies (see next subsection). Edge: when the matched asst text is short and ambiguous (e.g., both turns responded "OK"), the check passes against a different occurrence; splice produces a Frankenstein body. Documented in INSIGHTS as the "channel-of-last-resort" trade-off.
+### Persistent `<retcon-released>` reminder injection
 
-The `userIndices.length < 2` branch (claude's body has 0-1 user messages) was previously the release trigger but is now pass-through: the asst-text check already verified continuity, so a 0/1-user body is a probe (startup, system-reminder), not /rewind.
+When a released fork_anchors row has `acknowledged_at IS NULL`, every `/v1/messages` gets per-directive `<retcon-released>` text blocks prepended to the last user message's content array. The reminder fires on every turn until the AI acks — not just on the turn that caused the release.
 
-### Fresh-fork skip via per-fork token
+Three blocks:
 
-The asst-text continuity check has a structural blind spot: on the very first turn after `rewind_to`/`submit_file`, `branch_context`'s most-recent assistant message is the rewound target's response — set by `reconstructForkMessages` from the target's own body. claude has not yet sent any `/v1/messages` for the fork, so claude's local jsonl doesn't contain the splice's response yet. The check would anchor on the rewound target's text, which may have been compacted out of claude's view weeks earlier, and falsely release every healthy fork on its first follow-up turn.
+1. **Header**: a retcon fork was previously released and you haven't yet inspected the named turn. The release was logged earlier in this session.
+2. **LAST FORK-APPLIED TURN**: the `turn_id` of the most recent successfully-spliced revision, with concrete commands the AI can suggest to the user — `recall(turn_id="<id>")` to inspect, `rewind_to(turn_id="<id>", message="...")` to resume the fork's content with a fresh user message, `dump_to_file(turn_id="<id>")` + edit + `submit_file` to inspect-and-edit before resuming.
+3. **MUTE**: explicit contract — calling `recall(turn_id="<id>")` will silence the reminder for the rest of the session. Until then it appears on every `/v1/messages`. The recall handler honors this: when the AI inspects the named turn, it sets `acknowledged_at` and subsequent turns skip the injection.
 
-This actually happened. Forensic on session `b17275fb` (started 2026-04-13, hit `/compact` on 2026-05-01) showed three healthy `rewind_to` calls on 2026-05-06, all with successful `fork.forked`, all releasing within 4 minutes — exactly one follow-up turn each. The rewound targets were 4/13-era turns whose response text was no longer in claude's post-compact local view.
+Implementation in `proxy-handler.ts:buildPersistentReleaseReminderBlocks` and `injectPersistentReleaseReminder`. If the body shape is unexpected (last message not user-role, or content shape unrecognized) the injection skips and rawBody forwards unchanged — the audit event still fires.
 
-Fix: detect "fresh fork" state and skip the continuity check on that one turn. Detection mechanism:
-
-- `rewind_to`/`submit_file` generates a per-fork token (`tok_<12-hex>`, 48 bits of entropy) at MCP-call time.
-- The token is embedded in the synthetic landing turn as a `fork-id="..."` attribute on the `<retcon-active>` opening tag.
-- The token is also persisted to `sessions.branch_context_fork_id` (schema v6→v7) — same UPDATE statement that writes `branch_context_json`.
-- `applyBranchContextRewrite` reads both columns. If the tail entry of `branch_context` is a user-role message whose first text block contains exactly `<retcon-active fork-id="${storedForkId}">`, this is the fresh state — no extension has happened yet — skip the check and proceed to the splice.
-- After the splice extends `branch_context` with claude's tail (the splice's response + claude's new user message), the tail is no longer the synthetic. Subsequent turns' continuity check anchors correctly on the splice's response, which IS in claude's body.
-
-The detection is exact-equality match against the DB column, not a regex pattern over arbitrary text. This is collision-resistant: a user can quote `<retcon-active fork-id="...">` in conversation (e.g., when documenting retcon's design — this codebase has many such references), and the check won't false-match unless they happen to predict the random per-fork token. The DB column is the only authoritative source.
-
-Tradeoff: one-turn detection delay if claude diverges immediately on the first follow-up (e.g., user types `/rewind` between `rewind_to` and their next message, or a Task subagent fires before any user follow-up). The next turn's check still catches it; we lose detection on the first turn but gain detection on the second. Net: divergence still surfaces, just one turn delayed, and we no longer false-positive-release on every healthy fork.
-
-### `<retcon-released>` reminder injection on divergence release
-
-When the divergence guard fires, retcon doesn't just NULL the column and pass through. It also mutates the body that triggered the release, prepending per-directive `<retcon-released>` text blocks to the last user message's content array. The AI sees the release notice on the same turn it caused the release.
-
-Three blocks (one optional):
-
-1. **Header**: what just happened — `branch_context` released, why (state divergence, /compact, or 8-MiB overflow), and the consequence (the conversation the AI is now seeing is its local view, not the fork's history).
-2. **LAST FORK-APPLIED TURN** (only when a forkable revision exists in this task): the `turn_id` of the most recent successfully-spliced revision, with concrete commands the AI can suggest to the user — `recall(turn_id="<id>")` to inspect, `rewind_to(turn_id="<id>", message="...")` to resume the fork's content with a fresh user message, `dump_to_file(turn_id="<id>")` + edit + `submit_file` to inspect-and-edit before resuming.
-3. **PROPAGATION directive**: "no matter how you handle the user's request (answer fully, decline, partial answer), ALWAYS include a brief mention of this release in your response output. The recipient may be the user directly OR — if you are a Task subagent — a parent agent reading your response as a tool result. Best-effort relay through whatever chain exists." Plus a recommended one-liner the AI can drop into its response.
-
-Block layout matches claude code's `<system-reminder>`-per-block representation pattern: each directive in its own text block, the user's verbatim message in a separate UNWRAPPED block at the end. Implementation in `proxy-handler.ts:buildReleaseReminderBlocks` and `injectReleaseReminderInPlace`. The injection mutates `parsedBody.messages[last].content` in place; if the body shape is unexpected (last message not user-role, or content shape unrecognized) the injection skips and rawBody forwards unchanged — the audit event still fires.
-
-Symmetric counterpart to `<retcon-active>` (mcp-tools.ts:buildActiveReminderBlocks). Both wrap the user's message with retcon-controlled context blocks: one on activation (way IN), one on release (way OUT).
+Symmetric counterpart to `<retcon-active>` (mcp-tools.ts:buildActiveReminderBlocks). Both wrap the user's message with retcon-controlled context blocks: one on activation (way IN), one on release (way OUT until ack'd).
 
 ### Multi-block injection text concat
 
@@ -184,7 +161,7 @@ Fix: concat all text blocks (newline-joined) before passing to `isInjectionText`
 
 ### `<retcon-active>` reminder blocks in synthetic landing turn
 
-The synthetic user-role message that lands at the rewound branch (= TOBE.messages.last) is constructed as a content-array with multiple text blocks — one per logical directive, matching claude code's `<system-reminder>`-per-block representation pattern:
+The synthetic user-role message that lands at the rewound branch (= `target_messages_json.last`) is constructed as a content-array with multiple text blocks — one per logical directive, matching claude code's `<system-reminder>`-per-block representation pattern:
 
 ```
 {
@@ -208,24 +185,28 @@ The user-facing directive is retcon's only proactive channel into claude's UI fo
 
 Decision #6 in INSIGHTS.md ("message delivered VERBATIM") is preserved: the user's text is its own content block, byte-equal to what they passed. The reminder is sibling blocks, not a wrapper. retcon's `isInjectionText` recognizes the pattern (`<system-reminder>`-style with substantive content remaining after stripping reminder blocks) and treats the turn as a real user prompt, not an injection. The multi-block injection text concat fix (see below) ensures `isInjectionText` sees the full combined text, not just the first reminder block.
 
-## Persistent fork: the penultimate-user splice
+## Persistent fork: the anchor-scan splice
 
-After rewind_to, retcon doesn't just rewrite one `/v1/messages` and stop. It keeps the forked branch alive across every subsequent turn until you explicitly release it. Each session row carries a `branch_context_json` column: a JSON array holding the full conversation in the active forked branch.
+After `rewind_to`, retcon doesn't just rewrite one `/v1/messages` and stop. It keeps the forked branch alive across every subsequent turn until something releases it. There's no per-session column — the source of truth is the `fork_anchors` row, and the body itself carries the boundary marker (the `<retcon-anchor token="..." />` tag inside the rewind_to tool_result).
 
-For each `/v1/messages` from claude, the proxy:
+For each `/v1/messages` from claude, `applyAnchorSplice` (src/fork-anchors.ts) does:
 
-1. Reads `branch_context_json` from the session row.
-2. Finds the **penultimate user message** in claude's outgoing body.
-3. Slices everything *after* that index — that's the suffix claude has added since our last upstream call.
-4. Sends `[...branch_context, ...suffix]` upstream and writes back the extended branch_context.
+1. **Backward scan.** Walk `body.messages[]` from the end. For each user-role message whose content is an array containing `tool_result` blocks, regex-match `<retcon-anchor token=\\?"(tok_[0-9a-f]{12})\\?"\s*\/>` against the tool_result text. The regex's optional backslash matches both raw and JSON-escaped quotes — claude code JSON-stringifies MCP responses, so the production body carries the escaped form.
+2. **Row lookup.** First match wins. Query `fork_anchors` by `anchor_token`.
+3. **State dispatch.** If `state='active'`: splice `body.messages = [...target_messages, ...messages_after_the_anchor_turn]`. If `state='released'`: don't splice (the fork is gone); the persistent `<retcon-released>` reminder will fire below. If no row exists (stale token from a wiped DB, or coincidence): silent pass-through.
+4. **Divergence detection.** If the scan returns nothing but the session has an active `fork_anchors` row, the user typed `/rewind` and truncated past the anchor. Mark the row `state='released', state_reason='divergence'` and emit `session.fork_anchor_released`.
 
-The penultimate-user pivot is the trick: claude's `messages[]` alternates role and `tool_result` counts as user. The last user message is always the new query. The penultimate user is what we sent last turn. Everything between is the model's intermediate output that claude already assembled from the SSE stream — we don't re-parse it.
+The backward scan terminates on the first hit, so cascaded forks (rewind to a turn that was itself created by an earlier rewind) naturally pick the most-recent anchor — older anchor tokens still appear in body history as historical text inside the new target_messages, but they don't drive any splice.
 
-The DB column persists across daemon restarts. The binding-token rebind merges across `claude --resume` boundaries (the resumed session_id ends up on the same row that holds the branch_context). The fork survives anything short of an explicit release.
+The DB row persists across daemon restarts. The binding-token rebind merges across `claude --resume` boundaries (the resumed session_id ends up on the same row that holds the anchor — v0.6's rebindSession explicitly migrates `fork_anchors.session_id` along with `sessions.id`).
 
 ### Release on /clear and /compact
 
-When the SessionStart hook fires with `source=clear` or `source=compact`, the hook handler NULLs `branch_context_json` and emits `session.branch_context_cleared`. From the next turn onward, the proxy forwards claude's body unchanged. See [INSIGHTS.md](./INSIGHTS.md#why-compact-aligns-the-two-realities) for why /compact's signal is the right release point semantically.
+When the SessionStart hook fires with `source=clear` or `source=compact`, the hook handler calls `markSessionActiveAnchorsReleased` (folds target_messages to content-addressed CIDs and flips state) and emits `session.fork_anchor_cleared`. From the next turn onward, the proxy forwards claude's body unchanged. See [INSIGHTS.md](./INSIGHTS.md#why-compact-aligns-the-two-realities) for why /compact's signal is the right release point semantically.
+
+### Persistent release reminder
+
+While a released `fork_anchors` row on this session has `acknowledged_at IS NULL`, every `/v1/messages` gets a `<retcon-released>` text block prepended to the body's last user message. The reminder names the `turn_id` of the last successfully fork-applied revision so the AI can guide the user back via `recall` / `rewind_to` / `dump_to_file`. The AI mutes the reminder by calling `recall(turn_id=<that-turn>)` — the recall handler then sets `acknowledged_at` on the row and the next turn skips the injection. No auto-mute, no auto-retry. The AI/user must explicitly act to clear the alarm state.
 
 ## cache_control marker accumulation
 
