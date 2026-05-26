@@ -501,9 +501,11 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
 
       // Trigger rewind_to. This:
       //   - rolls back to before AARDVARK was introduced
-      //   - sends the new question through the TOBE swap
-      //   - sets sessions.branch_context_json so subsequent turns continue
-      //     on the forked branch
+      //   - inserts an active fork_anchors row whose target_messages_json
+      //     carries the rewound history + synthetic_user_message
+      //   - returns a tool_result containing the anchor token; subsequent
+      //     /v1/messages bodies carry it in a tool_result block and the
+      //     proxy's applyAnchorSplice replaces the prefix on every turn.
       tmux('send-keys', '-t', FORK_SESSION,
         'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, '
         + '"message":"What is the secret word? Reply EXACTLY ONE WORD, no punctuation."}. '
@@ -519,55 +521,51 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
         90000,
         'fork.back_requested event',
       )
-      // After rewind_to fires, sessions.branch_context_json must be populated.
+      // v0.6: after rewind_to fires, an active fork_anchors row must exist
+      // for this session with target_messages_json populated.
       await waitFor(
-        () => parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10) > 0,
+        () => parseInt(sql(`SELECT length(target_messages_json) FROM fork_anchors WHERE session_id='${sessId}' AND state='active'`), 10) > 0,
         10000,
-        'branch_context_json populated after rewind_to',
+        'active fork_anchors row with target_messages_json',
       )
 
-      // Wait for the TOBE-applied response to land (this is the immediate
-      // next /v1/messages, where upstream sees the forked context and
-      // responds with ZEBRA).
-      const ctxAfterTurn1 = parseInt(
-        sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10,
-      )
-
-      // Persistence check #1: send a follow-up turn. With persistent fork,
-      // the daemon rewrites this /v1/messages using branch_context_json,
-      // so the model still sees the forked context and answers ZEBRA.
+      // Persistence check #1: send a follow-up turn. With v0.6 anchor splice,
+      // the daemon scans claude's next body for the anchor token in any
+      // tool_result block, and splices target_messages on every match — so
+      // upstream still sees the rewound context (with ZEBRA) and answers
+      // ZEBRA. target_messages_json itself is STATIC across turns (set
+      // once at rewind_to MCP-call time, no per-turn extend); the splice
+      // grows by reusing claude's local jsonl post-anchor.
       tmux('send-keys', '-t', FORK_SESSION,
         'Tell me again, what is the secret word? Reply EXACTLY ONE WORD.')
       tmux('send-keys', '-t', FORK_SESSION, 'C-m')
 
+      // Wait for a fresh closed_forkable revision to land (the follow-up
+      // response). target_messages_json size won't change but the count of
+      // sealed revisions on this task should advance.
+      const revCountBeforeFollowup = parseInt(
+        sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10,
+      )
       await waitFor(
-        () => {
-          const len = parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10)
-          return len > ctxAfterTurn1
-        },
+        () => parseInt(sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10) > revCountBeforeFollowup,
         45000,
-        'branch_context_json grows after follow-up turn',
+        'closed_forkable revision count grows after follow-up turn',
       )
 
-      // The branch_context_json should contain "ZEBRA" in its assistant
-      // messages and never "AARDVARK". Use SQLite's instr() — testing JSON
-      // shape from shell is awkward.
+      // The active fork_anchors row's target_messages_json should contain
+      // "ZEBRA" (carried by the rewind target's user message) and never
+      // "AARDVARK" (past the rewind point).
       const hasZebra = parseInt(
-        sql(`SELECT instr(branch_context_json, 'ZEBRA') FROM sessions WHERE id='${sessId}'`), 10,
+        sql(`SELECT instr(target_messages_json, 'ZEBRA') FROM fork_anchors WHERE session_id='${sessId}' AND state='active'`), 10,
       )
       const hasAardvark = parseInt(
-        sql(`SELECT instr(branch_context_json, 'AARDVARK') FROM sessions WHERE id='${sessId}'`), 10,
+        sql(`SELECT instr(target_messages_json, 'AARDVARK') FROM fork_anchors WHERE session_id='${sessId}' AND state='active'`), 10,
       )
       expect(hasZebra).toBeGreaterThan(0)
-      // Note: branch_context_json may contain "AARDVARK" if the model
-      // happens to mention it in some response (unlikely with our prompts
-      // but possible). The key invariant we test below is that the model's
-      // ANSWER matches the forked context — which is what proxy-handler
-      // sends upstream. We rely on the model + prompt to be consistent.
       expect(hasAardvark).toBe(0)
 
       // Persistence check #2: kill the tmux session and resume the same
-      // session id. branch_context_json is on the DB so it should survive.
+      // session id. fork_anchors row is in SQLite so it should survive.
       try {
         tmux('kill-session', '-t', FORK_SESSION)
       }
@@ -575,8 +573,8 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       // Brief pause so the kill propagates before we relaunch.
       await sleep(1500)
 
-      const ctxAfterTurn2 = parseInt(
-        sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10,
+      const revCountAfterTurn2 = parseInt(
+        sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10,
       )
       tmux(
         'new-session', '-d', '-s', FORK_RESUME_SESSION, '-x', '200', '-y', '50',
@@ -593,23 +591,20 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       tmux('send-keys', '-t', FORK_RESUME_SESSION, 'C-m')
 
       await waitFor(
-        () => {
-          const len = parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sessId}'`), 10)
-          return len > ctxAfterTurn2
-        },
+        () => parseInt(sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10) > revCountAfterTurn2,
         60000,
-        'branch_context_json grows after post-resume turn',
+        'closed_forkable revision count grows after post-resume turn',
       )
 
-      // Final assertion: still has ZEBRA, still no AARDVARK.
-      const hasZebraFinal = parseInt(
-        sql(`SELECT instr(branch_context_json, 'ZEBRA') FROM sessions WHERE id='${sessId}'`), 10,
+      // Final assertion: anchor still has ZEBRA, still no AARDVARK, still active.
+      const finalRow = sql(
+        `SELECT state || '|' || instr(target_messages_json, 'ZEBRA') || '|' || instr(target_messages_json, 'AARDVARK') `
+        + `FROM fork_anchors WHERE session_id='${sessId}' ORDER BY created_at DESC LIMIT 1`,
       )
-      const hasAardvarkFinal = parseInt(
-        sql(`SELECT instr(branch_context_json, 'AARDVARK') FROM sessions WHERE id='${sessId}'`), 10,
-      )
-      expect(hasZebraFinal).toBeGreaterThan(0)
-      expect(hasAardvarkFinal).toBe(0)
+      const [finalState, finalZebra, finalAardvark] = finalRow.split('|')
+      expect(finalState).toBe('active')
+      expect(parseInt(finalZebra, 10)).toBeGreaterThan(0)
+      expect(parseInt(finalAardvark, 10)).toBe(0)
     }
     finally {
       try {

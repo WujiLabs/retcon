@@ -133,58 +133,65 @@ const MIGRATIONS: Record<number, (db: DB) => void> = {
       CREATE INDEX IF NOT EXISTS idx_fork_anchors_session_unacked
         ON fork_anchors(session_id, state, acknowledged_at);
     `)
-    // Synthesize ghost-released rows for v0.5.5 active forks. crypto isn't
-    // available in this sync migration context; use a deterministic-ish
-    // suffix (session_id-derived) for the token. The token will NEVER appear
-    // in any body, so uniqueness only needs to hold among migrated rows.
-    const activeForks = db.prepare(`
-      SELECT s.id AS session_id,
-             s.branch_context_json,
-             s.pending_synthetic_json,
-             (SELECT r.id
-                FROM revisions r
-                JOIN sessions s2 ON s2.task_id = r.task_id
-               WHERE s2.id = s.id
-                 AND r.classification = 'closed_forkable'
-                 AND r.sealed_at IS NOT NULL
-               ORDER BY r.sealed_at DESC, r.id DESC
-               LIMIT 1) AS last_fork_applied
-        FROM sessions s
-       WHERE s.branch_context_json IS NOT NULL
-    `).all() as Array<{
-      session_id: string
-      branch_context_json: string
-      pending_synthetic_json: string | null
-      last_fork_applied: string | null
-    }>
-    const now = Date.now()
-    const insertGhost = db.prepare(`
-      INSERT INTO fork_anchors (
-        anchor_token, session_id, target_messages_json, target_messages_top_cid,
-        fork_point_revision_id, source_view_id, synthetic_metadata_json,
-        state, state_reason, acknowledged_at, created_at, released_at
-      ) VALUES (?, ?, NULL, NULL, ?, NULL, ?, 'released', 'migrated_from_v0_5_5', NULL, ?, ?)
-    `)
-    for (const f of activeForks) {
-      // Migration-only synthetic token: prefixed with `mig_` so it never
-      // matches the production regex `tok_<12hex>`. Uniqueness via the PK
-      // would catch a collision; using session_id makes the conflict
-      // effectively impossible.
-      const ghostToken = `mig_${f.session_id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24)}`
-      insertGhost.run(
-        ghostToken,
-        f.session_id,
-        f.last_fork_applied,
-        f.pending_synthetic_json,
-        now,
-        now,
-      )
+    // Synthesize ghost-released rows for v0.5.5 active forks. The legacy
+    // columns may not exist on DBs that were stamped at v8 by a transitional
+    // v0.6 build (which used the new sessions DDL without branch_context_json
+    // before bumping CURRENT_SCHEMA_VERSION). Skip the data-migration step
+    // when the column is absent — there's nothing to migrate.
+    const sessionCols = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+    const hasBcj = sessionCols.some(c => c.name === 'branch_context_json')
+    if (hasBcj) {
+      const activeForks = db.prepare(`
+        SELECT s.id AS session_id,
+               s.branch_context_json,
+               s.pending_synthetic_json,
+               (SELECT r.id
+                  FROM revisions r
+                  JOIN sessions s2 ON s2.task_id = r.task_id
+                 WHERE s2.id = s.id
+                   AND r.classification = 'closed_forkable'
+                   AND r.sealed_at IS NOT NULL
+                 ORDER BY r.sealed_at DESC, r.id DESC
+                 LIMIT 1) AS last_fork_applied
+          FROM sessions s
+         WHERE s.branch_context_json IS NOT NULL
+      `).all() as Array<{
+        session_id: string
+        branch_context_json: string
+        pending_synthetic_json: string | null
+        last_fork_applied: string | null
+      }>
+      const now = Date.now()
+      const insertGhost = db.prepare(`
+        INSERT INTO fork_anchors (
+          anchor_token, session_id, target_messages_json, target_messages_top_cid,
+          fork_point_revision_id, source_view_id, synthetic_metadata_json,
+          state, state_reason, acknowledged_at, created_at, released_at
+        ) VALUES (?, ?, NULL, NULL, ?, NULL, ?, 'released', 'migrated_from_v0_5_5', NULL, ?, ?)
+      `)
+      for (const f of activeForks) {
+        // Migration-only synthetic token: prefixed with `mig_` so it never
+        // matches the production regex `tok_<12hex>`. Uniqueness via the PK
+        // would catch a collision; using session_id makes the conflict
+        // effectively impossible.
+        const ghostToken = `mig_${f.session_id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24)}`
+        insertGhost.run(
+          ghostToken,
+          f.session_id,
+          f.last_fork_applied,
+          f.pending_synthetic_json,
+          now,
+          now,
+        )
+      }
     }
-    // Drop the v0.5.x columns. They're forensic at this point and the new
-    // code doesn't reference them.
-    db.exec('ALTER TABLE sessions DROP COLUMN branch_context_json')
-    db.exec('ALTER TABLE sessions DROP COLUMN branch_context_fork_id')
-    db.exec('ALTER TABLE sessions DROP COLUMN pending_synthetic_json')
+    // Drop the v0.5.x columns. Each DROP is guarded so the migration is
+    // idempotent on transitional DBs that already lack the column.
+    for (const col of ['branch_context_json', 'branch_context_fork_id', 'pending_synthetic_json']) {
+      if (sessionCols.some(c => c.name === col)) {
+        db.exec(`ALTER TABLE sessions DROP COLUMN ${col}`)
+      }
+    }
   },
 }
 
