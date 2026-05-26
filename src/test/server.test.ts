@@ -9,12 +9,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventProducer, type EventProducer } from '../events.js'
 import { type ServerHandle, startServer } from '../server.js'
-import { createTobeStore, type TobeStore } from '../tobe.js'
 
 function fixture(): {
   db: DB
   producer: EventProducer
-  tobeStore: TobeStore
   tmpRoot: string
   cleanup: () => void
 } {
@@ -22,8 +20,7 @@ function fixture(): {
   migrate(db)
   const producer = createEventProducer(db, [])
   const tmpRoot = mkdtempSync(path.join(tmpdir(), 'playtiss-proxy-test-'))
-  const tobeStore = createTobeStore(tmpRoot)
-  return { db, producer, tobeStore, tmpRoot, cleanup: () => rmSync(tmpRoot, { recursive: true, force: true }) }
+  return { db, producer, tmpRoot, cleanup: () => rmSync(tmpRoot, { recursive: true, force: true }) }
 }
 
 describe('startServer routing', () => {

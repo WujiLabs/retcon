@@ -22,9 +22,8 @@
 import fs from 'node:fs'
 
 import { closeDb, openDb } from '../db.js'
-import { createTobeStore } from '../tobe.js'
 import { validateActor } from '../util/actor-name.js'
-import { retconDbPath, retconPidFile, retconTobeDir } from './paths.js'
+import { retconDbPath, retconPidFile } from './paths.js'
 
 export interface CleanOptions {
   actor: string
@@ -208,8 +207,11 @@ export function runClean(opts: CleanOptions): CleanResult {
           .prepare(`SELECT COUNT(*) AS n FROM tasks WHERE id IN (${taskPlaceholders})`)
           .get(...taskIds) as { n: number }).n
 
-    let tobeFilesRemoved = 0
-
+    // v0.6: fork_anchors are SQLite rows, so they're wiped by the per-table
+    // DELETEs below alongside sessions/events/etc. No filesystem cleanup
+    // needed — TOBE files no longer exist in production. v0.5.x leftover
+    // files at ~/.retcon/tobe/ stay on disk but harm nothing (the proxy
+    // never reads them in v0.6).
     if (opts.yes) {
       const tx = db.transaction(() => {
         if (sessionIds.length > 0) {
@@ -221,6 +223,8 @@ export function runClean(opts: CleanOptions): CleanResult {
             .run(...taskIds)
           db.prepare(`DELETE FROM tasks WHERE id IN (${taskPlaceholders})`)
             .run(...taskIds)
+          db.prepare(`DELETE FROM fork_anchors WHERE session_id IN (${sessionPlaceholders})`)
+            .run(...sessionIds)
           db.prepare(`DELETE FROM sessions WHERE id IN (${sessionPlaceholders})`)
             .run(...sessionIds)
         }
@@ -231,20 +235,6 @@ export function runClean(opts: CleanOptions): CleanResult {
         db.prepare('DELETE FROM pending_actors WHERE actor = ?').run(opts.actor)
       })
       tx()
-
-      // Filesystem cleanup of TOBE pending files. Routed through the live
-      // tobeStore so we use the same `tobe_pending-${safeName(sid)}.json`
-      // path format the writer used; a hand-built `${sid}.json` is wrong
-      // and silently no-ops every cleanup.
-      const tobeStore = createTobeStore(retconTobeDir())
-      for (const sessionId of sessionIds) {
-        const tobePath = tobeStore.fileFor(sessionId)
-        try {
-          fs.unlinkSync(tobePath)
-          tobeFilesRemoved++
-        }
-        catch { /* not present, fine */ }
-      }
     }
 
     return {
@@ -254,7 +244,7 @@ export function runClean(opts: CleanOptions): CleanResult {
       branchViews: branchViewsCount,
       events: eventsCount,
       pendingActors: pendingActorsCount,
-      tobeFilesRemoved,
+      tobeFilesRemoved: 0,
       applied: opts.yes,
     }
   }

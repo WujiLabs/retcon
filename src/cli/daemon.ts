@@ -41,8 +41,7 @@ import { closeDb, migrate, openDb } from '../db.js'
 import { createMcpTools } from '../mcp-tools.js'
 import { ANTHROPIC_UPSTREAM } from '../proxy-handler.js'
 import { DEFAULT_PORT, defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { createTobeStore } from '../tobe.js'
-import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile, retconTobeDir } from './paths.js'
+import { ensureRetconDirs, retconDbPath, retconDumpsDir, retconPidFile } from './paths.js'
 
 const SHUTDOWN_DEADLINE_MS = 2000
 
@@ -118,15 +117,13 @@ export async function runDaemon(opts: { port?: number, writePidFile?: boolean, u
   // declared deps, not implicit array order.
   const tasks = await defaultTasks()
   const channel = createChannel({ db, tasks })
-  const tobeStore = createTobeStore(retconTobeDir())
   const storageProvider = new SqliteStorageProvider(db)
-  const mcpTools = createMcpTools({ db, tobeStore, storageProvider, rewindEnabled: true })
+  const mcpTools = createMcpTools({ db, storageProvider, rewindEnabled: true })
 
   const handle = await startServer({
     port,
     upstream,
     channel,
-    tobeStore,
     mcpTools,
     db,
     dbPath: retconDbPath(),

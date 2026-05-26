@@ -28,19 +28,17 @@ afterEach(() => {
 
 describe('retcon paths', () => {
   it('respects RETCON_HOME override', async () => {
-    const { retconHome, retconDbPath, retconTobeDir, retconPidFile, retconLogFile } = await import('../cli/paths.js')
+    const { retconHome, retconDbPath, retconPidFile, retconLogFile } = await import('../cli/paths.js')
     expect(retconHome()).toBe(tmpHome)
     expect(retconDbPath()).toBe(path.join(tmpHome, 'proxy.db'))
-    expect(retconTobeDir()).toBe(path.join(tmpHome, 'tobe'))
     expect(retconPidFile()).toBe(path.join(tmpHome, 'proxy.pid'))
     expect(retconLogFile()).toBe(path.join(tmpHome, 'daemon.log'))
   })
 
-  it('ensureRetconDirs creates home + tobe subdirs (idempotent)', async () => {
-    const { ensureRetconDirs, retconHome, retconTobeDir } = await import('../cli/paths.js')
+  it('ensureRetconDirs creates home (idempotent)', async () => {
+    const { ensureRetconDirs, retconHome } = await import('../cli/paths.js')
     ensureRetconDirs()
     expect(fs.existsSync(retconHome())).toBe(true)
-    expect(fs.existsSync(retconTobeDir())).toBe(true)
     // Calling twice is a no-op (no throw).
     expect(() => ensureRetconDirs()).not.toThrow()
   })

@@ -43,7 +43,6 @@ import {
 } from './fork-anchors.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
-import type { TobeStore } from './tobe.js'
 
 /**
  * Safety cap on rewind_to's user message. Anything larger hints at abuse;
@@ -93,7 +92,6 @@ export const MAX_BOOKMARK_LABEL_BYTES = 256
 
 interface McpToolDeps {
   db: DB
-  tobeStore: TobeStore
   /** Same DB, but accessed via the @playtiss/core StorageProvider
    *  contract. body-blob's hydrate path goes through here instead of
    *  raw `SELECT bytes FROM blobs WHERE cid = ?`. */

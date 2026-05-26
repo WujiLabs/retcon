@@ -52,7 +52,34 @@ import type { AssetId } from '@playtiss/core'
 
 import { blobRefFromMessagesBody, loadHydratedMessagesBody } from './body-blob.js'
 import type { DB } from './db.js'
-import type { SyntheticDepartureMeta } from './tobe.js'
+
+/**
+ * SR-construction metadata stashed on the active anchor row at rewind_to /
+ * submit_file MCP-call time. proxy-handler emits `fork.forked` after
+ * response_completed and derives tool_use_id from claude's actual sent body
+ * (the pre-splice JSON request). The RewindMarkerV1 projector then INSERTs
+ * the SR row with `synthetic_revision_id`. Lifted out of the deleted
+ * tobe.ts in the v0.6 cutover.
+ */
+export interface SyntheticDepartureMeta {
+  /** Discriminates which operation produced the anchor. */
+  kind: 'rewind' | 'submit'
+  /** target_view_id from fork.back_requested (correlation). */
+  target_view_id: string
+  /** Pre-generated SR id; same value used for both fork.forked emit and INSERT. */
+  synthetic_revision_id: string
+  /** R2' display content (varies by kind). */
+  synthetic_tool_result_text: string
+  /** R3' display content (varies by kind). */
+  synthetic_assistant_text: string
+  /** The user's `message` arg from rewind_to OR submit_file. */
+  synthetic_user_message: string
+  /** R1.id — the assistant turn that emitted tool_use(rewind_to | submit_file).
+   *  SR.parent_revision_id will be set to this. */
+  parent_revision_id: string
+  /** Timestamp at MCP-call time. SR.sealed_at uses this. */
+  back_requested_at: number
+}
 
 /**
  * Hard cap on the JSON-encoded size of `target_messages_json` for an active

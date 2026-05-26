@@ -31,7 +31,11 @@ import type { DB } from './db.js'
 import type { BlobRef } from './events.js'
 import {
   applyAnchorSplice,
+  type ForkAnchor,
+  getAnchorByToken,
   getMostRecentUnacknowledgedRelease,
+  markReleased,
+  type SyntheticDepartureMeta,
 } from './fork-anchors.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
 import {
@@ -44,7 +48,6 @@ import { computeRevisionAsset } from './revisions-v1.js'
 import { buildSyntheticAsset, detectParallelTools } from './rewind-marker-v1.js'
 import type { SessionQueue } from './session-queue.js'
 import { extractStopReasonFromJsonBody, extractStopReasonFromSseBody } from './sse-parser.js'
-import type { TobePending, TobeStore } from './tobe.js'
 
 export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com'
 export const SESSION_HEADER = 'x-playtiss-session'
@@ -108,7 +111,6 @@ function filterResponseHeaders(
 export interface ProxyContext {
   readonly channel: Channel
   readonly sessionQueue: SessionQueue
-  readonly tobeStore: TobeStore
   readonly redactSet: ReadonlySet<string>
   readonly upstream: string
   readonly forkAwaiter: ForkAwaiter
@@ -121,11 +123,11 @@ export interface ProxyContext {
    */
   readonly bindingTable?: BindingTable
   /**
-   * Optional DB handle. When provided, dispatch reads sessions.branch_context_json
-   * to apply persistent fork rewrites to /v1/messages, and writes back the new
-   * branch state after each successful upstream response. Without this handle
-   * the proxy still works for non-fork traffic; fork persistence simply degrades
-   * to TOBE one-shot behavior.
+   * Optional DB handle. When provided, dispatch runs applyAnchorSplice to
+   * splice an active fork's target_messages into /v1/messages bodies that
+   * carry a matching <retcon-anchor token="..." /> in a tool_result block;
+   * also drives persistent <retcon-released> reminder injection. Without
+   * this handle, the proxy still works for non-fork traffic.
    */
   readonly db?: DB
 }
@@ -157,22 +159,6 @@ function readFullBody(req: http.IncomingMessage): Promise<Buffer> {
   })
 }
 
-function applyTobe(
-  body: Buffer,
-  pending: TobePending,
-): { rewritten: Buffer, originalBody: Buffer } {
-  // Only mutate if the body is JSON with a messages[] — otherwise pass-through.
-  try {
-    const parsed = JSON.parse(body.toString('utf8')) as { messages?: unknown }
-    parsed.messages = pending.messages
-    const rewritten = Buffer.from(JSON.stringify(parsed), 'utf8')
-    return { rewritten, originalBody: body }
-  }
-  catch {
-    return { rewritten: body, originalBody: body }
-  }
-}
-
 /**
  * Hard cap on the JSON-encoded size of `branch_context_json`. The column
  * grows by one user/assistant turn per /v1/messages once a fork is active.
@@ -182,10 +168,9 @@ function applyTobe(
  * override and fall back to claude's local view — the fork is lost, but
  * we don't grow the column further.
  */
-/** @deprecated Re-exported for legacy callers; new code should import
- *  `TARGET_MESSAGES_MAX_BYTES` from `./fork-anchors.js`. The v0.6 anchor
- *  design enforces this cap at rewind_to MCP-call time, not on every splice. */
-export const BRANCH_CONTEXT_MAX_BYTES = 8 * 1024 * 1024
+// BRANCH_CONTEXT_MAX_BYTES deleted in the v0.6 cutover. Equivalent cap is
+// TARGET_MESSAGES_MAX_BYTES in ./fork-anchors.js (enforced at rewind_to
+// MCP-call time rather than on every splice).
 
 /**
  * Anthropic's hard limit on ephemeral `cache_control` blocks per /v1/messages
@@ -573,7 +558,7 @@ async function decompressIfNeeded(buf: Buffer, encoding: string | undefined): Pr
 async function tryEmitForkForked(opts: {
   channel: Channel
   sessionId: string
-  synthetic: import('./tobe.js').SyntheticDepartureMeta
+  synthetic: import('./fork-anchors.js').SyntheticDepartureMeta
   parent_revision_id: string
   target_revision_id: string
   to_revision_id: string
@@ -686,7 +671,6 @@ async function dispatch(
   const url = req.url ?? ''
   const isMessagesPath = url.includes('/messages')
   const isMessagesEndpoint = isMessagesPath && !url.includes('/count_tokens')
-  const pending = isMessagesEndpoint ? ctx.tobeStore.peek(sessionId) : null
   let bodyToForward = rawBody
   let tobeAppliedFrom: {
     fork_point_revision_id: string
@@ -694,48 +678,19 @@ async function dispatch(
     original_body_cid: string
   } | undefined
   // Same bytes get hashed by both the tobe_applied_from metadata block
-  // and the proxy.request_received emit. Compute once.
+  // and the proxy.request_received emit. Compute once when an anchor matches.
   let originalBodyBlob: Awaited<ReturnType<typeof blobRefFromBytes>> | undefined
-  // Parallel-tool guard (v0.5.0-alpha.1). When R1 has sibling tool_uses
-  // beyond the operation, the splice would discard their tool_results and
-  // upstream would 400. We detect by parsing claude's pre-splice JSON body
-  // (no SSE involved — rawBody is the request claude sent, not the upstream
-  // response) and abort the splice if found. The AI surfaces the failure on
-  // the next turn via the loud-failure response in rewind_to/submit_file.
+  // anchorMatch: the active fork_anchors row whose token was just spliced.
+  // Captured here so the response-completed downstream can emit fork.forked
+  // / fork.synthesis_failed against the same synthetic_metadata.
+  let anchorMatch: { row: ForkAnchor, synthetic: SyntheticDepartureMeta | null } | null = null
+  // Parallel-tool guard. When R1 has sibling tool_uses beyond the operation,
+  // the splice would discard their tool_results (they live in the same
+  // user-role turn as the anchor's tool_result) and upstream would 400.
+  // Detect from claude's pre-splice JSON body and abort if found.
   let spliceAborted: { kind: 'rewind' | 'submit', names: string[] } | null = null
-  if (pending && pending.synthetic) {
-    const det = detectParallelTools(rawBody, pending.synthetic.kind)
-    if (det.ok && det.parallel.length > 0) {
-      spliceAborted = { kind: pending.synthetic.kind, names: det.parallel }
-    }
-  }
-  if (pending && !spliceAborted) {
-    const { rewritten, originalBody } = applyTobe(rawBody, pending)
-    bodyToForward = rewritten
-    originalBodyBlob = await blobRefFromBytes(originalBody)
-    tobeAppliedFrom = {
-      fork_point_revision_id: pending.fork_point_revision_id,
-      source_view_id: pending.source_view_id,
-      original_body_cid: originalBodyBlob.cid,
-    }
-  }
-  else if (pending && spliceAborted) {
-    // Abort path. Keep rawBody as bodyToForward (claude's call goes through
-    // unchanged). Commit (delete) the TOBE so retries don't keep tripping.
-    // Emit fork.synthesis_failed for audit.
-    ctx.tobeStore.commit(sessionId)
-    await ctx.channel.submit(
-      'fork.synthesis_failed',
-      {
-        target_revision_id: pending.fork_point_revision_id,
-        parent_revision_id: pending.synthetic?.parent_revision_id,
-        error_message: `splice aborted: R1 had parallel tool_uses (${spliceAborted.names.join(', ')}); rewound context would discard their results`,
-        parallel_tool_names: spliceAborted.names,
-      },
-      sessionId,
-    )
-  }
-  else if (isMessagesEndpoint && ctx.db) {
+
+  if (isMessagesEndpoint && ctx.db) {
     // v0.6 anchor splice. Scans the body's tool_results for the latest
     // <retcon-anchor token="..." />; on match, splices [target_messages,
     // ...everything_after_anchor_turn]. On the divergence path (active
@@ -744,15 +699,64 @@ async function dispatch(
     // gets marked released and a `<retcon-released>` reminder fires.
     const spliceResult = applyAnchorSplice(rawBody, sessionId, ctx.db)
     if (spliceResult?.releasedReason) {
-      // Divergence detected — emit audit. Reminder injection happens
-      // downstream when the reminder code path reads the released row.
       await ctx.channel.submit(
         'session.branch_context_released',
         { session_id: sessionId, reason: spliceResult.releasedReason },
         sessionId,
       )
     }
-    if (spliceResult) bodyToForward = spliceResult.body
+    if (spliceResult?.matchedToken) {
+      const row = getAnchorByToken(ctx.db, spliceResult.matchedToken)
+      if (row && row.state === 'active') {
+        const synthetic = row.synthetic_metadata_json
+          ? JSON.parse(row.synthetic_metadata_json) as SyntheticDepartureMeta
+          : null
+        anchorMatch = { row, synthetic }
+        // Parallel-tool guard only fires when the anchor was created via
+        // rewind_to / submit_file (synthetic_metadata present). For
+        // already-materialized SRs (synthetic_metadata NULL'd post-fork.forked),
+        // the splice runs unconditionally.
+        if (synthetic) {
+          const det = detectParallelTools(rawBody, synthetic.kind)
+          if (det.ok && det.parallel.length > 0) {
+            spliceAborted = { kind: synthetic.kind, names: det.parallel }
+          }
+        }
+        if (!spliceAborted && spliceResult.body !== rawBody) {
+          // Splice applied. Capture pre-splice body for SR construction
+          // (rewind-marker-v1 re-fetches by CID to extract R1's tool_use_id).
+          bodyToForward = spliceResult.body
+          originalBodyBlob = await blobRefFromBytes(rawBody)
+          tobeAppliedFrom = {
+            fork_point_revision_id: row.fork_point_revision_id ?? '',
+            source_view_id: row.source_view_id ?? '',
+            original_body_cid: originalBodyBlob.cid,
+          }
+        }
+        else if (spliceAborted) {
+          // Abort path: mark the anchor as released with parallel_tools reason,
+          // emit fork.synthesis_failed for audit. The body forwards unchanged
+          // (rawBody) so claude's parallel tool_uses get their real results
+          // upstream; the rewind itself is lost (user re-rewinds to recover).
+          await markReleased(ctx.db, row.anchor_token, 'parallel_tools')
+          await ctx.channel.submit(
+            'fork.synthesis_failed',
+            {
+              target_revision_id: row.fork_point_revision_id,
+              parent_revision_id: synthetic?.parent_revision_id,
+              error_message: `splice aborted: R1 had parallel tool_uses (${spliceAborted.names.join(', ')}); rewound context would discard their results`,
+              parallel_tool_names: spliceAborted.names,
+            },
+            sessionId,
+          )
+        }
+      }
+    }
+    else if (spliceResult) {
+      // Released or no-anchor body shape — applyAnchorSplice already produced
+      // the right body (may equal rawBody when no action needed).
+      bodyToForward = spliceResult.body
+    }
 
     // Persistent release reminder. If a released anchor on this session is
     // still unacknowledged, prepend a <retcon-released> reminder before the
@@ -894,27 +898,18 @@ async function dispatch(
       if (terminalEmitted) return
       terminalEmitted = true
       await ctx.channel.submit(topic, payload, sessionId, refs)
-      // TOBE lifecycle: only commit (delete the pending file) when the
-      // upstream call actually returned a non-5xx response. Every other
-      // outcome (5xx body, client abort, upstream_error) keeps the file
-      // so Claude Code's retry loop re-applies it. This is what makes
-      // the fork intent idempotent under transient failures.
-      if (pending && !spliceAborted) {
-        const isHttpSuccess
-          = topic === 'proxy.response_completed'
-            && typeof payload.status === 'number'
-            && payload.status < 500
-        if (isHttpSuccess) ctx.tobeStore.commit(sessionId)
-
-        // Note: fork.forked emission lives in the response-handler's async
-        // path (after emitTerminal) — it requires building the synthetic
-        // asset, which is async. See the call-site at the end of the
-        // response handler below.
-
+      // v0.6: anchor rows are SQLite-managed, so there's no per-response
+      // file commit to do (the equivalent of the v0.5 tobeStore.commit).
+      // The anchor row stays active across the response; future turns
+      // continue to splice off it. Failure modes (5xx, abort, upstream_error)
+      // are no-ops at this layer — claude's retry naturally re-splices.
+      if (anchorMatch && !spliceAborted) {
         // Notify any in-flight fork_back awaiter with a structured outcome.
         // fork_back can either await this or query the event log after the
         // fact; both paths go through ForkAwaiter / lastForkOutcome.
         const outcome: ForkOutcome = (() => {
+          const fp = anchorMatch.row.fork_point_revision_id ?? ''
+          const sv = anchorMatch.row.source_view_id ?? ''
           if (topic === 'proxy.response_completed') {
             const s = typeof payload.status === 'number' ? payload.status : 0
             return {
@@ -922,8 +917,8 @@ async function dispatch(
               revision_id: requestEvent.id,
               http_status: s,
               stop_reason: (payload.stop_reason ?? null) as string | null,
-              fork_point_revision_id: pending.fork_point_revision_id,
-              source_view_id: pending.source_view_id,
+              fork_point_revision_id: fp,
+              source_view_id: sv,
             }
           }
           if (topic === 'proxy.response_aborted') {
@@ -931,8 +926,8 @@ async function dispatch(
               status: 'aborted',
               revision_id: requestEvent.id,
               error_message: typeof payload.reason === 'string' ? payload.reason : undefined,
-              fork_point_revision_id: pending.fork_point_revision_id,
-              source_view_id: pending.source_view_id,
+              fork_point_revision_id: fp,
+              source_view_id: sv,
             }
           }
           return {
@@ -941,8 +936,8 @@ async function dispatch(
             http_status: typeof payload.status === 'number' ? payload.status : undefined,
             error_message:
               typeof payload.error_message === 'string' ? payload.error_message : undefined,
-            fork_point_revision_id: pending.fork_point_revision_id,
-            source_view_id: pending.source_view_id,
+            fork_point_revision_id: fp,
+            source_view_id: sv,
           }
         })()
         ctx.forkAwaiter.notify(sessionId, outcome)
@@ -1123,27 +1118,11 @@ async function dispatch(
             // and pending_synthetic_json should survive for claude's retry.
             const isClosedForkable = stopReason === 'end_turn' || stopReason === 'stop_sequence'
             const isOpen = stopReason === 'tool_use' || stopReason === 'pause_turn'
-            const tobeConsumed = pending && !spliceAborted && status >= 200 && status < 300
+            const anchorApplied = anchorMatch !== null && !spliceAborted && status >= 200 && status < 300
 
-            if (tobeConsumed && pending && pending.synthetic && originalBodyBlob) {
-              const s = pending.synthetic
-
-              // A new rewind clobbers any prior deferred SR. Audit + clear.
-              if (ctx.db) {
-                const prior = getPendingSynthetic(ctx.db, sessionId)
-                if (prior) {
-                  await ctx.channel.submit(
-                    'fork.synthesis_failed',
-                    {
-                      parent_revision_id: prior.synthetic.parent_revision_id,
-                      target_revision_id: prior.fork_point_revision_id,
-                      error_message: 'superseded by a new rewind/submit before reaching end_turn',
-                    },
-                    sessionId,
-                  )
-                  clearPendingSynthetic(ctx.db, sessionId)
-                }
-              }
+            if (anchorApplied && anchorMatch !== null && anchorMatch.synthetic && originalBodyBlob) {
+              const s = anchorMatch.synthetic
+              const fp = anchorMatch.row.fork_point_revision_id ?? ''
 
               if (isClosedForkable) {
                 await tryEmitForkForked({
@@ -1151,17 +1130,24 @@ async function dispatch(
                   sessionId,
                   synthetic: s,
                   parent_revision_id: s.parent_revision_id,
-                  target_revision_id: pending.fork_point_revision_id,
+                  target_revision_id: fp,
                   to_revision_id: requestEvent.id,
                   originalBodyBytes: originalBodyBlob.ref.bytes,
                 })
+                // SR materialized — clear synthetic_metadata on the anchor so
+                // a future end_turn doesn't re-fire fork.forked. The anchor
+                // row itself stays active for continued splicing.
+                if (ctx.db) clearPendingSynthetic(ctx.db, sessionId)
               }
               else if (isOpen && ctx.db) {
-                // Defer: persist for fire on the next end_turn.
+                // Defer: persist for fire on the next end_turn. The pending-
+                // synthetic facade writes to fork_anchors.synthetic_metadata_json
+                // on the active row, so the deferred metadata stays scoped to
+                // the same anchor.
                 setPendingSynthetic(ctx.db, sessionId, {
                   synthetic: s,
                   to_revision_id: requestEvent.id,
-                  fork_point_revision_id: pending.fork_point_revision_id,
+                  fork_point_revision_id: fp,
                   original_body_cid: originalBodyBlob.cid,
                   first_seen_at: Date.now(),
                 })
@@ -1172,7 +1158,7 @@ async function dispatch(
                   'fork.synthesis_failed',
                   {
                     parent_revision_id: s.parent_revision_id,
-                    target_revision_id: pending.fork_point_revision_id,
+                    target_revision_id: fp,
                     error_message: ctx.db
                       ? `post-rewind first turn ended with stop_reason=${stopReason ?? 'null'}; no SR materialized`
                       : `proxy-handler context has no DB; cannot defer SR through tool_use chains`,
@@ -1181,14 +1167,7 @@ async function dispatch(
                 )
               }
             }
-            else if (tobeConsumed && pending && !pending.synthetic && stopReason === 'end_turn') {
-              console.warn(
-                `[proxy-handler] TOBE consumed for session=${sessionId} but `
-                + `pending.synthetic is missing — likely written by a pre-v0.5 daemon. `
-                + `Skipping fork.forked emission; no SR will materialize.`,
-              )
-            }
-            else if (!pending && status >= 200 && status < 300 && ctx.db) {
+            else if (!anchorMatch && status >= 200 && status < 300 && ctx.db) {
               // No TOBE this turn — a prior rewind may still be waiting on
               // an end_turn. Re-check the persisted synthetic.
               const persisted = getPendingSynthetic(ctx.db, sessionId)

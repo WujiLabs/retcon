@@ -34,7 +34,6 @@ import { RevisionsV1Projector } from './revisions-v1.js'
 import { RewindMarkerV1Projector } from './rewind-marker-v1.js'
 import { SessionQueue } from './session-queue.js'
 import { SessionsV1Projector } from './sessions-v1.js'
-import type { TobeStore } from './tobe.js'
 import { VERSION } from './version.js'
 
 /**
@@ -177,8 +176,6 @@ export interface ServerOptions {
   upstream?: string
   /** Required: where events get emitted. */
   channel: Channel
-  /** Required: file-based TOBE state (per-session). */
-  tobeStore: TobeStore
   /** Optional: override the default header redaction list. */
   redactSet?: ReadonlySet<string>
   /**
@@ -223,7 +220,6 @@ export function startServer(options: ServerOptions): Promise<ServerHandle> {
   const proxyCtx: ProxyContext = {
     channel: options.channel,
     sessionQueue,
-    tobeStore: options.tobeStore,
     redactSet: options.redactSet ?? DEFAULT_REDACTED_HEADERS,
     upstream: options.upstream ?? ANTHROPIC_UPSTREAM,
     forkAwaiter,

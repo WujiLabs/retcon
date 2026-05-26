@@ -27,8 +27,8 @@ import {
   clearSyntheticMetadata,
   getActiveAnchorSyntheticMetadata,
   setActiveAnchorSyntheticMetadata,
+  type SyntheticDepartureMeta,
 } from './fork-anchors.js'
-import type { SyntheticDepartureMeta } from './tobe.js'
 
 /** Persisted form of an in-flight rewind awaiting an end_turn. */
 export interface PendingSynthetic {

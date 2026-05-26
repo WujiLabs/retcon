@@ -17,7 +17,7 @@ function tool(handler: McpTool['handler'], description = 'test tool'): McpTool {
   return { handler, description, inputSchema: { type: 'object' } }
 }
 import { defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { createTobeStore, type TobeStore } from '../tobe.js'
+import { createTobeStore, type TobeStore } from './_legacy-tobe-stub.js'
 
 async function fixture() {
   const db = openDb({ path: ':memory:' })
@@ -32,7 +32,6 @@ async function startWithTools(fx: Awaited<ReturnType<typeof fixture>>, tools: Ma
   return startServer({
     port: 0,
     channel: fx.channel,
-    tobeStore: fx.tobeStore,
     mcpTools: tools,
   })
 }

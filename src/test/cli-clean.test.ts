@@ -96,7 +96,9 @@ describe('runClean', () => {
     expect(r.sessions).toBe(2)
     expect(r.events).toBe(4)
     expect(r.branchViews).toBe(2)
-    expect(r.tobeFilesRemoved).toBe(2) // tobe_pending-sess-test-{1,2}.json
+    // v0.6: TOBE files are no longer created. Legacy v0.5.x files in the
+    // tobe/ directory aren't touched by runClean — they're harmless.
+    expect(r.tobeFilesRemoved).toBe(0)
 
     // Verify only the 'keep' actor's rows remain.
     const db = openDb({ path: dbPath })

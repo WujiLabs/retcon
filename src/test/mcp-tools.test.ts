@@ -27,12 +27,10 @@ import {
   META_REFS,
 } from '../mcp-tools.js'
 import { defaultTasks } from '../server.js'
-import { createTobeStore, type TobeStore } from '../tobe.js'
 
 interface TestFixture {
   db: DB
   channel: Channel
-  tobeStore: TobeStore
   storageProvider: SqliteStorageProvider
   tmp: string
   sessionId: string
@@ -45,7 +43,6 @@ async function fixture(opts: { orphan?: boolean } = {}): Promise<TestFixture> {
   migrate(db)
   const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmp = mkdtempSync(path.join(tmpdir(), 'mcp-tools-test-'))
-  const tobeStore = createTobeStore(tmp)
   const sessionId = 'sess-tools'
   if (opts.orphan) {
     await channel.submit(
@@ -62,7 +59,6 @@ async function fixture(opts: { orphan?: boolean } = {}): Promise<TestFixture> {
   return {
     db,
     channel,
-    tobeStore,
     storageProvider,
     tmp,
     sessionId,
@@ -103,7 +99,6 @@ async function emitTurn(
 async function call(fx: TestFixture, name: string, args: unknown, rewindEnabled = true): Promise<unknown> {
   const tools = createMcpTools({
     db: fx.db,
-    tobeStore: fx.tobeStore,
     storageProvider: fx.storageProvider,
     rewindEnabled,
   })
@@ -165,7 +160,6 @@ async function rewindTwoStep(
   const tools = createMcpToolsWithTokens(
     {
       db: fx.db,
-      tobeStore: fx.tobeStore,
       storageProvider: fx.storageProvider,
       rewindEnabled: opts.rewindEnabled ?? true,
     },
@@ -1188,7 +1182,6 @@ describe('delete_bookmark', () => {
     // Try to delete the FIRST session's bookmark from inside the SECOND session's context.
     const tools = createMcpTools({
       db: fx.db,
-      tobeStore: fx.tobeStore,
       storageProvider: fx.storageProvider,
       rewindEnabled: true,
     })
@@ -1663,7 +1656,7 @@ describe('rewind_to (dual-secret flow)', () => {
     ])
     const tokenStore = new ConfirmTokenStore()
     const tools = createMcpToolsWithTokens(
-      { db: fx.db, tobeStore: fx.tobeStore, storageProvider: fx.storageProvider, rewindEnabled: true },
+      { db: fx.db, storageProvider: fx.storageProvider, rewindEnabled: true },
       tokenStore,
     )
     const tool = tools.get('rewind_to')!
@@ -1691,7 +1684,7 @@ describe('rewind_to (dual-secret flow)', () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
     const tokenStore = new ConfirmTokenStore()
     const tools = createMcpToolsWithTokens(
-      { db: fx.db, tobeStore: fx.tobeStore, storageProvider: fx.storageProvider, rewindEnabled: true },
+      { db: fx.db, storageProvider: fx.storageProvider, rewindEnabled: true },
       tokenStore,
     )
     const tool = tools.get('rewind_to')!
@@ -1718,7 +1711,7 @@ describe('rewind_to (dual-secret flow)', () => {
     // deterministically without sleeping in the test.
     const tokenStore = new ConfirmTokenStore(1)
     const tools = createMcpToolsWithTokens(
-      { db: fx.db, tobeStore: fx.tobeStore, storageProvider: fx.storageProvider, rewindEnabled: true },
+      { db: fx.db, storageProvider: fx.storageProvider, rewindEnabled: true },
       tokenStore,
     )
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q' }])
@@ -2297,7 +2290,6 @@ describe('dump_to_file', () => {
 
       const tools = createMcpTools({
         db: evil.db,
-        tobeStore: evil.tobeStore,
         storageProvider: evil.storageProvider,
         rewindEnabled: true,
       })
@@ -2354,7 +2346,6 @@ describe('submit_file (dual-secret + path safety)', () => {
     const tools = createMcpToolsWithTokens(
       {
         db: fx.db,
-        tobeStore: fx.tobeStore,
         storageProvider: fx.storageProvider,
         rewindEnabled: true,
       },
@@ -2610,7 +2601,6 @@ describe('createMcpToolsWithTokens (defensive construction)', () => {
       fx,
       asDeps: {
         db: fx.db,
-        tobeStore: fx.tobeStore,
         storageProvider: fx.storageProvider,
         rewindEnabled: true,
       },
@@ -2783,7 +2773,6 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
     const tools = createMcpToolsWithTokens(
       {
         db: fx.db,
-        tobeStore: fx.tobeStore,
         storageProvider: fx.storageProvider,
         rewindEnabled: true,
       },
@@ -2809,7 +2798,6 @@ describe('submit_file: extended TOBE (Phase 1, v0.5.0-alpha.1)', () => {
     ])
     const tools = createMcpTools({
       db: fx.db,
-      tobeStore: fx.tobeStore,
       storageProvider: fx.storageProvider,
     })
     const res = await tools.get('submit_file')!.handler(

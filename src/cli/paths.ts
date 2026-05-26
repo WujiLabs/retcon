@@ -24,10 +24,6 @@ export function retconDbPath(): string {
   return path.join(retconHome(), 'proxy.db')
 }
 
-export function retconTobeDir(): string {
-  return path.join(retconHome(), 'tobe')
-}
-
 export function retconDumpsDir(): string {
   return path.join(retconHome(), 'dumps')
 }
@@ -41,15 +37,17 @@ export function retconLogFile(): string {
 }
 
 /**
- * Create ~/.retcon/, ~/.retcon/tobe/, and ~/.retcon/dumps/ if missing.
- * Idempotent.
+ * Create ~/.retcon/ and ~/.retcon/dumps/ if missing. Idempotent.
  *
  * Throws if the path is unwritable (e.g. read-only HOME, permission denied).
  * Caller is expected to surface the error to the user since retcon can't
  * function without local state.
+ *
+ * v0.6: ~/.retcon/tobe/ is no longer created. v0.5.x leftover files in that
+ * directory are harmless (the proxy never reads them) and can be deleted
+ * manually if needed.
  */
 export function ensureRetconDirs(): void {
   fs.mkdirSync(retconHome(), { recursive: true })
-  fs.mkdirSync(retconTobeDir(), { recursive: true })
   fs.mkdirSync(retconDumpsDir(), { recursive: true })
 }
