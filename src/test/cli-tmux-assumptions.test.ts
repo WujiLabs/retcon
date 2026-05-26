@@ -184,7 +184,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
 
   // ─── H1+H2 (/clear): SessionStart fires with source="clear" ─────────────
   // ─── persistent fork override is cleared on /clear ──────────────────────
-  it('H1 (clear) + persistence cleanup: branch_context_json drops to NULL after /clear', async () => {
+  it('H1 (clear) + persistence cleanup: active fork_anchors row released on /clear', async () => {
     const sessionName = 'asmp-clear'
     try {
       tmux('kill-session', '-t', sessionName)
@@ -232,19 +232,19 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     tmux('send-keys', '-t', sessionName, 'C-m')
 
     await waitFor(
-      () => parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sid}'`), 10) > 0,
+      () => parseInt(sql(`SELECT COUNT(*) FROM fork_anchors WHERE session_id='${sid}' AND state='active'`), 10) > 0,
       90_000,
-      'branch_context_json populated',
+      'active fork_anchors row exists',
     )
-    const lenBefore = parseInt(
-      sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sid}'`), 10,
+    const activeBefore = parseInt(
+      sql(`SELECT COUNT(*) FROM fork_anchors WHERE session_id='${sid}' AND state='active'`), 10,
     )
-    expect(lenBefore).toBeGreaterThan(0)
+    expect(activeBefore).toBeGreaterThan(0)
 
     // Fire /clear. claude mints a fresh session_id; SessionStart hook fires
-    // with source="clear" and our handler clears branch_context_json on the
-    // (rebound) session row. Scope the assertion to events tagged by THIS
-    // actor — earlier manual runs may have left global events behind.
+    // with source="clear" and our handler marks the session's active anchor
+    // as released (reason='clear'). Scope the assertion to events tagged by
+    // THIS actor — earlier manual runs may have left global events behind.
     tmux('send-keys', '-t', sessionName, '/clear')
     tmux('send-keys', '-t', sessionName, 'C-m')
 
@@ -259,12 +259,15 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
       'session.branch_context_cleared with source=clear (scoped to actor=asmp)',
     )
 
-    // Verify the row's branch_context_json is NULL (whichever row exists
-    // for this actor — /clear may have re-keyed the session id).
+    // Verify no active fork_anchors row remains for this actor's sessions
+    // — /clear marked them released. (claude may have re-keyed the session
+    // id; check the most recent row regardless of state.)
     const remaining = sql(
-      `SELECT IFNULL(branch_context_json, '__NULL__') FROM sessions WHERE actor='${ASSUMPTION_ACTOR}' ORDER BY created_at DESC LIMIT 1`,
+      `SELECT state FROM fork_anchors WHERE session_id IN `
+      + `(SELECT id FROM sessions WHERE actor='${ASSUMPTION_ACTOR}') `
+      + `ORDER BY created_at DESC LIMIT 1`,
     )
-    expect(remaining).toBe('__NULL__')
+    expect(remaining).toBe('released')
 
     try {
       tmux('kill-session', '-t', sessionName)
@@ -274,7 +277,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
 
   // ─── H1+H2 (/compact): SessionStart fires with source="compact" ─────────
   // ─── persistent fork override is cleared on /compact ────────────────────
-  it('H1 (compact) + persistence cleanup: branch_context_json drops to NULL after /compact', async () => {
+  it('H1 (compact) + persistence cleanup: active fork_anchors row released on /compact', async () => {
     const sessionName = 'asmp-compact'
     try {
       tmux('kill-session', '-t', sessionName)
@@ -322,9 +325,9 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     tmux('send-keys', '-t', sessionName, 'C-m')
 
     await waitFor(
-      () => parseInt(sql(`SELECT length(branch_context_json) FROM sessions WHERE id='${sid}'`), 10) > 0,
+      () => parseInt(sql(`SELECT COUNT(*) FROM fork_anchors WHERE session_id='${sid}' AND state='active'`), 10) > 0,
       90_000,
-      'branch_context_json populated (compact case)',
+      'active fork_anchors row exists (compact case)',
     )
 
     // /compact summarizes the conversation locally then fires SessionStart
@@ -345,9 +348,11 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     )
 
     const remaining = sql(
-      `SELECT IFNULL(branch_context_json, '__NULL__') FROM sessions WHERE actor='${ASSUMPTION_ACTOR}' ORDER BY created_at DESC LIMIT 1`,
+      `SELECT state FROM fork_anchors WHERE session_id IN `
+      + `(SELECT id FROM sessions WHERE actor='${ASSUMPTION_ACTOR}') `
+      + `ORDER BY created_at DESC LIMIT 1`,
     )
-    expect(remaining).toBe('__NULL__')
+    expect(remaining).toBe('released')
 
     try {
       tmux('kill-session', '-t', sessionName)

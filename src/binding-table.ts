@@ -197,6 +197,13 @@ export function rebindSession(db: DB, oldId: string, newId: string): void {
     }
 
     db.prepare('UPDATE events SET session_id=? WHERE session_id=?').run(newId, oldId)
+    // v0.6: fork_anchors rows are session-scoped. Without this update,
+    // /clear's rebind would orphan the active fork (sessions.id moves
+    // to newId but fork_anchors.session_id stays at oldId), and the
+    // /clear handler's markSessionActiveAnchorsReleased(newId) wouldn't
+    // find the row → the cleared-event never fires → AI never learns
+    // the fork was released.
+    db.prepare('UPDATE fork_anchors SET session_id=? WHERE session_id=?').run(newId, oldId)
     // pending_actors entry for oldId (if any) becomes meaningless after the
     // merge — the actor was already accounted for above.
     db.prepare('DELETE FROM pending_actors WHERE transport_id=?').run(oldId)

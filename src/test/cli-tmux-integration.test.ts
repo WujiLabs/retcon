@@ -51,7 +51,20 @@ function tmux(...args: string[]): string {
 }
 
 function pane(): string {
-  return tmux('capture-pane', '-t', SESSION, '-p')
+  // Best-effort: SESSION may be gone (test 1 kills it before test 2 / 3
+  // create their own). Fall through to a list of active sessions so the
+  // error message still gives the operator something to debug with.
+  try {
+    return tmux('capture-pane', '-t', SESSION, '-p')
+  }
+  catch {
+    try {
+      return `(SESSION pane unavailable; active tmux sessions: ${tmux('list-sessions', '-F', '#{session_name}').trim()})`
+    }
+    catch {
+      return '(no tmux sessions active)'
+    }
+  }
 }
 
 function sql(query: string): string {
@@ -329,9 +342,14 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
     catch { /* fine if already gone */ }
 
     // Spawn retcon --resume <id>. Positional id avoids the picker.
+    // Use --effort medium for the resume tests: low effort + a long
+    // pre-loaded history + an active fork's reminder makes the model
+    // unreliable at following the rewind_to instructions (observed in
+    // v2.1.150 with Opus 4.7). Medium effort restores the pre-v0.6
+    // pass rate without slowing the warmups in test 1.
     tmux(
       'new-session', '-d', '-s', RESUME_SESSION, '-x', '200', '-y', '50',
-      `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --resume ${originalSessionId} --effort low`,
+      `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --resume ${originalSessionId} --effort medium`,
     )
 
     await waitFor(
@@ -378,12 +396,19 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       + `AND topic='fork.back_requested'`,
     ), 10)
 
+    // v0.6 / claude code v2.1.150 flake mitigation: phrase the prompt as
+    // a fresh action (not "Re-call... with confirm" — that wording
+    // confused the model when prior fork history was in context). Cast
+    // it as "this is a new rewind to a different target" to break the
+    // 'I just did this' pattern. Also bump timeout from 90s → 150s — the
+    // resumed session has a long pre-loaded history and medium effort
+    // means thinking takes longer.
     tmux('send-keys', '-t', RESUME_SESSION,
-      'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"DURIAN"}. '
-      + 'It will return status:rules_returned + a confirm_clean token. '
-      + 'Re-call mcp__retcon__rewind_to with the SAME arguments PLUS '
-      + 'confirm=<the confirm_clean value from the first response>. '
-      + 'Then in your reply, just say DONE.',
+      'IMPORTANT NEW REQUEST: I want to make ANOTHER rewind. '
+      + 'Call mcp__retcon__rewind_to with arguments {"turn_back_n":1, "message":"DURIAN"} — this is a SEPARATE rewind from anything you may have done before. '
+      + 'You will get status:rules_returned + a confirm_clean token. '
+      + 'Then re-call mcp__retcon__rewind_to with the SAME arguments PLUS confirm=<the confirm_clean value>. '
+      + 'After both calls, just reply with "OK new rewind done".',
     )
     tmux('send-keys', '-t', RESUME_SESSION, 'C-m')
 
@@ -392,7 +417,7 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
         `SELECT COUNT(*) FROM events WHERE session_id='${originalSessionId}' `
         + `AND topic='fork.back_requested'`,
       ), 10) > baselineForkBackCount,
-      90000,
+      150_000,
       'NEW fork.back_requested event under originalSessionId post-resume',
     )
 
@@ -576,9 +601,12 @@ describeIfRunnable('retcon CLI ↔ Claude Code interactive integration (tmux)', 
       const revCountAfterTurn2 = parseInt(
         sql(`SELECT COUNT(*) FROM revisions WHERE task_id='${taskId}' AND classification='closed_forkable'`), 10,
       )
+      // --effort medium for the resumed test 3 session — see the test 2
+      // comment for why. Low effort + active fork + long history pushes
+      // v2.1.150 + Opus 4.7 into not-following-instructions territory.
       tmux(
         'new-session', '-d', '-s', FORK_RESUME_SESSION, '-x', '200', '-y', '50',
-        `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --resume ${sessId} --effort low`,
+        `RETCON_CLI_ENTRY=${CLI_ENTRY} retcon --resume ${sessId} --effort medium`,
       )
       await waitFor(
         () => /auto mode/.test(tmux('capture-pane', '-t', FORK_RESUME_SESSION, '-p')),
