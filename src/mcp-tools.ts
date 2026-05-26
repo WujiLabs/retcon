@@ -35,14 +35,17 @@ import { blobRefFromBytes, loadHydratedMessagesBody } from './body-blob.js'
 import { retconDumpsDir } from './cli/paths.js'
 import type { DB } from './db.js'
 import {
+  acknowledgeRelease,
   buildAnchorToolResultText,
   generateAnchorToken,
   getActiveAnchor,
+  getMostRecentUnacknowledgedRelease,
   insertActiveAnchor,
   TARGET_MESSAGES_MAX_BYTES,
 } from './fork-anchors.js'
 import { lastForkOutcome } from './fork-awaiter.js'
 import type { McpTool } from './mcp-handler.js'
+import { findLastForkAppliedTurn } from './proxy-handler.js'
 
 /**
  * Safety cap on rewind_to's user message. Anything larger hints at abuse;
@@ -1294,6 +1297,21 @@ export function createMcpToolsWithTokens(
               relative_to_target: i + 1,
             })),
           ]
+        }
+
+        // v0.6: ack the persistent <retcon-released> reminder. The reminder
+        // tells the AI "calling recall(turn_id=<lastForkAppliedTurn>) will
+        // silence this reminder." Honor that contract: if there's an
+        // unacknowledged released anchor on this session AND the AI is
+        // inspecting the turn we named in the reminder, set acknowledged_at
+        // so the next /v1/messages skips the reminder injection.
+        const pendingRelease = getMostRecentUnacknowledgedRelease(deps.db, ctx.sessionId)
+        if (pendingRelease) {
+          const remindedTurn = findLastForkAppliedTurn(deps.db, ctx.sessionId)
+            ?? pendingRelease.fork_point_revision_id
+          if (remindedTurn && remindedTurn === target.id) {
+            acknowledgeRelease(deps.db, pendingRelease.anchor_token)
+          }
         }
 
         if (!verbose) {

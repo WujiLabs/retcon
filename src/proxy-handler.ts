@@ -237,7 +237,7 @@ export const MAX_CACHE_CONTROL_BLOCKS = 4
  * this point — not sealed, not closed_forkable yet — so it won't appear in
  * the result. Returns the previous turn instead, which is what we want.
  */
-function findLastForkAppliedTurn(db: DB, sessionId: string): string | null {
+export function findLastForkAppliedTurn(db: DB, sessionId: string): string | null {
   const row = db.prepare(`
     SELECT r.id FROM revisions r
       JOIN sessions s ON s.task_id = r.task_id

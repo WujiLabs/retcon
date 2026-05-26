@@ -408,11 +408,19 @@ export function migrate(db: DB, dbPath?: string): void {
           + 'or remove the DB to start fresh (the backup remains).',
         )
       }
-      step(db)
-      // Idempotent: we stamp the new version after each step so a partial
-      // migration leaves a recoverable state.
-      db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)')
-        .run(v + 1, Date.now())
+      // v0.6: wrap step + schema_version stamp in one transaction so a
+      // partial migration (e.g. process killed mid-ghost-row-insert loop)
+      // rolls back cleanly instead of leaving fork_anchors with N rows
+      // and schema_version still at the old value. Without this, a retry
+      // re-enters MIGRATIONS[v] and the deterministic `mig_<sid>` ghost
+      // token collides on the PK, blocking startup with a confusing
+      // constraint error. better-sqlite3's db.transaction() wraps in
+      // BEGIN ... COMMIT and rolls back on throw.
+      db.transaction(() => {
+        step(db)
+        db.prepare('INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)')
+          .run(v + 1, Date.now())
+      })()
     }
   }
 
