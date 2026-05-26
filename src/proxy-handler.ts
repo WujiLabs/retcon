@@ -159,18 +159,9 @@ function readFullBody(req: http.IncomingMessage): Promise<Buffer> {
   })
 }
 
-/**
- * Hard cap on the JSON-encoded size of `branch_context_json`. The column
- * grows by one user/assistant turn per /v1/messages once a fork is active.
- * 8 MiB is well past any model's context window (≈2M+ tokens), so hitting
- * this cap means something went wrong: a runaway tool loop, an
- * adversarial LLM, or a misbehaving client. On overflow we wipe the
- * override and fall back to claude's local view — the fork is lost, but
- * we don't grow the column further.
- */
-// BRANCH_CONTEXT_MAX_BYTES deleted in the v0.6 cutover. Equivalent cap is
-// TARGET_MESSAGES_MAX_BYTES in ./fork-anchors.js (enforced at rewind_to
-// MCP-call time rather than on every splice).
+// v0.5.x BRANCH_CONTEXT_MAX_BYTES deleted in the v0.6 cutover. The
+// equivalent cap is TARGET_MESSAGES_MAX_BYTES in ./fork-anchors.js
+// (enforced once at rewind_to MCP-call time rather than on every splice).
 
 /**
  * Anthropic's hard limit on ephemeral `cache_control` blocks per /v1/messages
@@ -178,9 +169,10 @@ function readFullBody(req: http.IncomingMessage): Promise<Buffer> {
  * `system`, `tools`, and `messages.content[].cache_control` get a 400.
  *
  * retcon's persistent-fork splice naturally accumulates message-level cache
- * markers across turns: each branch_context_json round-trip preserves whatever
- * claude attached on prior turns, then claude attaches more on the new
- * suffix. After 2-3 spliced turns we hit the cap. `capCacheControlBlocks`
+ * markers across turns: each applyAnchorSplice run preserves whatever
+ * claude attached on prior turns (anything after the anchor in body), then
+ * claude attaches more on the new suffix. After 2-3 spliced turns we hit
+ * the cap. `capCacheControlBlocks`
  * strips earliest message markers first so the LATEST markers (which extend
  * the cache progressively via Anthropic's 20-block lookback) survive.
  *
@@ -206,8 +198,8 @@ export const MAX_CACHE_CONTROL_BLOCKS = 4
  * earlier in `messages` and a fresh 1h marker on the latest user turn — the
  * exact case b17275fb hit twice on 2026-05-01 after a `/compact` that ran
  * inside a forked branch (so the compact summary itself carries cache markers
- * inherited from the rewound history, even though branch_context_json was
- * NULL'd by /compact's release).
+ * inherited from the rewound history, even though the active fork_anchors
+ * row was marked released by /compact's hook).
  *
  * Fix: any earlier 5m marker is REDUNDANT once a later 1h marker exists,
  * because Anthropic's prefix-lookback caches the same content the 5m marker
@@ -227,11 +219,12 @@ export const MAX_CACHE_CONTROL_BLOCKS = 4
 
 /**
  * Find the most recent closed_forkable revision in the task that owns this
- * session. At release time, branch_context_json was active up until the
- * previous turn — so the most recent SEALED forkable revision IS the last
- * turn where the splice successfully applied AND advanced the conversation.
- * Pointing the AI at this turn lets it dive back into the fork content via
- * `recall` / `rewind_to` / `dump_to_file` if the user wants to resume.
+ * session. At release time, the now-released anchor was active up until
+ * the previous turn — so the most recent SEALED forkable revision IS the
+ * last turn where the splice successfully applied AND advanced the
+ * conversation. Pointing the AI at this turn lets it dive back into the
+ * fork content via `recall` / `rewind_to` / `dump_to_file` if the user
+ * wants to resume.
  *
  * The current /v1/messages (the one that triggered release) is in_flight at
  * this point — not sealed, not closed_forkable yet — so it won't appear in
@@ -250,27 +243,12 @@ export function findLastForkAppliedTurn(db: DB, sessionId: string): string | nul
   return row?.id ?? null
 }
 
-/**
- * Build the text injected into the body that triggered fork release.
- * Symmetric counterpart to mcp-tools.ts:synthesizeUserMessageWithReminder
- * (the ON-fork reminder); this fires when retcon detected state divergence
- * and just NULL'd branch_context_json.
- *
- * The release would otherwise be silent from the AI's POV — Anthropic
- * returns 200, no error, no signal, and the AI never learns the fork is
- * gone. Without this injection the user sees the AI talk past the prior
- * fork's history with no acknowledgment. Solution: add a system-reminder-
- * style block beside the user's own message in the very request that
- * caused the release. The AI sees BOTH on the same turn and decides
- * whether to mention the release before answering, after, or work it
- * into the reply however it judges best — same calling-AI-decides
- * pattern as the v0.5.4 `<retcon-active>` reminder.
- */
 // v0.5.x one-shot release reminder helpers (buildReleaseReminderBlocks /
 // injectReleaseReminderInPlace) deleted in the v0.6 cutover. The persistent
 // reminder (buildPersistentReleaseReminderBlocks / injectPersistentReleaseReminder
-// below) replaces both, firing on every /v1/messages while a released
-// fork_anchors row has acknowledged_at IS NULL.
+// below) replaces both: it fires on EVERY /v1/messages while a released
+// fork_anchors row has acknowledged_at IS NULL, and the AI mutes it by
+// calling recall(turn_id=...) against the named turn.
 
 /**
  * Build the persistent `<retcon-released>` reminder text. Used by the v0.6
@@ -700,7 +678,7 @@ async function dispatch(
     const spliceResult = applyAnchorSplice(rawBody, sessionId, ctx.db)
     if (spliceResult?.releasedReason) {
       await ctx.channel.submit(
-        'session.branch_context_released',
+        'session.fork_anchor_released',
         { session_id: sessionId, reason: spliceResult.releasedReason },
         sessionId,
       )
@@ -1059,13 +1037,13 @@ async function dispatch(
           catch {
             stopReason = null
           }
-          // We intentionally don't parse the upstream response to harvest the
-          // assistant message for branch_context_json. Instead, the next
-          // /v1/messages from claude will arrive with the assistant turn
-          // already folded into claude's body — applyBranchContextRewrite
-          // walks claude's body to find the suffix-after-penultimate-user
-          // and appends it. Letting claude do its own SSE assembly keeps us
-          // out of the response-format business.
+          // We intentionally don't parse the upstream response to harvest
+          // the assistant message. Instead, the next /v1/messages from
+          // claude will arrive with the assistant turn already folded into
+          // its body — applyAnchorSplice scans the body backward for the
+          // most-recent retcon-anchor tool_result and forwards everything
+          // after it unchanged. Letting claude do its own SSE assembly
+          // keeps us out of the response-format business.
 
           if (clientAborted) {
             await emitTerminal(

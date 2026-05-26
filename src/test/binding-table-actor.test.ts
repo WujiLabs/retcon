@@ -105,4 +105,36 @@ describe('rebindSession actor isolation', () => {
       .get('new-id') as { actor: string } | undefined
     expect(newRow?.actor).toBe('bob')
   })
+
+  it('promote path: migrates fork_anchors.session_id from oldId to newId', () => {
+    // v0.6 regression — without this UPDATE, /clear's rebind orphans
+    // the active fork_anchors row at oldId while sessions.id moves to
+    // newId. The /clear hook then calls markSessionActiveAnchorsReleased
+    // with newId, finds zero rows, and the session.fork_anchor_cleared
+    // event never fires. The AI never learns the fork was released.
+    insertSession(db, 'old-id', 'task-old', 'alice')
+    db.prepare(
+      'INSERT INTO fork_anchors (anchor_token, session_id, state, created_at) VALUES (?, ?, ?, ?)',
+    ).run('tok_aaaaaaaaaaaa', 'old-id', 'active', Date.now())
+    rebindSession(db, 'old-id', 'new-id')
+    const row = db
+      .prepare('SELECT session_id, state FROM fork_anchors WHERE anchor_token=?')
+      .get('tok_aaaaaaaaaaaa') as { session_id: string, state: string }
+    expect(row.session_id).toBe('new-id')
+    expect(row.state).toBe('active')
+  })
+
+  it('merge path: migrates fork_anchors.session_id from oldId to newId', () => {
+    // Same invariant on the merge code path (existingNew session exists).
+    insertSession(db, 'old-id', 'task-old', 'default')
+    insertSession(db, 'new-id', 'task-new', 'default')
+    db.prepare(
+      'INSERT INTO fork_anchors (anchor_token, session_id, state, created_at) VALUES (?, ?, ?, ?)',
+    ).run('tok_bbbbbbbbbbbb', 'old-id', 'active', Date.now())
+    rebindSession(db, 'old-id', 'new-id')
+    const row = db
+      .prepare('SELECT session_id FROM fork_anchors WHERE anchor_token=?')
+      .get('tok_bbbbbbbbbbbb') as { session_id: string }
+    expect(row.session_id).toBe('new-id')
+  })
 })

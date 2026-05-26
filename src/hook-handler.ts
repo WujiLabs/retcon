@@ -10,14 +10,15 @@
 //   resume   — `claude --resume`. We rebind T → claude actual session_id
 //              and merge any events that landed under T pre-hook.
 //   clear    — user typed `/clear`. claude wiped its local conversation;
-//              we drop sessions.branch_context_json so the next /v1/messages
-//              isn't rewritten with a now-stale forked context.
+//              we mark any active fork_anchors row for this session as
+//              released (reason=clear) so the next /v1/messages doesn't
+//              try to splice into the wiped conversation.
 //   compact  — user typed `/compact`. claude rebuilt its local jsonl from
 //              a summary that already incorporated whatever forked context
-//              we'd been feeding it. Continuing to override would just
-//              re-inflate the body claude just compressed; clear the
-//              override and let claude's compacted view drive future
-//              upstream calls.
+//              we'd been feeding it. Continuing to splice would just
+//              re-inflate the body claude just compressed; mark active
+//              fork_anchors as released (reason=compact) and let claude's
+//              compacted view drive future upstream calls.
 //
 // The hook payload shape (per Claude Code docs):
 //   { session_id, source, transcript_path?, cwd?, hook_event_name }
@@ -149,7 +150,7 @@ export async function handleSessionStartHook(
     const releasedTokens = markSessionActiveAnchorsReleased(ctx.db, sessionId, source)
     if (releasedTokens.length > 0) {
       await ctx.channel.submit(
-        'session.branch_context_cleared',
+        'session.fork_anchor_cleared',
         { session_id: sessionId, source, anchor_tokens: releasedTokens },
         sessionId,
       )

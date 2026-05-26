@@ -1012,7 +1012,7 @@ describe('proxy pass-through + event emission', () => {
   it('count_tokens skips applyAnchorSplice — no splice, no release on tiny body', async () => {
     // Forensic: b17275fb 2026-05-08 11:55:25. claude code's count_tokens
     // probe (121-byte body, no anchor from active fork) was hitting the
-    // divergence guard and false-triggering session.branch_context_released
+    // divergence guard and false-triggering session.fork_anchor_released
     // because `isMessagesPath = url.includes('/messages')` matched both
     // /v1/messages and /v1/messages/count_tokens. The fix splits into
     // isMessagesEndpoint (the real conversation endpoint) and isMessagesPath
@@ -1062,7 +1062,7 @@ describe('proxy pass-through + event emission', () => {
     // No release event fired (splice didn't run on count_tokens).
     const releaseRow = fx.db
       .prepare('SELECT COUNT(*) AS n FROM events WHERE session_id=? AND topic=?')
-      .get(sessionId, 'session.branch_context_released') as { n: number }
+      .get(sessionId, 'session.fork_anchor_released') as { n: number }
     expect(releaseRow.n).toBe(0)
 
     // Active anchor row still active (not released by count_tokens probe).

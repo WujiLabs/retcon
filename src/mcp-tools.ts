@@ -62,8 +62,8 @@ export const RECALL_MAX_DEPTH = 1000
 
 /**
  * Hard cap on dump_to_file's serialized output size and submit_file's input
- * file size. Mirrors the 8 MiB cap on `branch_context_json` in proxy-handler
- * — if a conversation is too long for an in-memory branch context, it's also
+ * file size. Mirrors TARGET_MESSAGES_MAX_BYTES (fork-anchors.ts) — if a
+ * conversation is too long for a fork's target_messages_json, it's also
  * too long for a JSONL dump+submit round-trip. Without this, a runaway dump
  * fills the disk and an attacker-crafted submit blows up the daemon's heap.
  */
@@ -153,18 +153,20 @@ interface RevisionRow {
  */
 /**
  * Per-fork random token format. Embedded as a `fork-id="..."` attribute
- * on the `<retcon-active>` opening tag inside the synthetic_user_message
- * AND persisted to `sessions.branch_context_fork_id`. The proxy uses
- * exact-equality match (proxy-handler.ts:isSyntheticUserMessageTail)
- * between the column and the tail user message's first text block to
- * detect "branch_context tail is still the synthetic" (fresh fork, no
- * extension yet) — distinguishing retcon's synthetic from any user content
- * that happens to mention `<retcon-active>` (e.g., conversations about
- * retcon's own design — this very codebase has many such references).
+ * on the `<retcon-active>` opening tag inside the synthetic_user_message.
  *
- * Token is 12 hex chars (48 bits, ~281 trillion possibilities). Random
- * per rewind. The DB column is the ground truth; the in-text marker is
- * the comparison subject. The AI never needs to echo it back.
+ * In v0.5.x the proxy used this token to detect "branch_context tail is
+ * still the synthetic" (fresh fork) via exact-equality match against the
+ * deleted sessions.branch_context_fork_id column. The v0.6 anchor splice
+ * does not depend on fork-id matching at all — the anchor token in the
+ * rewind_to tool_result is the splice signal. fork-id remains here as
+ * a per-fork visual marker on the synthetic user message so a human
+ * reading the JSONL can see "this turn was synthesized by retcon".
+ *
+ * Token is 12 hex chars (48 bits). Visually distinct from anchor tokens
+ * (which use the same prefix) only by context: fork-id appears as a
+ * `fork-id="..."` attribute on `<retcon-active>`; anchor tokens appear
+ * as a `token="..."` attribute on `<retcon-anchor>` inside tool_results.
  */
 const FORK_ID_PREFIX = 'tok_'
 const FORK_ID_HEX_LEN = 12
@@ -174,8 +176,8 @@ export function generateForkId(): string {
 }
 
 /** Build the `<retcon-active fork-id="...">` opening tag retcon embeds in
- *  the synthetic_user_message. Exposed so the proxy-handler can build the
- *  exact substring it needs to search for in branch_context's tail. */
+ *  the synthetic_user_message. Exposed for tests that need the exact
+ *  substring; the proxy no longer searches for it post-v0.6. */
 export function buildForkIdMarker(forkId: string): string {
   return `<retcon-active fork-id="${forkId}">`
 }
@@ -187,9 +189,10 @@ export function buildForkIdMarker(forkId: string): string {
  * keeps the model's reading behavior consistent across the two reminder
  * types it sees most.
  *
- * The FIRST block carries the `fork-id="..."` attribute that
- * proxy-handler.ts:isSyntheticUserMessageTail detects via exact-equality
- * against `sessions.branch_context_fork_id` — keep block[0] stable.
+ * The FIRST block carries the `fork-id="..."` attribute. v0.5.x relied on
+ * exact-equality match against the deleted branch_context_fork_id column;
+ * the v0.6 anchor splice does not. The attribute remains as a visual
+ * marker so the synthetic turn is identifiable in claude's local JSONL.
  */
 export function buildActiveReminderBlocks(forkId: string): Array<{ type: 'text', text: string }> {
   return [
@@ -1516,12 +1519,24 @@ export function createMcpToolsWithTokens(
       const oldestSealedAt = rows.length > 0
         ? rows[rows.length - 1].sealed_at ?? 0
         : 0
+      // v0.6 renamed session.branch_context_{released,cleared} →
+      // session.fork_anchor_{released,cleared}. Query BOTH so existing
+      // event logs (pre-rename) still surface release markers via recall's
+      // walk-back. session.branch_context_overflow was deleted in v0.6
+      // along with the 8 MiB BRANCH_CONTEXT_MAX_BYTES cap; kept in the IN
+      // list so historical overflow events are still readable.
       const releaseRows = deps.db.prepare(`
         SELECT e.event_id, e.topic, e.created_at, e.payload, e.session_id
           FROM events e
           JOIN sessions s ON s.id = e.session_id
          WHERE s.task_id = ?
-           AND e.topic IN ('session.branch_context_released', 'session.branch_context_cleared', 'session.branch_context_overflow')
+           AND e.topic IN (
+             'session.fork_anchor_released',
+             'session.fork_anchor_cleared',
+             'session.branch_context_released',
+             'session.branch_context_cleared',
+             'session.branch_context_overflow'
+           )
            AND e.created_at >= ?
          ORDER BY e.created_at DESC
       `).all(sess.task_id, oldestSealedAt) as Array<{
@@ -1540,10 +1555,11 @@ export function createMcpToolsWithTokens(
         }
         catch { /* keep '' */ }
         const label = r.topic === 'session.branch_context_overflow'
-          ? `branch_context overflowed (8 MiB cap)`
-          : r.topic === 'session.branch_context_cleared'
-            ? `branch_context cleared by ${reason || 'unknown'}`
-            : `branch_context released: ${reason || 'unknown'}`
+          ? `fork overflowed (8 MiB cap)`
+          : r.topic === 'session.fork_anchor_cleared'
+            || r.topic === 'session.branch_context_cleared'
+            ? `fork cleared by ${reason || 'unknown'}`
+            : `fork released: ${reason || 'unknown'}`
         return {
           turn_id: r.event_id,
           kind: 'release_marker' as const,

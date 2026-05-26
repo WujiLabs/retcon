@@ -301,7 +301,7 @@ describe('recall (list mode)', () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q2' }])
     // Emit a state-divergence release between q2 and q3.
     await fx.channel.submit(
-      'session.branch_context_released',
+      'session.fork_anchor_released',
       { session_id: fx.sessionId, reason: 'rewind_or_state_divergence' },
       fx.sessionId,
     )
@@ -336,7 +336,7 @@ describe('recall (list mode)', () => {
   it('list mode surfaces compact / clear events as release_marker with reason from payload', async () => {
     await emitTurn(fx, 'end_turn', [{ role: 'user', content: 'q1' }])
     await fx.channel.submit(
-      'session.branch_context_cleared',
+      'session.fork_anchor_cleared',
       { session_id: fx.sessionId, source: 'compact' },
       fx.sessionId,
     )

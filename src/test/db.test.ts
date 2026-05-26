@@ -83,6 +83,178 @@ describe('db migrations', () => {
   })
 })
 
+// ─── v8 → v9 cutover migration ─────────────────────────────────────────────
+//
+// v0.6 replaces the sessions.branch_context_json + branch_context_fork_id +
+// pending_synthetic_json columns with the new fork_anchors table. The
+// migration must:
+//   1. Synthesize a `released` ghost row in fork_anchors for each v0.5.5
+//      session that had a non-NULL branch_context_json.
+//   2. Drop the three legacy columns.
+//   3. Stay idempotent on transitional v0.6 DBs where v8 was stamped with
+//      the new DDL (no legacy columns) — the data-migration step skips.
+//   4. Run inside a transaction so a mid-migration crash rolls back
+//      cleanly (a partial ghost-row insert loop must not strand
+//      schema_version at 8 with a half-populated fork_anchors).
+describe('v8 → v9 migration (cutover from branch_context_json)', () => {
+  let db: DB
+  beforeEach(() => {
+    db = openDb({ path: ':memory:' })
+  })
+  afterEach(() => closeDb(db))
+
+  // Build a pre-v8 schema shape that includes the legacy columns. Mimics
+  // a real v0.5.5 production DB just before the v8 → v9 step runs.
+  function stampPreV9WithLegacyColumns(): void {
+    // Channel tables (created by channelMigrate) + retcon schema_version
+    // are bootstrapped via a normal migrate() to v8 — but we then drop
+    // the v0.6 fork_anchors / new-shape and recreate sessions with the
+    // legacy columns so the v8 → v9 step sees data to migrate. This is
+    // the only way to test the synthesis path now that the v0.5.5
+    // source-of-truth schema is no longer in the binary.
+    db.exec(`
+      DROP TABLE IF EXISTS branch_views;
+      DROP TABLE IF EXISTS revisions;
+      DROP TABLE IF EXISTS sessions;
+      DROP TABLE IF EXISTS tasks;
+      DROP TABLE IF EXISTS schema_version;
+
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        harness TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        branch_context_json TEXT,
+        branch_context_fork_id TEXT,
+        pending_synthetic_json TEXT
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE revisions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        parent_revision_id TEXT,
+        classification TEXT,
+        stop_reason TEXT,
+        asset_cid TEXT,
+        sealed_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO schema_version (version, applied_at) VALUES (8, ${Date.now()});
+    `)
+  }
+
+  it('synthesizes a released ghost row for each session with branch_context_json', () => {
+    stampPreV9WithLegacyColumns()
+    // Two sessions, both with non-NULL branch_context_json. One also has a
+    // sealed closed_forkable revision so fork_point_revision_id gets populated.
+    db.prepare(
+      `INSERT INTO sessions (id, task_id, actor, harness, created_at,
+        branch_context_json, branch_context_fork_id, pending_synthetic_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('sess-a', 'task-a', 'alice', 'claude-code', Date.now(),
+      '{"messages":[]}', 'tok_oldforkid111', '{"meta":"x"}')
+    db.prepare('INSERT INTO tasks (id, session_id, created_at) VALUES (?, ?, ?)')
+      .run('task-a', 'sess-a', Date.now())
+    db.prepare(
+      `INSERT INTO revisions (id, task_id, classification, sealed_at, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run('rev-fork-a', 'task-a', 'closed_forkable', Date.now(), Date.now())
+
+    db.prepare(
+      `INSERT INTO sessions (id, task_id, actor, harness, created_at,
+        branch_context_json, branch_context_fork_id, pending_synthetic_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('sess-b', 'task-b', 'bob', 'claude-code', Date.now(),
+      '{"messages":[]}', null, null)
+    db.prepare('INSERT INTO tasks (id, session_id, created_at) VALUES (?, ?, ?)')
+      .run('task-b', 'sess-b', Date.now())
+
+    migrate(db)
+
+    const ghosts = db.prepare(
+      `SELECT anchor_token, session_id, state, state_reason,
+              fork_point_revision_id, synthetic_metadata_json
+         FROM fork_anchors ORDER BY session_id`,
+    ).all() as Array<{
+      anchor_token: string
+      session_id: string
+      state: string
+      state_reason: string
+      fork_point_revision_id: string | null
+      synthetic_metadata_json: string | null
+    }>
+    expect(ghosts.length).toBe(2)
+    expect(ghosts.every(g => g.state === 'released')).toBe(true)
+    expect(ghosts.every(g => g.state_reason === 'migrated_from_v0_5_5')).toBe(true)
+    expect(ghosts.every(g => g.anchor_token.startsWith('mig_'))).toBe(true)
+    const ghostA = ghosts.find(g => g.session_id === 'sess-a')!
+    expect(ghostA.fork_point_revision_id).toBe('rev-fork-a')
+    expect(ghostA.synthetic_metadata_json).toBe('{"meta":"x"}')
+    const ghostB = ghosts.find(g => g.session_id === 'sess-b')!
+    expect(ghostB.fork_point_revision_id).toBeNull()
+  })
+
+  it('drops the three legacy sessions columns', () => {
+    stampPreV9WithLegacyColumns()
+    migrate(db)
+    const cols = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+    const colNames = new Set(cols.map(c => c.name))
+    expect(colNames.has('branch_context_json')).toBe(false)
+    expect(colNames.has('branch_context_fork_id')).toBe(false)
+    expect(colNames.has('pending_synthetic_json')).toBe(false)
+  })
+
+  it('runs cleanly on a transitional v8 DB that lacks the legacy columns', () => {
+    // Some dev builds stamped v8 with the new sessions DDL (no legacy
+    // columns) before MIGRATIONS[8] existed. The PRAGMA table_info guard
+    // must let this case through without throwing.
+    db.exec(`
+      DROP TABLE IF EXISTS branch_views;
+      DROP TABLE IF EXISTS revisions;
+      DROP TABLE IF EXISTS sessions;
+      DROP TABLE IF EXISTS tasks;
+      DROP TABLE IF EXISTS schema_version;
+
+      CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        harness TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE revisions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        parent_revision_id TEXT,
+        classification TEXT,
+        stop_reason TEXT,
+        asset_cid TEXT,
+        sealed_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO schema_version (version, applied_at) VALUES (8, ${Date.now()});
+    `)
+    expect(() => migrate(db)).not.toThrow()
+    const ghostCount = (
+      db.prepare('SELECT COUNT(*) AS n FROM fork_anchors').get() as { n: number }
+    ).n
+    expect(ghostCount).toBe(0)
+  })
+})
+
 // ─── backup + migration policy ──────────────────────────────────────────────
 //
 // User said "do not wipe out database on migration from now on. backup the

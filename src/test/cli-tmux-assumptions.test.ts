@@ -251,12 +251,12 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     await waitFor(
       () => parseInt(sql(
         `SELECT COUNT(*) FROM events `
-        + `WHERE topic='session.branch_context_cleared' `
+        + `WHERE topic='session.fork_anchor_cleared' `
         + `AND json_extract(payload, '$.source') = 'clear' `
         + `AND session_id IN (SELECT id FROM sessions WHERE actor='${ASSUMPTION_ACTOR}')`,
       ), 10) >= 1,
       30_000,
-      'session.branch_context_cleared with source=clear (scoped to actor=asmp)',
+      'session.fork_anchor_cleared with source=clear (scoped to actor=asmp)',
     )
 
     // Verify no active fork_anchors row remains for this actor's sessions
@@ -339,12 +339,12 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     await waitFor(
       () => parseInt(sql(
         `SELECT COUNT(*) FROM events `
-        + `WHERE topic='session.branch_context_cleared' `
+        + `WHERE topic='session.fork_anchor_cleared' `
         + `AND json_extract(payload, '$.source') = 'compact' `
         + `AND session_id IN (SELECT id FROM sessions WHERE actor='${ASSUMPTION_ACTOR}')`,
       ), 10) >= 1,
       120_000,
-      'session.branch_context_cleared with source=compact (scoped to actor=asmp)',
+      'session.fork_anchor_cleared with source=compact (scoped to actor=asmp)',
     )
 
     const remaining = sql(
@@ -438,7 +438,7 @@ describeIfRunnable('Claude Code behavior assumptions (run weekly)', () => {
     // this session. If claude starts using a side-channel endpoint, our
     // event count won't grow and we'll time out here.
     //
-    // We deliberately don't wait for `session.branch_context_cleared` —
+    // We deliberately don't wait for `session.fork_anchor_cleared` —
     // that event only fires when branch_context_json was non-NULL at
     // hook time, and this test doesn't run a rewind_to. The H1 (compact)
     // test above covers the cleared-event side; this one isolates the

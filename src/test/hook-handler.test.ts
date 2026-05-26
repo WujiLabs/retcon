@@ -206,7 +206,7 @@ describe('handleSessionStartHook', () => {
     return db.prepare('SELECT state, state_reason FROM fork_anchors WHERE anchor_token=?').get(token) as { state: string, state_reason: string | null } | undefined
   }
 
-  it('marks fork_anchors row as released + emits session.branch_context_cleared on /clear', async () => {
+  it('marks fork_anchors row as released + emits session.fork_anchor_cleared on /clear', async () => {
     db.prepare('INSERT INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)')
       .run('sid-clear', 'task-clear', 'default', Date.now(), 'claude-code')
     const token = seedActiveAnchor(db, 'sid-clear')
@@ -219,12 +219,12 @@ describe('handleSessionStartHook', () => {
     const row = getAnchorState(db, token)
     expect(row?.state).toBe('released')
     expect(row?.state_reason).toBe('clear')
-    const cleared = eventsForTopic(db, 'session.branch_context_cleared') as Array<{ source: string }>
+    const cleared = eventsForTopic(db, 'session.fork_anchor_cleared') as Array<{ source: string }>
     expect(cleared).toHaveLength(1)
     expect(cleared[0].source).toBe('clear')
   })
 
-  it('marks fork_anchors row as released + emits session.branch_context_cleared on /compact', async () => {
+  it('marks fork_anchors row as released + emits session.fork_anchor_cleared on /compact', async () => {
     db.prepare('INSERT INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)')
       .run('sid-comp', 'task-comp', 'default', Date.now(), 'claude-code')
     const token = seedActiveAnchor(db, 'sid-comp')
@@ -237,11 +237,11 @@ describe('handleSessionStartHook', () => {
     const row = getAnchorState(db, token)
     expect(row?.state).toBe('released')
     expect(row?.state_reason).toBe('compact')
-    const cleared = eventsForTopic(db, 'session.branch_context_cleared') as Array<{ source: string }>
+    const cleared = eventsForTopic(db, 'session.fork_anchor_cleared') as Array<{ source: string }>
     expect(cleared.find(c => c.source === 'compact')).toBeTruthy()
   })
 
-  it('does NOT emit branch_context_cleared on startup (no clear-source)', async () => {
+  it('does NOT emit fork_anchor_cleared on startup (no clear-source)', async () => {
     db.prepare('INSERT INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)')
       .run('sid-startup', 'task-s', 'default', Date.now(), 'claude-code')
     const token = seedActiveAnchor(db, 'sid-startup')
@@ -253,6 +253,6 @@ describe('handleSessionStartHook', () => {
     // Anchor stays active — startup is not a clear-source.
     const row = getAnchorState(db, token)
     expect(row?.state).toBe('active')
-    expect(eventsForTopic(db, 'session.branch_context_cleared')).toHaveLength(0)
+    expect(eventsForTopic(db, 'session.fork_anchor_cleared')).toHaveLength(0)
   })
 })
