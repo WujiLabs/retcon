@@ -92,11 +92,13 @@ export const TARGET_MESSAGES_MAX_BYTES = 8 * 1024 * 1024
 
 /**
  * Regex that extracts an anchor token from a tool_result content string.
- * Format: `<retcon-anchor token="tok_<12hex>" />`. 48 bits entropy makes
- * accidental collisions (e.g., user text quoting the tag verbatim with a
- * matching random suffix) astronomically unlikely.
+ * Format: `<retcon-anchor token="tok_<12hex>" />`. claude code MAY embed our
+ * MCP response as a JSON-stringified blob in tool_result.content, which
+ * double-escapes the inner quotes (`\"`) — so the regex matches either
+ * raw or backslash-escaped quotes around the token. 48 bits entropy makes
+ * accidental collisions astronomically unlikely either way.
  */
-const ANCHOR_TAG_RE = /<retcon-anchor token="(tok_[0-9a-f]{12})"\s*\/>/
+const ANCHOR_TAG_RE = /<retcon-anchor token=\\?"(tok_[0-9a-f]{12})\\?"\s*\/>/
 
 export type AnchorState = 'active' | 'released'
 
