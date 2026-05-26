@@ -551,25 +551,39 @@ export function getActiveAnchorSyntheticMetadata(
      LIMIT 1
   `).get(sessionId) as { anchor_token: string, synthetic_metadata_json: string } | undefined
   if (!row) return null
+  // Route through the shared parser so we don't carry the wrapped-shape
+  // assumption in two places. A row carrying only the BARE
+  // SyntheticDepartureMeta (just inserted by rewind_to, never deferred)
+  // has no PendingSynthetic envelope — `deferred` will be false, and we
+  // return null since no fire-ready state exists.
+  const parsed = parseAnchorSyntheticMetadata(row.synthetic_metadata_json)
+  if (!parsed || !parsed.deferred) return null
+  // Wrapped form: re-parse the full envelope for the extra fields.
+  let envelope: {
+    to_revision_id?: string
+    fork_point_revision_id?: string
+    original_body_cid?: string
+    first_seen_at?: number
+  }
   try {
-    const parsed = JSON.parse(row.synthetic_metadata_json) as {
-      synthetic: SyntheticDepartureMeta
-      to_revision_id: string
-      fork_point_revision_id: string
-      original_body_cid: string
-      first_seen_at: number
-    }
-    return {
-      anchor_token: row.anchor_token,
-      synthetic: parsed.synthetic,
-      to_revision_id: parsed.to_revision_id,
-      fork_point_revision_id: parsed.fork_point_revision_id,
-      original_body_cid: parsed.original_body_cid,
-      first_seen_at: parsed.first_seen_at,
-    }
+    envelope = JSON.parse(row.synthetic_metadata_json)
   }
   catch {
     return null
+  }
+  if (
+    typeof envelope.to_revision_id !== 'string'
+    || typeof envelope.fork_point_revision_id !== 'string'
+    || typeof envelope.original_body_cid !== 'string'
+    || typeof envelope.first_seen_at !== 'number'
+  ) return null
+  return {
+    anchor_token: row.anchor_token,
+    synthetic: parsed.synthetic,
+    to_revision_id: envelope.to_revision_id,
+    fork_point_revision_id: envelope.fork_point_revision_id,
+    original_body_cid: envelope.original_body_cid,
+    first_seen_at: envelope.first_seen_at,
   }
 }
 

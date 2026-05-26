@@ -1451,7 +1451,7 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(res.confirm_meta).toMatch(/^[A-Za-z0-9]{8}$/)
   })
 
-  it('opaque tokens have no semantic prefix (regression guard)', async () => {
+  it('opaque tokens have no semantic prefix (regression guard)', { timeout: 30_000 }, async () => {
     // Guards against a future regression where someone adds deliberate semantic
     // prefixes like PROCEED-/REVISE-. We only check for prefixes long enough
     // that random collision against an 8-char alphanumeric token is
@@ -1733,8 +1733,10 @@ describe('rewind_to (dual-secret flow)', () => {
     expect(CONFIRM_TOKEN_TTL_MS).toBe(5 * 60 * 1000)
   })
 
-  it('clean and meta tokens are always distinct (collision guard)', () => {
+  it('clean and meta tokens are always distinct (collision guard)', { timeout: 30_000 }, () => {
     // Stress: 10k generations should never produce a clean=meta pair.
+    // CPU-bound — bumped timeout because the 5s default flakes under
+    // full-suite parallel load even though the test passes in isolation.
     const store = new ConfirmTokenStore()
     for (let i = 0; i < 10_000; i++) {
       const pair = store.generate(`session-${i}`)

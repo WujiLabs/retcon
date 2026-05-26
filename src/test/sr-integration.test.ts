@@ -258,7 +258,10 @@ describe('SR end-to-end (Phase 4)', () => {
     const consumer = createEventConsumer(fx.db)
     let attempts = 0
     let forked: unknown
-    while (attempts < 100) {
+    // 500 attempts × 10ms = 5s ceiling. The original 100×10ms=1s flaked
+    // on full-suite parallel runs where SR projection + downstream events
+    // can take >1s under CPU contention.
+    while (attempts < 500) {
       const evts = consumer.poll('_probe', ['fork.forked'], 1)
       if (evts.length > 0) {
         forked = evts[0]!.payload
@@ -422,7 +425,10 @@ describe('SR end-to-end (Phase 4)', () => {
     const consumer = createEventConsumer(fx.db)
     let attempts = 0
     let synthFailed: { error_message?: string } | undefined
-    while (attempts < 100) {
+    // 500 attempts × 10ms = 5s ceiling. The original 100×10ms=1s flaked
+    // on full-suite parallel runs where SR projection + downstream events
+    // can take >1s under CPU contention.
+    while (attempts < 500) {
       const evts = consumer.poll('_probe_sf', ['fork.synthesis_failed'], 1)
       if (evts.length > 0) {
         synthFailed = evts[0]!.payload as { error_message?: string }

@@ -937,9 +937,19 @@ describe('proxy pass-through + event emission', () => {
     }).then(r => r.text())
 
     const p1 = send('a')
-    // Give a beat for p1 to reach the mock.
-    await new Promise(r => setTimeout(r, 30))
+    // Wait for p1 to actually reach the mock (event-based; the prior
+    // time-based 30ms sleep flaked under full-suite parallel load).
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 5000
+      const tick = (): void => {
+        if (order.includes('start:a')) resolve()
+        else if (Date.now() > deadline) reject(new Error('p1 never reached mock within 5s'))
+        else setTimeout(tick, 5)
+      }
+      tick()
+    })
     const p2 = send('b')
+    // Give a brief window for p2 to (incorrectly) start if serialization broke.
     await new Promise(r => setTimeout(r, 50))
 
     // At this point, a should have started but b should not have — serialized.

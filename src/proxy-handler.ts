@@ -1128,7 +1128,27 @@ async function dispatch(
                 : null
 
               if (isClosedForkable) {
-                if (persisted) {
+                // Defense-in-depth: if we believed we were in the deferred
+                // state (anchor metadata parsed as wrapped) but
+                // getPendingSynthetic now returns null, the wrapped state
+                // was concurrently cleared (e.g., a superseding rewind_to
+                // hit insertActiveAnchor between our read and now). Falling
+                // through to the immediate-fire branch would emit
+                // fork.forked with the WRONG to_revision_id and the WRONG
+                // originalBodyBytes (this turn's body, not the rewind's
+                // landing-turn body). Fail loud instead.
+                if (anchorMatch.deferredAlready && !persisted) {
+                  await ctx.channel.submit(
+                    'fork.synthesis_failed',
+                    {
+                      parent_revision_id: s.parent_revision_id,
+                      target_revision_id: fp,
+                      error_message: 'deferred fire: PendingSynthetic state lost between splice-time read and response_completed (likely concurrent supersede)',
+                    },
+                    sessionId,
+                  )
+                }
+                else if (persisted) {
                   // Re-fetch original (T1) body bytes from blobs by CID.
                   const blobRow = ctx.db!
                     .prepare('SELECT bytes FROM blobs WHERE cid=?')

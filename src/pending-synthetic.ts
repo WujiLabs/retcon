@@ -24,7 +24,6 @@
 
 import type { DB } from './db.js'
 import {
-  clearSyntheticMetadata,
   getActiveAnchorSyntheticMetadata,
   setActiveAnchorSyntheticMetadata,
   type SyntheticDepartureMeta,
@@ -68,6 +67,13 @@ export function getPendingSynthetic(db: DB, sessionId: string): PendingSynthetic
 }
 
 export function clearPendingSynthetic(db: DB, sessionId: string): void {
-  const row = getActiveAnchorSyntheticMetadata(db, sessionId)
-  if (row) clearSyntheticMetadata(db, row.anchor_token)
+  // Direct UPDATE — don't route through getActiveAnchorSyntheticMetadata,
+  // which returns null on rows carrying the bare-shape metadata (no
+  // deferred state). Immediate-fire after a successful end_turn needs to
+  // clear the bare metadata too, so a subsequent splice off the same anchor
+  // doesn't re-fire fork.forked.
+  db.prepare(
+    `UPDATE fork_anchors SET synthetic_metadata_json = NULL
+      WHERE session_id = ? AND state = 'active'`,
+  ).run(sessionId)
 }

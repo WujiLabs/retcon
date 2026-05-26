@@ -2,6 +2,28 @@
 
 All notable changes to `@playtiss/retcon` are documented here.
 
+## [0.6.1] - 2026-05-26
+
+Deferred SR pipeline bugfix. The v0.6.0 anchor substrate had a hidden corruption path on the deferred fork.forked emission flow: when the first post-rewind turn closed with `stop_reason=tool_use` (the empirically-common case where the AI chains Read/Bash/recall before answering), `setPendingSynthetic` wrote a WRAPPED `PendingSynthetic` shape into `fork_anchors.synthetic_metadata_json`. On the next turn, the proxy parsed that column as bare `SyntheticDepartureMeta`, got `kind=undefined`, tripped the parallel-tool guard against the AI's own non-rewind tool_use (Read, Bash, etc), and released the anchor with `state_reason=parallel_tools`. Every healthy deferred SR died mid-chain.
+
+### Fixed
+
+- **Deferred SR no longer false-releases mid-chain.** New `parseAnchorSyntheticMetadata` in `src/fork-anchors.ts` detects both shapes the column can hold (bare via `.kind`, wrapped via `.synthetic.kind`) and returns the bare meta either way plus a `deferred: boolean` flag. The proxy-handler dispatches off that flag: parallel-tool guard skips when already deferred; the defer branch skips re-wrapping when already deferred (double-wrapping would corrupt the format further); the fire branch uses the wrapped envelope's `to_revision_id` + `original_body_cid` (re-fetched from blobs) so SR identity stays bound to the rewind's LANDING turn, not whichever later turn closed the chain.
+- **Dangling stop_reason now clears pending state.** The deferred-then-`max_tokens`/`refusal` path previously left `synthetic_metadata_json` populated, leaking a stale wrapped envelope that would re-trigger fork.synthesis_failed on subsequent turns. Now `clearPendingSynthetic` runs in the dangling branch alongside the audit event.
+- **Defense-in-depth on concurrent supersede.** If `setPendingSynthetic` state was concurrently cleared between the splice-time read and the response_completed re-read (e.g., a superseding `rewind_to` hit `insertActiveAnchor` mid-chain), the old code path would fall through to immediate-fire with the WRONG `to_revision_id` (this turn's id instead of T1's) and WRONG body bytes. Now this edge case emits `fork.synthesis_failed` with `error_message: "deferred fire: PendingSynthetic state lost between splice-time read and response_completed (likely concurrent supersede)"` instead.
+- **`getActiveAnchorSyntheticMetadata` routes through the shared parser.** Eliminates the asymmetry where one read site assumed wrapped shape while another (post-fix) assumed bare. Single source of truth for the wrapped-vs-bare distinction.
+
+### Tests
+
+- **10 v0.5.x-shaped `it.skip('[v0.6 rewrite pending] …')` tests rewritten against `fork_anchors`.** All 8 in `proxy-handler.test.ts` (anchor consume + tobe_applied_from payload, fork.forked happy path, parallel-tool guard, deferred fork.forked across tool_use chains, deferred abandon on max_tokens, 5xx retention semantics, ForkAwaiter notify on completed/upstream_error) and both in `sr-integration.test.ts` (SR row materialization end-to-end, fork.synthesis_failed when R1 has no operation tool_use). Catching this commit's bug REQUIRED the deferred test to actually exercise the deferred path against the new substrate.
+- New seed helpers (`seedActiveAnchor` + `bodyWithAnchor`) replace the legacy `TobeStore.write(...)` pattern across the rewritten tests. `src/test/_legacy-tobe-stub.ts` is deleted along with dead `tobeStore` allocations from proxy-handler/sr-integration/mcp-handler test fixtures.
+- Test-suite robustness under parallel-load: the dual-secret token-collision tests (10k iterations) bumped to 30s timeouts; the per-session-serialization test switched from a 30ms sleep to event-driven readiness so it doesn't flake when CPU contention delays the mock's first response.
+
+### For contributors
+
+- 498 → 508 passing unit tests; 26 → 16 skipped. The remaining 16 skips are unrelated to v0.6 (legacy harness-injection tests, pre-existing flake markers).
+- One residual flake: under heavy full-suite parallel load (41 test files × 8+ workers), a different timing-sensitive test occasionally exceeds its inline timeout per run. Each fails in isolation. Not v0.6.x-specific. Tracked for a future test-infra pass.
+
 ## [0.6.0] - 2026-05-26
 
 Two intertwined cutovers ship together. The substrate moves to `@playtiss/core/channel` (event log, blob storage, projector dispatch) — that part is invisible to users but unlocks shared infrastructure for `arianna`. On top of it, the fork mechanism gets replaced: a per-rewind anchor token embedded in the `rewind_to` / `submit_file` tool_result drives a one-mechanism splice, displacing three fragile machineries from v0.5.x (`branch_context_json` column, asst-text continuity check, fresh-fork token skip).
