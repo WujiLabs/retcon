@@ -24,26 +24,6 @@ Deferred from v1 launch. Source-of-truth alignment docs: `~/filo/collaboration-p
 - [ ] **Per-turn branch lineage in recall list** — `recall()` list mode mixes turns from all branches under the same task in `sealed_at DESC` order. After a rewind, the AI sees turns from the new branch interleaved with turns from the pre-rewind branch, with no per-turn distinction. `list_branches` surfaces the navigation points (where each branch's head is); this TODO is about surfacing PER-TURN branch lineage in recall's list output. Cost: O(N) ancestor walks per list call, OR denormalize branch membership into the revisions table during projection. Defer until dogfood shows the unlabeled-mix is a real navigation problem (v0.5.0's SR rows with `kind: 'rewind_marker'` may already cover the most common case — they mark where rewinds happened, even if branch identity per turn isn't surfaced).
 - [ ] **Push `n_back_of_head` computation into SQL for `list_branches`** — current implementation calls `forkableSequence(taskId)` to materialize ALL closed_forkable revision ids in memory, then does O(N) `seq.indexOf` per branch. Theoretical concern at 5000+ turns × 100+ branches = 500k string compares per call. Today's dogfood sessions are 50-200 turns, no measured impact. Fix: replace the helper with a per-row COUNT(*) subquery over the existing `idx_revisions_forkable` partial index (LEFT JOIN against the branch's head_revision_id; null when head is non-forkable). ~15 LOC + test. Land if `list_branches` shows up in real perf data.
 
-## P2 — v0.6 test debt (rewrite pending against fork_anchors substrate)
-
-The v0.6 anchor cutover deleted the legacy TOBE store and `branch_context_json` mechanism. 10 behaviorally-rich tests rely on the deleted APIs and are currently `it.skip('[v0.6 rewrite pending] …', …)` rather than ported. Without rewrites these stay permanently skipped and the new substrate has weaker coverage than v0.5.5 did. Each can be reseeded against `fork_anchors` directly (use `insertActiveAnchor` + the synthetic_metadata_json column instead of `TobeStore.write`).
-
-`src/test/proxy-handler.test.ts`:
-- [ ] line 181 — TOBE consumed by next /v1/messages, body shape pinned (port to `applyAnchorSplice`).
-- [ ] line 228 — fork.forked emitted on first 2xx + end_turn + synthetic present (anchor-row state machine).
-- [ ] line 308 — fork.synthesis_failed on parallel tool_uses in R1; splice aborted; row → `released` reason=`parallel_tools`. **High priority — the only test for the parallel-tool guard.**
-- [ ] line 429 — fork.forked deferred when first post-rewind turn is `tool_use`, fires on later end_turn.
-- [ ] line 543 — fork.synthesis_failed when deferred SR chain ends on `max_tokens`.
-- [ ] line 884 — TOBE retention on upstream 5xx so retry re-applies; v0.6 equivalent: active anchor row stays active until explicit transition.
-- [ ] line 928 — ForkAwaiter notify on completed TOBE request.
-- [ ] line 960 — ForkAwaiter notify with aborted/http_error on upstream failure.
-
-`src/test/sr-integration.test.ts`:
-- [ ] line 178 — rewind_to → next /v1/messages → SR row exists in revisions.
-- [ ] line 331 — synthesis_failed audit when R1 missing for synthetic_asset build.
-
-After all rewrites land, delete `src/test/_legacy-tobe-stub.ts` (the placeholder TobeStore type that lets these compile while skipped).
-
 ## P2 — v0.5.0 SR follow-ups
 
 - [ ] **Backfill SR rows for v0.4.x sessions** — v0.5.0 inserts synthetic departure Revisions (SR) on every successful `rewind_to`/`submit_file`, but pre-existing v0.4.x sessions in `proxy.db` have no SR rows for their old rewinds. `recall` on those sessions surfaces only the real Revisions; the rewind boundaries don't show up as `kind: 'rewind_marker'` entries. A one-time migration could walk historical `fork.back_requested` events that have a corresponding `tobe_applied_from` follow-up (= the splice ran), reconstruct the synthetic body, and INSERT the SR rows retroactively. Effort: M. Land if dogfood across long-lived sessions shows the gap is annoying.
@@ -70,5 +50,6 @@ After all rewrites land, delete `src/test/_legacy-tobe-stub.ts` (the placeholder
 
 ## Completed
 
+- [x] **v0.6 test debt — 10 skipped tests rewritten against fork_anchors substrate** — All 8 `it.skip('[v0.6 rewrite pending] …')` cases in `proxy-handler.test.ts` plus the 2 in `sr-integration.test.ts` ported to the v0.6 anchor flow (seed an active `fork_anchors` row + drive a body containing the `<retcon-anchor token="..." />` tool_result instead of writing a TOBE). Caught a real bug in the deferred SR pipeline: `setPendingSynthetic` wrote the wrapped `PendingSynthetic` shape into the same `synthetic_metadata_json` column that proxy-handler reads as bare `SyntheticDepartureMeta`, so T2 reads got `kind=undefined`, tripped parallel-tool detection on the AI's own non-rewind tool_use, and released the anchor mid-chain. Fixed by adding `parseAnchorSyntheticMetadata` (detects both shapes), tracking `deferredAlready` on `anchorMatch`, and gating the parallel-tool guard + re-wrap behind `!deferredAlready`. The deferred-fire path now uses the wrapped metadata's `to_revision_id` + `original_body_cid` (re-fetched from blobs) so SR identity stays bound to the rewind's landing turn, not whichever later turn closed the chain. **Completed:** v0.6.0 (2026-05-26). Deletes `src/test/_legacy-tobe-stub.ts` and dead `tobeStore` allocations from `proxy-handler.test.ts`, `sr-integration.test.ts`, and `mcp-handler.test.ts`. 498 → 508 passing unit tests.
 - [x] **ToBe-as-file MVP (Phase 3 of MCP UX redesign plan)** — `dump_to_file` + `submit_file` MCP tools. Same opaque dual-secret + loud-failure contracts as `rewind_to`, with assistant-must-end validation on the JSONL so the appended user message blends naturally. **Completed:** v0.4.0-alpha.0 (2026-04-30).
 - [x] **MCP tool-adoption A/B test harness (Phase 4 of MCP UX redesign plan)** — gated tmux test (`RETCON_TEST_INTEGRATION=1` AND `RETCON_TEST_TOOL_ADOPTION=1`) drives Sonnet AND Opus through natural-language rewind/bookmark/dump scenarios with no `mcp__retcon__X` hand-holding. Asserts the right tool was invoked end-to-end via the event log + filesystem. **Completed:** v0.4.0-alpha.0 (initial harness), v0.4.1-alpha.0 (verification fixes — userTurn predicate, ready-detect, instrumentation).

@@ -17,15 +17,13 @@ function tool(handler: McpTool['handler'], description = 'test tool'): McpTool {
   return { handler, description, inputSchema: { type: 'object' } }
 }
 import { defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { createTobeStore, type TobeStore } from './_legacy-tobe-stub.js'
 
 async function fixture() {
   const db = openDb({ path: ':memory:' })
   migrate(db)
   const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmp = mkdtempSync(path.join(tmpdir(), 'mcp-test-'))
-  const tobeStore: TobeStore = createTobeStore(tmp)
-  return { db, channel, tobeStore, tmp, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
+  return { db, channel, tmp, cleanup: () => rmSync(tmp, { recursive: true, force: true }) }
 }
 
 async function startWithTools(fx: Awaited<ReturnType<typeof fixture>>, tools: Map<string, McpTool>) {

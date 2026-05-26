@@ -35,6 +35,7 @@ import {
   getAnchorByToken,
   getMostRecentUnacknowledgedRelease,
   markReleased,
+  parseAnchorSyntheticMetadata,
   type SyntheticDepartureMeta,
 } from './fork-anchors.js'
 import type { ForkAwaiter, ForkOutcome } from './fork-awaiter.js'
@@ -661,7 +662,18 @@ async function dispatch(
   // anchorMatch: the active fork_anchors row whose token was just spliced.
   // Captured here so the response-completed downstream can emit fork.forked
   // / fork.synthesis_failed against the same synthetic_metadata.
-  let anchorMatch: { row: ForkAnchor, synthetic: SyntheticDepartureMeta | null } | null = null
+  // anchorMatch.synthetic is the BARE SyntheticDepartureMeta — parseAnchor-
+  // SyntheticMetadata unwraps either shape the row may carry: bare (initial)
+  // or wrapped PendingSynthetic (deferred after a tool_use chain). anchorMatch.
+  // deferredAlready=true means setPendingSynthetic was called on an earlier
+  // turn; the T2 dispatch must NOT re-wrap it (double-wrapping corrupts the
+  // metadata shape) and the parallel-tool guard should skip (the splice has
+  // already been running successfully across the chain).
+  let anchorMatch: {
+    row: ForkAnchor
+    synthetic: SyntheticDepartureMeta | null
+    deferredAlready: boolean
+  } | null = null
   // Parallel-tool guard. When R1 has sibling tool_uses beyond the operation,
   // the splice would discard their tool_results (they live in the same
   // user-role turn as the anchor's tool_result) and upstream would 400.
@@ -686,18 +698,21 @@ async function dispatch(
     if (spliceResult?.matchedToken) {
       const row = getAnchorByToken(ctx.db, spliceResult.matchedToken)
       if (row && row.state === 'active') {
-        const synthetic = row.synthetic_metadata_json
-          ? JSON.parse(row.synthetic_metadata_json) as SyntheticDepartureMeta
-          : null
-        anchorMatch = { row, synthetic }
-        // Parallel-tool guard only fires when the anchor was created via
-        // rewind_to / submit_file (synthetic_metadata present). For
-        // already-materialized SRs (synthetic_metadata NULL'd post-fork.forked),
-        // the splice runs unconditionally.
-        if (synthetic) {
-          const det = detectParallelTools(rawBody, synthetic.kind)
+        const parsed = parseAnchorSyntheticMetadata(row.synthetic_metadata_json)
+        anchorMatch = {
+          row,
+          synthetic: parsed?.synthetic ?? null,
+          deferredAlready: parsed?.deferred ?? false,
+        }
+        // Parallel-tool guard only fires on the FIRST splice (bare metadata).
+        // Once the SR is deferred, the splice has already been running across
+        // the tool_use chain on prior turns; re-checking would false-positive
+        // on the AI's own non-rewind tool_uses (e.g., Read) that appear on
+        // T2+ as the latest assistant turn.
+        if (anchorMatch.synthetic && !anchorMatch.deferredAlready) {
+          const det = detectParallelTools(rawBody, anchorMatch.synthetic.kind)
           if (det.ok && det.parallel.length > 0) {
-            spliceAborted = { kind: synthetic.kind, names: det.parallel }
+            spliceAborted = { kind: anchorMatch.synthetic.kind, names: det.parallel }
           }
         }
         if (!spliceAborted && spliceResult.body !== rawBody) {
@@ -721,7 +736,7 @@ async function dispatch(
             'fork.synthesis_failed',
             {
               target_revision_id: row.fork_point_revision_id,
-              parent_revision_id: synthetic?.parent_revision_id,
+              parent_revision_id: anchorMatch.synthetic?.parent_revision_id,
               error_message: `splice aborted: R1 had parallel tool_uses (${spliceAborted.names.join(', ')}); rewound context would discard their results`,
               parallel_tool_names: spliceAborted.names,
             },
@@ -1101,27 +1116,73 @@ async function dispatch(
             if (anchorApplied && anchorMatch !== null && anchorMatch.synthetic && originalBodyBlob) {
               const s = anchorMatch.synthetic
               const fp = anchorMatch.row.fork_point_revision_id ?? ''
+              // Deferred-fire path: the anchor row's synthetic_metadata_json
+              // carries the WRAPPED PendingSynthetic shape because an earlier
+              // turn in this chain hit setPendingSynthetic. The to_revision_id
+              // and original_body_cid from THAT earlier turn drive the SR's
+              // identity; this turn's request_event.id and originalBodyBlob
+              // are NOT correct for the SR (they describe a downstream turn,
+              // not the rewind's landing turn).
+              const persisted = anchorMatch.deferredAlready && ctx.db
+                ? getPendingSynthetic(ctx.db, sessionId)
+                : null
 
               if (isClosedForkable) {
-                await tryEmitForkForked({
-                  channel: ctx.channel,
-                  sessionId,
-                  synthetic: s,
-                  parent_revision_id: s.parent_revision_id,
-                  target_revision_id: fp,
-                  to_revision_id: requestEvent.id,
-                  originalBodyBytes: originalBodyBlob.ref.bytes,
-                })
+                if (persisted) {
+                  // Re-fetch original (T1) body bytes from blobs by CID.
+                  const blobRow = ctx.db!
+                    .prepare('SELECT bytes FROM blobs WHERE cid=?')
+                    .get(persisted.original_body_cid) as { bytes: Uint8Array } | undefined
+                  if (blobRow) {
+                    await tryEmitForkForked({
+                      channel: ctx.channel,
+                      sessionId,
+                      synthetic: s,
+                      parent_revision_id: s.parent_revision_id,
+                      target_revision_id: fp,
+                      to_revision_id: persisted.to_revision_id,
+                      originalBodyBytes: blobRow.bytes,
+                    })
+                  }
+                  else {
+                    await ctx.channel.submit(
+                      'fork.synthesis_failed',
+                      {
+                        parent_revision_id: s.parent_revision_id,
+                        target_revision_id: fp,
+                        error_message: `deferred fire: original_body_cid=${persisted.original_body_cid} missing from blobs`,
+                      },
+                      sessionId,
+                    )
+                  }
+                }
+                else {
+                  // Immediate-fire path (first post-rewind turn closed on
+                  // end_turn / stop_sequence). originalBodyBlob is this
+                  // turn's pre-splice body, which IS the rewind's landing-
+                  // turn body.
+                  await tryEmitForkForked({
+                    channel: ctx.channel,
+                    sessionId,
+                    synthetic: s,
+                    parent_revision_id: s.parent_revision_id,
+                    target_revision_id: fp,
+                    to_revision_id: requestEvent.id,
+                    originalBodyBytes: originalBodyBlob.ref.bytes,
+                  })
+                }
                 // SR materialized — clear synthetic_metadata on the anchor so
                 // a future end_turn doesn't re-fire fork.forked. The anchor
                 // row itself stays active for continued splicing.
                 if (ctx.db) clearPendingSynthetic(ctx.db, sessionId)
               }
-              else if (isOpen && ctx.db) {
+              else if (isOpen && ctx.db && !anchorMatch.deferredAlready) {
                 // Defer: persist for fire on the next end_turn. The pending-
                 // synthetic facade writes to fork_anchors.synthetic_metadata_json
                 // on the active row, so the deferred metadata stays scoped to
-                // the same anchor.
+                // the same anchor. Skip when already deferred — re-wrapping
+                // would double-nest the SyntheticDepartureMeta and corrupt
+                // subsequent reads.
                 setPendingSynthetic(ctx.db, sessionId, {
                   synthetic: s,
                   to_revision_id: requestEvent.id,
@@ -1130,19 +1191,23 @@ async function dispatch(
                   first_seen_at: Date.now(),
                 })
               }
+              else if (isOpen) {
+                // Already deferred on a prior turn; nothing to do this turn.
+              }
               else {
-                // Dangling stop_reason or no DB: audit-fail.
+                // Dangling stop_reason: audit-fail and clear deferred state.
                 await ctx.channel.submit(
                   'fork.synthesis_failed',
                   {
                     parent_revision_id: s.parent_revision_id,
                     target_revision_id: fp,
                     error_message: ctx.db
-                      ? `post-rewind first turn ended with stop_reason=${stopReason ?? 'null'}; no SR materialized`
+                      ? `post-rewind turn ended with stop_reason=${stopReason ?? 'null'}; no SR materialized`
                       : `proxy-handler context has no DB; cannot defer SR through tool_use chains`,
                   },
                   sessionId,
                 )
+                if (ctx.db) clearPendingSynthetic(ctx.db, sessionId)
               }
             }
             else if (!anchorMatch && status >= 200 && status < 300 && ctx.db) {

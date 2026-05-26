@@ -26,7 +26,6 @@ import { createEventConsumer, createEventProducer } from '../events.js'
 import { ConfirmTokenStore, createMcpToolsWithTokens } from '../mcp-tools.js'
 import { SESSION_HEADER } from '../proxy-handler.js'
 import { defaultProjectors, defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { createTobeStore } from './_legacy-tobe-stub.js'
 
 interface E2EFixture {
   db: DB
@@ -60,12 +59,10 @@ async function setup(
   migrate(db)
   const channel = createChannel({ db, tasks: await defaultTasks() })
   const tmpRoot = mkdtempSync(path.join(tmpdir(), 'sr-int-'))
-  const tobeStore = createTobeStore(tmpRoot)
   const mock = await startMock(upstreamHandler)
   const proxy = await startServer({
     port: 0,
     channel,
-    tobeStore,
     upstream: `http://127.0.0.1:${mock.port}`,
     db,
   })
@@ -170,20 +167,16 @@ describe('SR end-to-end (Phase 4)', () => {
     }
   })
 
-  // v0.6: this test seeds TOBE directly; proxy-handler no longer reads TOBE
-  // (uses applyAnchorSplice / fork_anchors instead). Rewriting to seed a
-  // fork_anchors row + drive through the MCP rewind_to handler is the
-  // proper fix; deferred to a follow-up since the equivalent flow IS
-  // exercised by the cli-tmux-integration suite.
-  it.skip('rewind_to → next /v1/messages → SR row exists in revisions (v0.6: rewrite pending)', async () => {
+  it('rewind_to → next /v1/messages → SR row exists in revisions', async () => {
     fx = await setup((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
     })
     const sessionId = 'sess-e2e-1'
 
-    // Seed history: 2 closed_forkable turns (T1=rewind target, T2=current
-    // head) + R1 (tool_use turn calling rewind_to).
+    // Seed history: 2 closed_forkable turns + R1 (tool_use turn calling
+    // rewind_to). The MCP tool handler reads recent revisions to compute
+    // the target's revision id and reconstruct the fork's prefix history.
     const seedProducer = createEventProducer(fx.db, defaultProjectors())
     seedProducer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
     for (const label of ['t1', 't2']) {
@@ -206,15 +199,16 @@ describe('SR end-to-end (Phase 4)', () => {
     }
 
     // R1: tool_use turn calling rewind_to.
-    const { r1Id } = await seedR1ToolUse(fx, sessionId, [{ role: 'user', content: 't2' }], 'rewind_to', 'toolu_R1')
-    void r1Id
+    await seedR1ToolUse(fx, sessionId, [{ role: 'user', content: 't2' }], 'rewind_to', 'toolu_R1')
 
-    // Drive rewind_to via MCP — two-step token flow.
-    const tobeStore = createTobeStore(fx.tmpRoot)
+    // Drive rewind_to via MCP — two-step confirm token flow. The MCP handler
+    // writes the active fork_anchors row + returns a tool_result containing
+    // <retcon-anchor token="..." /> that the proxy will scan for on the next
+    // /v1/messages.
     const storage = new SqliteStorageProvider(fx.db)
     const proxyChannel = createChannel({ db: fx.db, tasks: await defaultTasks() })
     const tools = createMcpToolsWithTokens(
-      { db: fx.db, tobeStore, storageProvider: storage, rewindEnabled: true },
+      { db: fx.db, storageProvider: storage, rewindEnabled: true },
       { rewind: new ConfirmTokenStore(), submit: new ConfirmTokenStore() },
     )
     const rewindTool = tools.get('rewind_to')!
@@ -225,30 +219,25 @@ describe('SR end-to-end (Phase 4)', () => {
     const second = await rewindTool.handler(
       { turn_back_n: 1, message: 'switch to plan B', confirm: first.confirm_clean },
       { sessionId, channel: proxyChannel },
-    ) as { status: string }
+    ) as { status: string, message: string }
     expect(second.status).toBe('scheduled')
 
-    // The TOBE pending file is now sitting in fx.tmpRoot. But the proxy uses
-    // its OWN tobeStore (created in setup). We need to write the pending file
-    // to the proxy's tobeStore. Easier: skip this test — it requires the MCP
-    // tools and proxy to share a tobeStore. Replicate the TOBE write to the
-    // proxy's path.
-    // (For this integration test, we directly seed the proxy's TOBE store.)
-    const pending = tobeStore.peek(sessionId)
-    expect(pending).toBeTruthy()
-    expect(pending!.synthetic).toBeTruthy()
+    // Extract the anchor token from the scheduled tool_result text — the
+    // proxy will scan for the SAME token in the body's tool_result.
+    const anchorMatch = second.message.match(/<retcon-anchor token="(tok_[0-9a-f]{12})"/)
+    expect(anchorMatch).not.toBeNull()
+    const anchorToken = anchorMatch![1]
 
-    // Now drive a /v1/messages through the proxy, but use the proxy's own
-    // tobe store. The proxy's tobeStore lives in the fx.tmpRoot (same path
-    // we used here), so the pending file IS visible. Verify by reading it
-    // back via a fresh tobe store on the same dir.
-    const proxyTobeStore = createTobeStore(fx.tmpRoot)
-    expect(proxyTobeStore.peek(sessionId)).toBeTruthy()
+    // The fork_anchors row should be active.
+    const seededRow = fx.db.prepare(
+      'SELECT state, synthetic_metadata_json FROM fork_anchors WHERE anchor_token=?',
+    ).get(anchorToken) as { state: string, synthetic_metadata_json: string | null }
+    expect(seededRow.state).toBe('active')
+    expect(seededRow.synthetic_metadata_json).toBeTruthy()
 
-    // Realistic claude body shape: R1's parsed assistant turn (with
-    // tool_use(rewind_to)) and a trailing user turn carrying the
-    // tool_result. proxy-handler reads this to derive tool_use_id and
-    // detect parallel tools.
+    // Drive a /v1/messages with R1's tool_use + the anchor-bearing
+    // tool_result. proxy-handler reads R1 to derive tool_use_id and fires
+    // fork.forked on the 2xx+end_turn response.
     await driveTurn(fx, sessionId, [
       { role: 'user', content: 't2' },
       {
@@ -257,11 +246,15 @@ describe('SR end-to-end (Phase 4)', () => {
       },
       {
         role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: 'toolu_R1', content: 'scheduled' }],
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_R1',
+          content: `Rewind scheduled.\n<retcon-anchor token="${anchorToken}" />`,
+        }],
       },
     ])
 
-    // Wait for fork.forked to fire.
+    // Wait for fork.forked.
     const consumer = createEventConsumer(fx.db)
     let attempts = 0
     let forked: unknown
@@ -277,7 +270,7 @@ describe('SR end-to-end (Phase 4)', () => {
     expect(forked).toBeDefined()
     const forkedPayload = forked as { synthetic_revision_id: string }
 
-    // SR row must exist in revisions, parented to R1, classified closed_forkable.
+    // SR row must exist in revisions, classified closed_forkable.
     const sr = fx.db.prepare(
       'SELECT id, classification, stop_reason FROM revisions WHERE id = ?',
     ).get(forkedPayload.synthetic_revision_id) as
@@ -288,93 +281,158 @@ describe('SR end-to-end (Phase 4)', () => {
     expect(sr!.stop_reason).toBe('rewind_synthetic')
   })
 
-  it('failure path: 4xx upstream → no SR materializes', async () => {
+  it('failure path: 4xx upstream → no SR materializes, anchor stays active', async () => {
     fx = await setup((_req, res) => {
       res.writeHead(429, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit' } }))
     })
     const sessionId = 'sess-e2e-fail'
 
-    // Seed a session and an SR-construction TOBE pending file.
     const seedProducer = createEventProducer(fx.db, defaultProjectors())
     seedProducer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
     await seedR1ToolUse(fx, sessionId, [{ role: 'user', content: 'q' }], 'rewind_to', 'toolu_X')
 
-    const proxyTobeStore = createTobeStore(fx.tmpRoot)
-    proxyTobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
-      fork_point_revision_id: 'ver-fp',
-      source_view_id: 'view-src',
-      synthetic: {
+    // Seed an active fork_anchors row that the proxy will splice off when
+    // the body carries its token. v0.6's contract on 4xx: no fork.forked,
+    // anchor stays active for claude's retry path.
+    const anchorToken = 'tok_aabbccddee01'
+    fx.db.prepare(
+      'INSERT OR IGNORE INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)',
+    ).run(sessionId, 'task-fail', 'default', Date.now(), 'claude-code')
+    fx.db.prepare(`
+      INSERT INTO fork_anchors (
+        anchor_token, session_id, target_messages_json, target_messages_top_cid,
+        fork_point_revision_id, source_view_id, synthetic_metadata_json,
+        state, state_reason, acknowledged_at, created_at, released_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'active', NULL, NULL, ?, NULL)
+    `).run(
+      anchorToken,
+      sessionId,
+      JSON.stringify([{ role: 'user', content: 'rewritten' }]),
+      'ver-fp',
+      'view-src',
+      JSON.stringify({
         kind: 'rewind',
         target_view_id: 'tv',
         synthetic_revision_id: 'rev-should-not-exist',
         synthetic_tool_result_text: 't',
         synthetic_assistant_text: 'a',
         synthetic_user_message: 'u',
-        tool_use_id: 'toolu_X',
         parent_revision_id: 'r1',
         back_requested_at: 1,
+      }),
+      Date.now(),
+    )
+
+    await driveTurn(fx, sessionId, [
+      { role: 'user', content: 'orig' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_X', name: 'rewind_to', input: {} }] },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_X',
+          content: `Rewind scheduled.\n<retcon-anchor token="${anchorToken}" />`,
+        }],
       },
-    })
+    ])
 
-    await driveTurn(fx, sessionId, [{ role: 'user', content: 'orig' }])
-
-    // 4xx means TOBE stays pending (proxy retains for retry) and no SR
-    // materializes.
+    // No SR materialized.
     const sr = fx.db.prepare(
       'SELECT id FROM revisions WHERE id = ?',
     ).get('rev-should-not-exist')
     expect(sr).toBeUndefined()
+    // Anchor still active — 4xx (rate limit) doesn't auto-release. The
+    // upstream_4xx state transition is reserved for true splice-induced
+    // 400s, not for retryable upstream errors like 429.
+    const row = fx.db.prepare(
+      'SELECT state FROM fork_anchors WHERE anchor_token=?',
+    ).get(anchorToken) as { state: string }
+    expect(row.state).toBe('active')
   })
 
-  it.skip('[v0.6 rewrite pending] synthesis_failed audit: emitted when R1 is missing for synthetic_asset build', async () => {
+  it('synthesis_failed audit: emitted when R1 is missing the operation tool_use', async () => {
+    // v0.6 buildSyntheticAsset reads the pre-splice body's last assistant
+    // turn and looks for a tool_use named `rewind_to` (or `mcp__retcon__
+    // rewind_to`) to pair the synthetic tool_result with. When the
+    // assistant turn has NO matching tool_use, buildSyntheticAsset returns
+    // null and proxy-handler emits fork.synthesis_failed instead of
+    // fork.forked. This protects cascade rewinds: an unpaired tool_use in
+    // a future synthetic body would 400 from Anthropic.
     fx = await setup((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
     })
     const sessionId = 'sess-e2e-synthfail'
 
-    // Bootstrap session (so proxy doesn't bail on FK).
     const seedProducer = createEventProducer(fx.db, defaultProjectors())
     seedProducer.emit('mcp.session_initialized', { mcp_session_id: 'm', harness: 'claude-code' }, sessionId)
 
-    // Write a TOBE that points at a non-existent R1 — buildSyntheticAsset
-    // will return null and proxy-handler emits fork.synthesis_failed.
-    const proxyTobeStore = createTobeStore(fx.tmpRoot)
-    proxyTobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
-      fork_point_revision_id: 'ver-fp',
-      source_view_id: 'view-src',
-      synthetic: {
+    // Seed an active fork_anchors row directly. The synthetic_metadata
+    // carries the SR fields buildSyntheticAsset will try to use; the body
+    // we drive below WON'T have a matching tool_use, so the build fails.
+    // Token must be 12 hex chars to match ANCHOR_TAG_RE (`tok_[0-9a-f]{12}`).
+    const anchorToken = 'tok_aabbccddeeff'
+    fx.db.prepare(
+      'INSERT OR IGNORE INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)',
+    ).run(sessionId, 'task-orphan', 'default', Date.now(), 'claude-code')
+    fx.db.prepare(`
+      INSERT INTO fork_anchors (
+        anchor_token, session_id, target_messages_json, target_messages_top_cid,
+        fork_point_revision_id, source_view_id, synthetic_metadata_json,
+        state, state_reason, acknowledged_at, created_at, released_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'active', NULL, NULL, ?, NULL)
+    `).run(
+      anchorToken,
+      sessionId,
+      JSON.stringify([{ role: 'user', content: 'rewritten' }]),
+      'ver-fp',
+      'view-src',
+      JSON.stringify({
         kind: 'rewind',
         target_view_id: 'tv',
         synthetic_revision_id: 'rev-orphan-sr',
         synthetic_tool_result_text: 't',
         synthetic_assistant_text: 'a',
         synthetic_user_message: 'u',
-        tool_use_id: 'toolu_OOPS',
         parent_revision_id: 'rev-does-not-exist',
         back_requested_at: 1,
+      }),
+      Date.now(),
+    )
+
+    // Body shape: assistant turn carries only TEXT (no tool_use), then a
+    // user turn with the anchor-bearing tool_result. The splice scan still
+    // finds the anchor (it only inspects tool_result blocks, not tool_use
+    // pairing). buildSyntheticAsset then walks back to the assistant turn,
+    // finds no rewind_to tool_use, returns null.
+    await driveTurn(fx, sessionId, [
+      { role: 'user', content: 'orig' },
+      { role: 'assistant', content: [{ type: 'text', text: 'just text, no tool_use' }] },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_OOPS',
+          content: `Rewind scheduled.\n<retcon-anchor token="${anchorToken}" />`,
+        }],
       },
-    })
+    ])
 
-    await driveTurn(fx, sessionId, [{ role: 'user', content: 'orig' }])
-
-    // Wait for terminal event so the projector chain has run.
     const consumer = createEventConsumer(fx.db)
     let attempts = 0
-    let synthFailed: unknown
+    let synthFailed: { error_message?: string } | undefined
     while (attempts < 100) {
       const evts = consumer.poll('_probe_sf', ['fork.synthesis_failed'], 1)
       if (evts.length > 0) {
-        synthFailed = evts[0]!.payload
+        synthFailed = evts[0]!.payload as { error_message?: string }
         break
       }
       await new Promise(r => setTimeout(r, 10))
       attempts++
     }
     expect(synthFailed).toBeDefined()
+    expect(synthFailed!.error_message).toMatch(/buildSyntheticAsset returned null/i)
     // No SR row created.
     const sr = fx.db.prepare(
       'SELECT id FROM revisions WHERE id = ?',

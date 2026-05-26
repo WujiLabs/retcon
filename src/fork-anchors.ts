@@ -484,8 +484,40 @@ export function applyAnchorSplice(rawBody: Buffer, sessionId: string, db: DB): A
   }
 }
 
+/** Parse fork_anchors.synthetic_metadata_json. Two shapes can live here:
+ *  (1) the BARE SyntheticDepartureMeta written at insertActiveAnchor time
+ *      (initial state after rewind_to / submit_file), and (2) the WRAPPED
+ *      PendingSynthetic shape written by setActiveAnchorSyntheticMetadata
+ *      after the first post-rewind turn closes on tool_use (deferred SR
+ *      awaiting end_turn). Both can be read on subsequent splice turns; the
+ *      consumer needs the bare meta either way (for parallel-tool detection
+ *      and fork.forked field extraction). This helper returns the bare meta
+ *      regardless of which shape is stored, and reports whether the row is
+ *      in deferred state so the caller can skip re-firing setPendingSynthetic. */
+export function parseAnchorSyntheticMetadata(
+  json: string | null,
+): { synthetic: SyntheticDepartureMeta, deferred: boolean } | null {
+  if (!json) return null
+  try {
+    const obj = JSON.parse(json) as
+      | SyntheticDepartureMeta
+      | { synthetic?: SyntheticDepartureMeta }
+    if (obj && typeof (obj as SyntheticDepartureMeta).kind === 'string') {
+      return { synthetic: obj as SyntheticDepartureMeta, deferred: false }
+    }
+    const wrapped = obj as { synthetic?: SyntheticDepartureMeta }
+    if (wrapped?.synthetic && typeof wrapped.synthetic.kind === 'string') {
+      return { synthetic: wrapped.synthetic, deferred: true }
+    }
+    return null
+  }
+  catch {
+    return null
+  }
+}
+
 /** Read fork_anchors.synthetic_metadata_json. Replaces sessions.pending_synthetic_json
- *  in the v0.6 cutover. */
+ *  in the v0.6 cutover. Returns the bare meta regardless of wrapped/deferred state. */
 export function getSyntheticMetadataForAnchor(
   db: DB,
   anchorToken: string,
@@ -493,13 +525,8 @@ export function getSyntheticMetadataForAnchor(
   const row = db.prepare(
     'SELECT synthetic_metadata_json FROM fork_anchors WHERE anchor_token = ?',
   ).get(anchorToken) as { synthetic_metadata_json: string | null } | undefined
-  if (!row?.synthetic_metadata_json) return null
-  try {
-    return JSON.parse(row.synthetic_metadata_json) as SyntheticDepartureMeta
-  }
-  catch {
-    return null
-  }
+  const parsed = parseAnchorSyntheticMetadata(row?.synthetic_metadata_json ?? null)
+  return parsed?.synthetic ?? null
 }
 
 /** Clear synthetic_metadata_json once the SR row has materialized. */

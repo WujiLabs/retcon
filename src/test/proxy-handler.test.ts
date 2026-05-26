@@ -17,10 +17,82 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { type DB, migrate, openDb } from '../db.js'
 import { createEventConsumer } from '../events.js'
+import type { SyntheticDepartureMeta } from '../fork-anchors.js'
 import { capCacheControlBlocks, MAX_CACHE_CONTROL_BLOCKS, SESSION_HEADER, stripTtlViolations } from '../proxy-handler.js'
 import { REDACTED_VALUE } from '../redaction.js'
 import { defaultTasks, type ServerHandle, startServer } from '../server.js'
-import { createTobeStore, type TobeStore } from './_legacy-tobe-stub.js'
+
+/** Seed an active fork_anchors row for a session — the v0.6 replacement for
+ *  the v0.5 `tobeStore.write(...)` pattern. Inserts the session row too
+ *  (idempotent on the session). Returns the anchor token the test should
+ *  embed in the body's tool_result. */
+function seedActiveAnchor(
+  db: DB,
+  sessionId: string,
+  opts: {
+    anchor_token?: string
+    target_messages: unknown[]
+    fork_point_revision_id?: string | null
+    source_view_id?: string | null
+    synthetic?: SyntheticDepartureMeta
+  },
+): string {
+  const token = opts.anchor_token ?? `tok_${Math.random().toString(16).slice(2, 14).padStart(12, '0')}`
+  db.prepare(
+    'INSERT OR IGNORE INTO sessions (id, task_id, actor, created_at, harness) VALUES (?, ?, ?, ?, ?)',
+  ).run(sessionId, `task-${sessionId}`, 'default', Date.now(), 'claude-code')
+  db.prepare(
+    'INSERT OR IGNORE INTO tasks (id, session_id, created_at) VALUES (?, ?, ?)',
+  ).run(`task-${sessionId}`, sessionId, Date.now())
+  db.prepare(`
+    INSERT INTO fork_anchors (
+      anchor_token, session_id, target_messages_json, target_messages_top_cid,
+      fork_point_revision_id, source_view_id, synthetic_metadata_json,
+      state, state_reason, acknowledged_at, created_at, released_at
+    ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'active', NULL, NULL, ?, NULL)
+  `).run(
+    token,
+    sessionId,
+    JSON.stringify(opts.target_messages),
+    opts.fork_point_revision_id ?? null,
+    opts.source_view_id ?? null,
+    opts.synthetic ? JSON.stringify(opts.synthetic) : null,
+    Date.now(),
+  )
+  return token
+}
+
+/** Build a claude-shaped /v1/messages body where the latest user-role turn
+ *  carries the rewind_to/submit_file anchor inside a tool_result block. The
+ *  `priorAssistantToolUse` lets a test inject sibling tool_uses (parallel-
+ *  tool guard). */
+function bodyWithAnchor(opts: {
+  history: unknown[]
+  toolUseId: string
+  toolName: 'rewind_to' | 'submit_file'
+  anchorToken: string
+  parallelToolUses?: Array<{ id: string, name: string, input?: unknown }>
+}): string {
+  const r1Content: unknown[] = [
+    { type: 'tool_use', id: opts.toolUseId, name: opts.toolName, input: { turn_back_n: 1, message: 'hi' } },
+    ...(opts.parallelToolUses?.map(t => ({ type: 'tool_use', id: t.id, name: t.name, input: t.input ?? {} })) ?? []),
+  ]
+  return JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    messages: [
+      ...opts.history,
+      { role: 'assistant', content: r1Content },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: opts.toolUseId,
+          content: `Rewind scheduled.\n<retcon-anchor token="${opts.anchorToken}" />`,
+        }],
+      },
+    ],
+  })
+}
 
 type MockHandler = (
   req: http.IncomingMessage,
@@ -48,11 +120,9 @@ function fixture() {
   migrate(db)
   const channel = createChannel({ db })
   const tmpRoot = mkdtempSync(path.join(tmpdir(), 'proxy-ph-test-'))
-  const tobeStore: TobeStore = createTobeStore(tmpRoot)
   return {
     db,
     channel,
-    tobeStore,
     tmpRoot,
     cleanup: () => rmSync(tmpRoot, { recursive: true, force: true }),
   }
@@ -178,7 +248,11 @@ describe('proxy pass-through + event emission', () => {
     expect(responsePayload.stop_reason).toBe('end_turn')
   })
 
-  it.skip('[v0.6 rewrite pending] consumes a pending TOBE and carries tobe_applied_from in the event payload', async () => {
+  it('applies an active anchor splice and carries tobe_applied_from in the event payload', async () => {
+    // v0.6: the anchor splice REPLACES the body's pre-anchor turns with
+    // target_messages_json from the active fork_anchors row. The request
+    // event payload's `tobe_applied_from` field carries the row's
+    // fork_point_revision_id + source_view_id + the pre-splice body's CID.
     mock = await startMock((_req, res, body) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
@@ -190,11 +264,12 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
 
-    const sessionId = 'sess-tobe'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
+    const sessionId = 'sess-anchor-applied'
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'rewritten' }],
       fork_point_revision_id: 'ver-fork-point-xyz',
       source_view_id: 'view-origin',
     })
@@ -202,9 +277,16 @@ describe('proxy pass-through + event emission', () => {
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'ORIGINAL' }] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'ORIGINAL' }],
+        toolUseId: 'toolu_anchor_1',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
-    const body = await res.json() as { echoed_messages: Array<{ content: string }> }
+    const body = await res.json() as { echoed_messages: Array<{ role: string, content: unknown }> }
+    // Splice replaced the pre-anchor turns with target_messages. Body upstream
+    // sees the trailing user content from target_messages (`rewritten`).
     expect(body.echoed_messages[0].content).toBe('rewritten')
 
     const reqPayload = await waitForEvent(fx.db, 'proxy.request_received') as {
@@ -215,8 +297,13 @@ describe('proxy pass-through + event emission', () => {
     expect(reqPayload.tobe_applied_from!.source_view_id).toBe('view-origin')
     expect(typeof reqPayload.tobe_applied_from!.original_body_cid).toBe('string')
 
-    // TOBE should have been committed (2xx upstream → file deleted).
-    expect(fx.tobeStore.peek(sessionId)).toBeNull()
+    // Anchor row stays active after a 2xx — the v0.6 equivalent of "TOBE
+    // commit on success" is "row keeps splicing future turns". Compare to
+    // v0.5.x where success deleted the pending file.
+    const stillActive = fx.db.prepare(
+      'SELECT state FROM fork_anchors WHERE anchor_token = ?',
+    ).get(token) as { state: string }
+    expect(stillActive.state).toBe('active')
   })
 
   // ── Phase 1 (v0.5.0): fork.forked emission ───────────────────────────────
@@ -225,7 +312,7 @@ describe('proxy pass-through + event emission', () => {
   // synthetic SR-construction metadata. Each test below pins one of those
   // gates.
 
-  it.skip('[v0.6 rewrite pending] fork.forked: emitted when TOBE consumed AND 2xx AND end_turn AND synthetic present', async () => {
+  it('fork.forked: emitted when anchor spliced + 2xx + end_turn + synthetic_metadata present', async () => {
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
@@ -238,8 +325,8 @@ describe('proxy pass-through + event emission', () => {
     })
 
     const sessionId = 'sess-forked-happy'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'rewritten' }],
       fork_point_revision_id: 'ver-fork-x',
       source_view_id: 'view-x',
       synthetic: {
@@ -254,30 +341,19 @@ describe('proxy pass-through + event emission', () => {
       },
     })
 
-    // claude's pre-splice body: realistic shape with R1's parsed assistant
-    // turn (containing the rewind_to tool_use) and a trailing user turn
-    // with the operation's tool_result. proxy-handler reads this body to
-    // derive tool_use_id and compose the synthetic SR body.
-    const claudeBody = {
-      model: 'claude-sonnet-4-6',
-      messages: [
-        { role: 'user', content: 'q1' },
-        {
-          role: 'assistant',
-          content: [
-            { type: 'tool_use', id: 'toolu_42', name: 'rewind_to', input: { turn_back_n: 1, message: 'hi' } },
-          ],
-        },
-        {
-          role: 'user',
-          content: [{ type: 'tool_result', tool_use_id: 'toolu_42', content: 'scheduled' }],
-        },
-      ],
-    }
+    // claude's pre-splice body: R1 is the assistant turn that called
+    // rewind_to; the trailing user turn carries the anchor-bearing
+    // tool_result. proxy-handler reads R1 to derive the tool_use_id for SR
+    // construction, then fires fork.forked on the 2xx+end_turn response.
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(claudeBody),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'q1' }],
+        toolUseId: 'toolu_42',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
     await res.text()
 
@@ -303,9 +379,17 @@ describe('proxy pass-through + event emission', () => {
     expect(forkedPayload.target_view_id).toBe('view-target')
     expect(forkedPayload.sealed_at).toBe(1234567890)
     expect(forkedPayload.synthetic_asset_cid).toMatch(/.+/)
+
+    // After fork.forked fires, synthetic_metadata_json is cleared on the
+    // anchor row so a future end_turn (e.g., on a follow-up turn that still
+    // splices off this anchor) doesn't re-fire fork.forked.
+    const cleared = fx.db.prepare(
+      'SELECT synthetic_metadata_json FROM fork_anchors WHERE anchor_token = ?',
+    ).get(token) as { synthetic_metadata_json: string | null }
+    expect(cleared.synthetic_metadata_json).toBeNull()
   })
 
-  it.skip('[v0.6 rewrite pending] fork.forked: NOT emitted, splice aborted, fork.synthesis_failed instead when R1 has parallel tool_uses', async () => {
+  it('parallel tool_uses: splice aborted, anchor released, fork.synthesis_failed emitted', async () => {
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
@@ -318,8 +402,8 @@ describe('proxy pass-through + event emission', () => {
     })
 
     const sessionId = 'sess-parallel'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'rewritten' }],
       fork_point_revision_id: 'ver-fork-p',
       source_view_id: 'view-p',
       synthetic: {
@@ -334,28 +418,22 @@ describe('proxy pass-through + event emission', () => {
       },
     })
 
-    // R1 has parallel tool_uses: rewind_to + read_file.
-    const claudeBody = {
-      model: 'claude-sonnet-4-6',
-      messages: [
-        { role: 'user', content: 'q' },
-        {
-          role: 'assistant',
-          content: [
-            { type: 'tool_use', id: 'toolu_R', name: 'rewind_to', input: {} },
-            { type: 'tool_use', id: 'toolu_F', name: 'read_file', input: {} },
-          ],
-        },
-        {
-          role: 'user',
-          content: [{ type: 'tool_result', tool_use_id: 'toolu_R', content: 'scheduled' }],
-        },
-      ],
-    }
+    // R1 has parallel tool_uses: rewind_to + read_file. The splice would
+    // discard read_file's tool_result (it lives in the same user-role turn
+    // as the anchor's tool_result, which the splice replaces), and upstream
+    // would 400 on the unpaired tool_use. proxy-handler aborts the splice,
+    // marks the anchor row released with reason=parallel_tools, and emits
+    // fork.synthesis_failed with the offending tool names.
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(claudeBody),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'q' }],
+        toolUseId: 'toolu_R',
+        toolName: 'rewind_to',
+        anchorToken: token,
+        parallelToolUses: [{ id: 'toolu_F', name: 'read_file' }],
+      }),
     })
 
     const synthFail = await waitForEvent(fx.db, 'fork.synthesis_failed') as {
@@ -365,11 +443,17 @@ describe('proxy pass-through + event emission', () => {
     expect(synthFail.error_message).toMatch(/splice aborted/i)
     expect(synthFail.parallel_tool_names).toEqual(['read_file'])
 
-    // No fork.forked. TOBE was committed (deleted).
+    // No fork.forked.
     const consumer = createEventConsumer(fx.db)
     const found = consumer.poll('_probe_no_forked_par', ['fork.forked'], 1)
     expect(found.length).toBe(0)
-    expect(fx.tobeStore.peek(sessionId)).toBeNull()
+
+    // Anchor row is now released with the parallel_tools reason.
+    const row = fx.db.prepare(
+      'SELECT state, state_reason FROM fork_anchors WHERE anchor_token = ?',
+    ).get(token) as { state: string, state_reason: string }
+    expect(row.state).toBe('released')
+    expect(row.state_reason).toBe('parallel_tools')
   })
 
   it('fork.forked: NOT emitted when stop_reason is not end_turn', async () => {
@@ -384,8 +468,8 @@ describe('proxy pass-through + event emission', () => {
     })
 
     const sessionId = 'sess-no-end-turn'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'r' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'r' }],
       fork_point_revision_id: 'ver-fork-y',
       source_view_id: 'view-y',
       synthetic: {
@@ -402,10 +486,17 @@ describe('proxy pass-through + event emission', () => {
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'orig' }],
+        toolUseId: 'toolu_dangle',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
 
-    // response_completed must already be in the log; fork.forked must NOT.
+    // max_tokens is dangling-unforkable: anchor splice ran, but no SR
+    // materializes. Instead the dispatch fires fork.synthesis_failed and
+    // fork.forked stays absent.
     await waitForEvent(fx.db, 'proxy.response_completed')
     const consumer = createEventConsumer(fx.db)
     const found = consumer.poll('_probe_no_forked', ['fork.forked'], 1)
@@ -419,20 +510,13 @@ describe('proxy pass-through + event emission', () => {
   // (only emit on end_turn) drops the SR silently in those cases.
   // Defer-and-fire-on-eventual-end_turn pins the recovery.
 
-  // v0.6: deferred fork.forked now reads/writes fork_anchors.synthetic_metadata_json
-  // (via the pending-synthetic.ts facade) instead of sessions.pending_synthetic_json.
-  // Test setup needs an active fork_anchors row to receive the deferred metadata;
-  // the bare TOBE-write path used by this test predates v0.6 and bypasses that
-  // wiring. Re-skinning these tests to seed a fork_anchors row alongside the
-  // TOBE write is straightforward but deferred — production code path is
-  // exercised by sr-integration.test.ts.
-  it.skip('fork.forked: deferred when first post-rewind turn is tool_use, fires on a later end_turn (v0.6: rewrite pending)', async () => {
-    // Three /v1/messages calls. First consumes TOBE, response=tool_use
-    // (defer). Second is a follow-up with no TOBE, response=tool_use
-    // (still pending). Third is no-TOBE, response=end_turn (fire).
-    //
-    // pending_synthetic_json lives on the sessions table — we need the
-    // sessions_v1 projector wired up so the row exists.
+  it('fork.forked: deferred when first post-rewind turn is tool_use, fires on a later end_turn', async () => {
+    // Three /v1/messages calls. T1: anchor spliced, response=tool_use →
+    // setPendingSynthetic stashes the SR-construction state on
+    // fork_anchors.synthetic_metadata_json. T2: same anchor still in body,
+    // response=tool_use → still deferred. T3: anchor still in body,
+    // response=end_turn → fork.forked fires with the original SR metadata
+    // and to_revision_id pointing at T1's request event.
     const localDb = openDb({ path: ':memory:' })
     migrate(localDb)
     const localChannel = createChannel({ db: localDb, tasks: await defaultTasks() })
@@ -452,8 +536,8 @@ describe('proxy pass-through + event emission', () => {
     })
 
     const sessionId = 'sess-deferred-happy'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'rewritten' }],
+    const token = seedActiveAnchor(localDb, sessionId, {
+      target_messages: [{ role: 'user', content: 'rewritten' }],
       fork_point_revision_id: 'ver-fork-deferred',
       source_view_id: 'view-deferred',
       synthetic: {
@@ -468,54 +552,51 @@ describe('proxy pass-through + event emission', () => {
       },
     })
 
-    const claudeBody = (turn: number) => ({
-      model: 'claude-sonnet-4-6',
-      messages: [
-        { role: 'user', content: `q${turn}` },
-        {
-          role: 'assistant',
-          content: [
-            { type: 'tool_use', id: `toolu_${turn}`, name: 'rewind_to', input: { turn_back_n: 1, message: 'go' } },
-          ],
-        },
-        {
-          role: 'user',
-          content: [{ type: 'tool_result', tool_use_id: `toolu_${turn}`, content: 'scheduled' }],
-        },
-      ],
+    // The same anchor stays in the body across all 3 turns (claude carries
+    // the rewind_to tool_result through its local jsonl until /compact or
+    // /clear wipes it). Each turn uses a unique R1 tool_use_id so the parsed
+    // assistant blocks aren't duplicates.
+    const body = (turn: number) => bodyWithAnchor({
+      history: [{ role: 'user', content: `q${turn}` }],
+      toolUseId: `toolu_${turn}`,
+      toolName: 'rewind_to',
+      anchorToken: token,
     })
 
-    // Turn 1: consumes TOBE, response stop_reason=tool_use → defer.
+    // T1: splice runs, response=tool_use → defer.
     await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(claudeBody(1)),
+      body: body(1),
     })).text()
-
-    // After turn 1: pending_synthetic_json is set, no fork.forked yet.
     await waitForEvent(localDb, 'proxy.response_completed')
     let consumer = createEventConsumer(localDb)
     expect(consumer.poll('_probe_defer_t1', ['fork.forked'], 1).length).toBe(0)
-    const persistedAfter1 = (localDb
-      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
-      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
-    expect(persistedAfter1).toBeTruthy()
-    expect(JSON.parse(persistedAfter1!).synthetic.synthetic_revision_id).toBe('rev-synth-deferred')
+    const meta1 = (localDb
+      .prepare('SELECT synthetic_metadata_json FROM fork_anchors WHERE anchor_token=?')
+      .get(token) as { synthetic_metadata_json: string | null }).synthetic_metadata_json
+    expect(meta1).toBeTruthy()
+    expect(JSON.parse(meta1!).synthetic.synthetic_revision_id).toBe('rev-synth-deferred')
 
-    // Turn 2: no TOBE, response stop_reason=tool_use → still deferred.
+    // T2: anchor still in body, response=tool_use → still deferred.
     await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(claudeBody(2)),
+      body: body(2),
     })).text()
     consumer = createEventConsumer(localDb)
     expect(consumer.poll('_probe_defer_t2', ['fork.forked'], 1).length).toBe(0)
+    // Anchor must still be active — deferred state shouldn't release.
+    const stateAfterT2 = (localDb
+      .prepare('SELECT state FROM fork_anchors WHERE anchor_token=?')
+      .get(token) as { state: string }).state
+    expect(stateAfterT2).toBe('active')
 
-    // Turn 3: no TOBE, response stop_reason=end_turn → fork.forked fires.
+    // T3: anchor still in body, response=end_turn → fork.forked fires.
     await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(claudeBody(3)),
+      body: body(3),
     })).text()
 
     const forkedPayload = await waitForEvent(localDb, 'fork.forked') as {
@@ -524,25 +605,23 @@ describe('proxy pass-through + event emission', () => {
       to_revision_id?: string
       sealed_at?: number
     }
-    // SR id and target_view_id come from the deferred metadata.
     expect(forkedPayload.synthetic_revision_id).toBe('rev-synth-deferred')
     expect(forkedPayload.target_view_id).toBe('view-target-deferred')
     expect(forkedPayload.sealed_at).toBe(9999)
-    // to_revision_id points at the FIRST post-rewind turn (the TOBE-consumer),
-    // not the eventual end_turn turn — that's the navigation handle the user
-    // thinks of as "where the fork landed."
     expect(forkedPayload.to_revision_id).toMatch(/.+/)
 
-    // pending_synthetic_json is cleared on fire.
-    const persistedAfter3 = (localDb
-      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
-      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
-    expect(persistedAfter3).toBeNull()
+    // synthetic_metadata_json cleared on fire so a subsequent end_turn (e.g.,
+    // a follow-up turn that still carries the same anchor) doesn't re-fire.
+    const cleared = (localDb
+      .prepare('SELECT synthetic_metadata_json FROM fork_anchors WHERE anchor_token=?')
+      .get(token) as { synthetic_metadata_json: string | null }).synthetic_metadata_json
+    expect(cleared).toBeNull()
   })
 
-  it.skip('fork.synthesis_failed: deferred SR abandoned when chain ends on max_tokens (v0.6: rewrite pending)', async () => {
-    // First call: TOBE → tool_use (defer). Second call: no TOBE → max_tokens
-    // (dangling_unforkable; abandon).
+  it('fork.synthesis_failed: deferred SR abandoned when chain ends on max_tokens', async () => {
+    // T1: splice runs, response=tool_use → defer.
+    // T2: same anchor in body, response=max_tokens (dangling_unforkable) →
+    //     fork.synthesis_failed + synthetic_metadata cleared.
     const localDb = openDb({ path: ':memory:' })
     migrate(localDb)
     const localChannel = createChannel({ db: localDb, tasks: await defaultTasks() })
@@ -562,8 +641,8 @@ describe('proxy pass-through + event emission', () => {
     })
 
     const sessionId = 'sess-deferred-abandon'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'r' }],
+    const token = seedActiveAnchor(localDb, sessionId, {
+      target_messages: [{ role: 'user', content: 'r' }],
       fork_point_revision_id: 'ver-fork-abandon',
       source_view_id: 'view-abandon',
       synthetic: {
@@ -578,36 +657,33 @@ describe('proxy pass-through + event emission', () => {
       },
     })
 
-    const body = (n: number) => ({
-      model: 'claude-sonnet-4-6',
-      messages: [
-        { role: 'user', content: 'q' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: `t${n}`, name: 'rewind_to', input: {} }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${n}`, content: 'scheduled' }] },
-      ],
+    const body = (n: number) => bodyWithAnchor({
+      history: [{ role: 'user', content: 'q' }],
+      toolUseId: `t${n}`,
+      toolName: 'rewind_to',
+      anchorToken: token,
     })
 
     await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(body(1)),
+      body: body(1),
     })).text()
     await (await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify(body(2)),
+      body: body(2),
     })).text()
 
-    // No fork.forked.
     await waitForEvent(localDb, 'fork.synthesis_failed')
     const consumer = createEventConsumer(localDb)
     expect(consumer.poll('_probe_abandon_no_forked', ['fork.forked'], 1).length).toBe(0)
 
-    // pending_synthetic_json cleared.
-    const persisted = (localDb
-      .prepare('SELECT pending_synthetic_json FROM sessions WHERE id=?')
-      .get(sessionId) as { pending_synthetic_json: string | null } | undefined)?.pending_synthetic_json
-    expect(persisted).toBeNull()
+    // synthetic_metadata_json cleared after the abandon.
+    const cleared = (localDb
+      .prepare('SELECT synthetic_metadata_json FROM fork_anchors WHERE anchor_token=?')
+      .get(token) as { synthetic_metadata_json: string | null }).synthetic_metadata_json
+    expect(cleared).toBeNull()
   })
 
   it('fork.forked: NOT emitted on 4xx upstream (not 2xx)', async () => {
@@ -619,11 +695,12 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
 
     const sessionId = 'sess-4xx'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'r' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'r' }],
       fork_point_revision_id: 'ver-fork-z',
       source_view_id: 'view-z',
       synthetic: {
@@ -640,7 +717,12 @@ describe('proxy pass-through + event emission', () => {
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'orig' }],
+        toolUseId: 'toolu_4xx',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
 
     await waitForEvent(fx.db, 'proxy.response_completed')
@@ -649,7 +731,12 @@ describe('proxy pass-through + event emission', () => {
     expect(found.length).toBe(0)
   })
 
-  it('fork.forked: NOT emitted when TOBE has no synthetic field (backward-compat)', async () => {
+  it('fork.forked: NOT emitted when fork_anchors row has no synthetic_metadata', async () => {
+    // An anchor without synthetic_metadata (e.g., a cascade-fork SR that
+    // was already materialized in a prior session) still splices, but
+    // there's no SR construction to perform. Verifies the splice runs
+    // unconditionally for active rows but fork.forked is gated on the
+    // presence of synthetic_metadata.
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] }))
@@ -658,19 +745,26 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
 
     const sessionId = 'sess-no-synth'
-    // Pre-v0.5.0 TOBE shape: no `synthetic`.
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'r' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'r' }],
       fork_point_revision_id: 'ver-old',
       source_view_id: 'view-old',
+      // no synthetic_metadata — the row was created via a different code
+      // path or had its metadata cleared post-fork.forked.
     })
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'orig' }] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'orig' }],
+        toolUseId: 'toolu_nosynth',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
 
     await waitForEvent(fx.db, 'proxy.response_completed')
@@ -881,7 +975,16 @@ describe('proxy pass-through + event emission', () => {
     expect(res.headers.get('connection')).not.toBe('close')
   })
 
-  it.skip('[v0.6 rewrite pending] retains TOBE on upstream 5xx so the next retry re-applies it (A-R8)', async () => {
+  it('anchor stays active on upstream 5xx so claude\'s retry re-splices (A-R8)', async () => {
+    // v0.6 contract: an anchor's lifecycle is decoupled from per-request
+    // outcome. Unlike v0.5's TOBE pending file (which got deleted on the
+    // first 2xx and survived 5xx so claude's retry would re-apply), the
+    // anchor row stays `active` regardless of HTTP status. Claude's retry
+    // produces the same body with the same anchor token; applyAnchorSplice
+    // runs again. The anchor only transitions on explicit signals: /clear,
+    // /compact, divergence, supersession, parallel_tools, or upstream_4xx.
+    // 5xx is none of those — pure infrastructure transient — so the row
+    // sits and waits.
     let call = 0
     mock = await startMock((_req, res, _body) => {
       call++
@@ -898,34 +1001,48 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
     const sessionId = 'sess-retry'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'retry-me' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'retry-me' }],
       fork_point_revision_id: 'v-retry-fp',
       source_view_id: 'view-retry',
     })
 
-    // First call — upstream returns 5xx. TOBE must survive.
+    const body = bodyWithAnchor({
+      history: [{ role: 'user', content: 'ORIG' }],
+      toolUseId: 'toolu_retry',
+      toolName: 'rewind_to',
+      anchorToken: token,
+    })
+
+    // First call — upstream 5xx. Anchor stays active.
     const r1 = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+      body,
     })
     expect(r1.status).toBe(502)
-    expect(fx.tobeStore.peek(sessionId)).not.toBeNull()
+    const after1 = fx.db.prepare(
+      'SELECT state FROM fork_anchors WHERE anchor_token=?',
+    ).get(token) as { state: string }
+    expect(after1.state).toBe('active')
 
-    // Second call — upstream returns 2xx. TOBE now commits (deleted).
+    // Second call — upstream 2xx. Anchor still active (no transition on success).
     const r2 = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+      body,
     })
     expect(r2.status).toBe(200)
-    expect(fx.tobeStore.peek(sessionId)).toBeNull()
+    const after2 = fx.db.prepare(
+      'SELECT state FROM fork_anchors WHERE anchor_token=?',
+    ).get(token) as { state: string }
+    expect(after2.state).toBe('active')
   })
 
-  it.skip('[v0.6 rewrite pending] notifies ForkAwaiter on a completed TOBE request (A-R8 scaffolding)', async () => {
+  it('notifies ForkAwaiter on a completed anchor-spliced request (A-R8 scaffolding)', async () => {
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ stop_reason: 'end_turn' }))
@@ -934,10 +1051,11 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
     const sessionId = 'sess-await'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'forked' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'forked' }],
       fork_point_revision_id: 'v-await-fp',
       source_view_id: 'view-await',
     })
@@ -946,7 +1064,12 @@ describe('proxy pass-through + event emission', () => {
     const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ messages: [{ role: 'user', content: 'ORIG' }] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'ORIG' }],
+        toolUseId: 'toolu_await',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
     await res.text()
     const outcome = await outcomeP
@@ -957,15 +1080,16 @@ describe('proxy pass-through + event emission', () => {
     expect(outcome.source_view_id).toBe('view-await')
   })
 
-  it.skip('[v0.6 rewrite pending] notifies ForkAwaiter with aborted/http_error on upstream failure', async () => {
+  it('notifies ForkAwaiter with upstream_error on connect failure', async () => {
     proxy = await startServer({
       port: 0,
       channel: fx.channel,
       upstream: 'http://127.0.0.1:1', // unreachable
+      db: fx.db,
     })
     const sessionId = 'sess-await-err'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'forked' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'forked' }],
       fork_point_revision_id: 'v-fp',
       source_view_id: 'view-err',
     })
@@ -973,16 +1097,30 @@ describe('proxy pass-through + event emission', () => {
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [SESSION_HEADER]: sessionId },
-      body: JSON.stringify({ messages: [] }),
+      body: bodyWithAnchor({
+        history: [{ role: 'user', content: 'q' }],
+        toolUseId: 'toolu_err',
+        toolName: 'rewind_to',
+        anchorToken: token,
+      }),
     })
     const outcome = await outcomeP
     expect(outcome.status).toBe('upstream_error')
     expect(outcome.http_status).toBe(502)
-    // TOBE retained for retry — upstream failure.
-    expect(fx.tobeStore.peek(sessionId)).not.toBeNull()
+    // Anchor row stays active — upstream failure is transient. Claude's
+    // retry produces the same body with the same anchor; splice re-runs.
+    const row = fx.db.prepare(
+      'SELECT state FROM fork_anchors WHERE anchor_token=?',
+    ).get(token) as { state: string }
+    expect(row.state).toBe('active')
   })
 
-  it('does NOT consume TOBE for non-messages /v1/* paths', async () => {
+  it('does NOT touch fork_anchors for non-messages /v1/* paths', async () => {
+    // v0.6: applyAnchorSplice only runs when isMessagesEndpoint is true.
+    // A /v1/models probe (or any non-messages path) must NOT release the
+    // active anchor on divergence even though the probe body lacks the
+    // anchor token. Mirrors the count_tokens skip but for non-/messages
+    // routes generally.
     mock = await startMock((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ data: [] }))
@@ -991,22 +1129,25 @@ describe('proxy pass-through + event emission', () => {
       port: 0,
       channel: fx.channel,
       upstream: `http://127.0.0.1:${mock.port}`,
+      db: fx.db,
     })
     const sessionId = 'sess-nontarget'
-    fx.tobeStore.write(sessionId, {
-      messages: [{ role: 'user', content: 'only-apply-to-messages' }],
+    const token = seedActiveAnchor(fx.db, sessionId, {
+      target_messages: [{ role: 'user', content: 'only-apply-to-messages' }],
       fork_point_revision_id: 'v-keep',
       source_view_id: 'view-keep',
     })
-    // Hit /v1/models — must NOT consume the pending TOBE.
+    // Hit /v1/models — must NOT touch fork_anchors.
     await fetch(`http://127.0.0.1:${proxy.port}/v1/models`, {
       method: 'GET',
       headers: { [SESSION_HEADER]: sessionId },
     })
-    // TOBE should still be there for the next /v1/messages.
-    const stillPending = fx.tobeStore.peek(sessionId)
-    expect(stillPending).not.toBeNull()
-    expect(stillPending!.fork_point_revision_id).toBe('v-keep')
+    // Anchor row still active for the next /v1/messages.
+    const row = fx.db.prepare(
+      'SELECT state, state_reason FROM fork_anchors WHERE anchor_token=?',
+    ).get(token) as { state: string, state_reason: string | null }
+    expect(row.state).toBe('active')
+    expect(row.state_reason).toBeNull()
   })
 
   it('count_tokens skips applyAnchorSplice — no splice, no release on tiny body', async () => {

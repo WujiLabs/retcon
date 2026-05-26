@@ -9,7 +9,7 @@
 // Lifecycle:
 //
 //   start  → openDb + migrate
-//          → createTobeStore + createDefaultProducer + createMcpTools
+//          → createDefaultProducer + createMcpTools
 //          → startServer
 //          → write PID file
 //          → install signal handlers
