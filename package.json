@@ -6,10 +6,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/WujiLabs/playtiss.git",
-    "directory": "playtiss-proxy"
+    "url": "git+https://github.com/WujiLabs/retcon.git"
   },
-  "homepage": "https://github.com/WujiLabs/playtiss/tree/master/playtiss-proxy",
+  "homepage": "https://github.com/WujiLabs/retcon",
   "keywords": [
     "retcon",
     "playtiss",
@@ -49,20 +48,20 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@playtiss/core": "workspace:*",
-    "better-sqlite3": "catalog:"
+    "@playtiss/core": "^0.3.0",
+    "better-sqlite3": "^11.10.0"
   },
   "devDependencies": {
-    "@eslint/js": "catalog:",
-    "@stylistic/eslint-plugin": "catalog:",
-    "@types/better-sqlite3": "catalog:",
-    "@types/node": "catalog:",
-    "@vitest/coverage-v8": "catalog:",
-    "eslint": "catalog:",
-    "globals": "catalog:",
-    "typescript": "catalog:",
-    "typescript-eslint": "catalog:",
-    "vitest": "catalog:"
+    "@eslint/js": "^9.39.4",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "24.10.9",
+    "@vitest/coverage-v8": "^4.1.4",
+    "eslint": "^9.39.4",
+    "globals": "^16.5.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.58.2",
+    "vitest": "^4.1.4"
   },
   "engines": {
     "node": ">=20.0.0"
