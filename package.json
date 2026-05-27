@@ -48,7 +48,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@playtiss/core": "^0.3.0",
+    "@playtiss/core": "^0.3.1",
     "better-sqlite3": "^11.10.0"
   },
   "devDependencies": {
